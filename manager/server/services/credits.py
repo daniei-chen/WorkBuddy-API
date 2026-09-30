@@ -1,0 +1,159 @@
+"""实时积分的短期缓存 + 积分变动留痕。
+
+为什么要缓存：积分需要直接调腾讯接口（上游 /status 的 credits 只在它自己的
+定时任务里刷新，滞后可达数小时）。但每次打开页面都全量查询会给腾讯带来
+不必要的请求，账号多时更明显，也可能触发限流。
+
+因此加一层 TTL 缓存：TTL 内的重复查询直接命中缓存，超过 TTL 才真正请求。
+手动「刷新积分」可传 force=True 绕过缓存。命中缓存时会明确标记，
+前端据此区分「实时」与「缓存」，不让滞后的数字伪装成刚查到的。
+
+积分变动留痕：签到 / 活跃上报 / 猫猫旅行等都会让余额增加，但上游只在
+旅行领奖时打印具体数额，签到与活跃都不打。因此这里在**每次真实查询成功后**
+比对上一次的余额，只要增加就记一条流水，从而覆盖所有获取渠道。
+（只记增加：减少是消耗，不属于"积分获取"。）
+"""
+from __future__ import annotations
+
+import json
+import time
+
+from .. import db
+from . import tencent
+
+# uid -> (查询时间戳, 是否成功, 积分值, 消息, 到期列表)
+# 到期列表跟着积分一起缓存：两者出自同一次账单请求，分开放会出现「余额是刚查的、
+# 到期时间还是上一分钟那次查询的」这种自相矛盾的展示。
+_cache: dict[str, tuple[float, bool, int | float | None, str, list[dict]]] = {}
+TTL_SECONDS = 60
+
+# 余额快照持久化在 settings 表，重启后仍能继续比对
+_SNAP_KEY = 'credits_snapshot'
+
+# 单次余额增加的记录上限，避免异常值刷屏（正常任务收益都远小于此）
+_MAX_DELTA = 1_000_000
+
+
+def cached_credits(uid: str) -> tuple[bool, int | float | None, str, list[dict]] | None:
+    """命中未过期的缓存则返回，否则 None。"""
+    item = _cache.get(uid)
+    if not item:
+        return None
+    ts, ok, credits, message, expiries = item
+    if time.time() - ts > TTL_SECONDS:
+        return None
+    return ok, credits, message, expiries
+
+
+def cache_age(uid: str) -> int | None:
+    """缓存已存在多少秒（未命中返回 None），用于界面标注「x 秒前」。"""
+    item = _cache.get(uid)
+    if not item:
+        return None
+    return max(0, int(time.time() - item[0]))
+
+
+# ── 余额快照与变动流水 ───────────────────────────────────
+def _load_snapshot() -> dict:
+    raw = db.get_setting(_SNAP_KEY, None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _save_snapshot(snap: dict) -> None:
+    try:
+        db.set_setting(_SNAP_KEY, json.dumps(snap, ensure_ascii=False))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def record_balance(uid: str, nickname: str, credits: int | float | None) -> int | None:
+    """记录一次余额；较上次增加时写一条积分流水并返回增加量。
+
+    首次见到的账号只建立基线、不记流水，否则会把历史余额误报成「刚获得」。
+    """
+    if not uid or credits is None:
+        return None
+    try:
+        value = int(credits)
+    except (TypeError, ValueError):
+        return None
+
+    snap = _load_snapshot()
+    prev_raw = snap.get(uid)
+    snap[uid] = value
+    _save_snapshot(snap)
+
+    if prev_raw is None:
+        return None
+    try:
+        prev = int(prev_raw)
+    except (TypeError, ValueError):
+        return None
+
+    delta = value - prev
+    if delta <= 0 or delta > _MAX_DELTA:
+        return None
+
+    db.add_task_logs([{
+        'ts': int(time.time()),
+        'uid': uid,
+        'kind': 'credit',
+        'level': 'credit',
+        'credits': delta,
+        'message': f'余额 +{delta}（{prev} → {value}）'
+                   + (f' · {nickname}' if nickname else ''),
+        # 用余额值做去重键：同一余额只会留下一条流水
+        'dedup_key': f'credit|{uid}|{value}',
+    }])
+    return delta
+
+
+async def get_credits(
+    auth: dict,
+    *,
+    force: bool = False,
+    nickname: str = '',
+    record: bool = True,
+) -> tuple[bool, int | float | None, str, bool, int | None, list[dict]]:
+    """查询积分（带 TTL 缓存）。
+
+    返回 (是否成功, 积分, 消息, 是否来自缓存, 缓存已存在秒数, 到期列表)。
+    到期列表见 tencent.fetch_credits 的说明。
+    真实查询成功且 record=True 时，顺带比对余额并记录积分变动流水。
+    """
+    uid = str(auth.get('uid') or '')
+    if uid and not force:
+        hit = cached_credits(uid)
+        if hit is not None:
+            ok, credits, message, expiries = hit
+            return ok, credits, f'{message}（缓存）', True, cache_age(uid), expiries
+
+    ok, credits, message, expiries = await tencent.fetch_credits(auth)
+    if uid:
+        # 仅缓存成功结果：失败往往是临时网络问题，不该被缓存住
+        if ok:
+            _cache[uid] = (time.time(), ok, credits, message, expiries)
+        else:
+            _cache.pop(uid, None)
+
+    if ok and record:
+        try:
+            record_balance(uid, nickname, credits)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return ok, credits, message, False, None, expiries
+
+
+def invalidate(uid: str | None = None) -> None:
+    """清除缓存（uid 为空则全清）。签到等会改变余额的操作后调用。"""
+    if uid:
+        _cache.pop(uid, None)
+    else:
+        _cache.clear()

@@ -1,0 +1,33 @@
+[Unit]
+Description=WorkBuddy Manager (账号池管理 + OpenAI 兼容反代网关)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/workbuddy-manager
+Environment=WB_MANAGER_HOST=0.0.0.0
+Environment=WB_MANAGER_PORT=7864
+Environment=WB2API_BASE=http://127.0.0.1:7863
+Environment=WB2API_CONTAINER=workbuddy2api
+Environment=WB_AUTH_DIR=/opt/workbuddy2api/auths
+Environment=WB_UPSTREAM_CONFIG=/opt/workbuddy2api/config.json
+Environment=WB_DATA_DIR=/opt/workbuddy-manager/data
+Environment=WB_STATIC_DIR=/opt/workbuddy-manager/web/out
+Environment=WB_SECURE_COOKIE=auto
+# 真实 IP 取自反代覆盖写入的 X-Real-IP；前置 CDN 时把跳数改成 CDN+反代层数
+Environment=WB_TRUST_PROXY=1
+Environment=WB_TRUSTED_PROXY_HOPS=1
+# 生产环境不暴露 /docs、/openapi.json（需要调试时改为 1）
+Environment=WB_ENABLE_DOCS=0
+# 每密钥每分钟调用上限（0 = 不限）
+Environment=WB_GATEWAY_RATE_PER_MIN=120
+# 首次启动若不设 WB_ADMIN_PASSWORD，会随机生成并打印到日志（journalctl 可见）
+# Environment=WB_ADMIN_PASSWORD=改成你的强密码
+
+ExecStart=/usr/bin/python3 -m uvicorn server.main:app --host 0.0.0.0 --port 7864
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,177 @@
+diff --git a/internal/session/session.go b/internal/session/session.go
+index 693ebbd..632bb20 100644
+--- a/internal/session/session.go
++++ b/internal/session/session.go
+@@ -4,14 +4,19 @@
+ // 但改为纯内存 + redisstore 异步镜像：
+ //   - 命中走 RLock 快查（绝大多数请求已绑定）；
+ //   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
+-//   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
++//   - 分配为**顺序轮转**（round-robin）：优先"空闲账号"（未绑定任何会话的可用号）
++//     中取游标之后的下一个，其次全池同规则；账号失效后游标顺延不跳漏；
+ //   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
+ //   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
++//
++// 本地定制（2026-09-16）：新会话分配由「FNV 哈希取模」改为「顺序轮转」，
++// 让每个新对话按可用账号顺序依次落号（配合额度跳过，耗尽账号不再被分配）。
+ package session
+ 
+ import (
+ 	"encoding/json"
+ 	"log"
++	"sort"
+ 	"sync"
+ 	"time"
+ 
+@@ -47,6 +52,12 @@ type Router struct {
+ 	entries map[string]entry
+ 	cfg     Config
+ 	stop    chan struct{}
++	// rotLast 顺序轮转游标：最近一次新会话分配到的 uid（空串 = 尚未分配过）。
++	// 新会话分配取「该 uid 之后的下一个可用号」（见 pickNextLocked）。
++	// 只记 uid 而非下标：可用列表随账号失效/恢复动态变化，记住"上一个是谁"
++	// 才能在列表收缩后仍精确指向下一个，不跳漏也不重放。
++	// 运行态，不持久化（重启后从列表头开始，只影响"下一个新会话从哪开始"）。
++	rotLast string
+ }
+ 
+ // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
+@@ -171,6 +182,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 	}
+ 
+ 	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
++	// 段内取「轮转游标之后的下一个」（顺序轮转，本地定制；原实现为 FNV 哈希取模）。
+ 	bound := map[string]bool{}
+ 	for _, v := range r.entries {
+ 		bound[v.uid] = true
+@@ -185,10 +197,11 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 	if len(pool2) == 0 {
+ 		pool2 = uids
+ 	}
+-	uid := pool2[hashIndex(key, len(pool2))]
++	uid := r.pickNextLocked(pool2)
+ 
+ 	prev, existed := r.entries[key]
+ 	r.entries[key] = entry{uid: uid, lastActive: now}
++	r.rotLast = uid // 推进轮转游标：下一个新会话从该 uid 之后开始
+ 	if existed && prev.uid != uid {
+ 		r.cfg.Store.DelBind(key)
+ 	}
+@@ -196,6 +209,31 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 	return uid, true
+ }
+ 
++// pickNextLocked 顺序轮转取下一个账号（本地定制，替换原 FNV 哈希取模）：
++// 在**已排序**的候选列表 uids 中，取「轮转游标 rotLast 之后」的第一个；游标不在
++// 列表（账号失效/被移出）或未初始化时，二分插入点即为"其后"位置；到列表尾回绕
++// 到开头。列表用 sort.SearchStrings 做二分，无需重排序。
++//
++// 为什么用「上一个 uid + 二分」而不是「下标+1」：可用列表随账号冷却/额度耗尽/
++// 恢复动态伸缩，下标会在列表变化后指向错位甚至越界；记住"上一个是谁"，二分找到
++// 它在有序列表中的位置再取下一个，列表怎么变都能精确顺延，也天然跳过被过滤掉的
++// 账号（不跳漏、不重放）。调用方必须已持有 r.mu 写锁。
++func (r *Router) pickNextLocked(uids []string) string {
++	sort.Strings(uids) // 稳定序：池侧输出已排序，此处防御性再排（幂等、开销可忽略）
++	if r.rotLast == "" {
++		return uids[0] // 首次分配：从第一个开始
++	}
++	// 找 rotLast 之后第一个 > rotLast 的账号（轮转语义：不重复分配上一个）。
++	i := sort.SearchStrings(uids, r.rotLast)
++	for i < len(uids) && uids[i] <= r.rotLast {
++		i++
++	}
++	if i >= len(uids) {
++		return uids[0] // 到列表尾：回绕到开头
++	}
++	return uids[i]
++}
++
+ // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+ func (r *Router) touch(key, uid string, now time.Time) {
+ 	r.mu.Lock()
+diff --git a/internal/session/session_rotation_test.go b/internal/session/session_rotation_test.go
+new file mode 100644
+index 0000000..9e1a28f
+--- /dev/null
++++ b/internal/session/session_rotation_test.go
+@@ -0,0 +1,80 @@
++package session
++
++import (
++	"testing"
++	"time"
++)
++
++// 本地定制（2026-09-16）：新会话分配由「FNV 哈希取模」改为「顺序轮转」。
++// 覆盖契约：依次取下一个账号、到尾回绕、账号被移出后顺延不跳漏、同会话保持粘性。
++func TestRotationSequentialThenWrap(t *testing.T) {
++	avail := []string{"a1", "a2", "a3"}
++	r := New(Config{
++		TTL:       time.Minute,
++		Available: func() []string { return avail },
++	})
++	want := []string{"a1", "a2", "a3", "a1"} // 第 4 个新会话回绕到开头
++	for i, w := range want {
++		got, ok := r.ResolveForModel("k"+string(rune('1'+i)), "")
++		if !ok || got != w {
++			t.Fatalf("第 %d 个新会话 = %q（ok=%v），want %q", i+1, got, ok, w)
++		}
++	}
++}
++
++func TestRotationSkipsRemovedAccount(t *testing.T) {
++	avail := []string{"a1", "a2", "a3"}
++	r := New(Config{
++		TTL:       time.Minute,
++		Available: func() []string { return avail },
++	})
++	if got, _ := r.ResolveForModel("k1", ""); got != "a1" {
++		t.Fatalf("首个会话 = %q want a1", got)
++	}
++	// a1 冷却/额度耗尽被移出可用列表：下一个新会话应顺延到 a1 之后（a2），
++	// 既不重放 a1、也不跳漏 a2。
++	avail = []string{"a2", "a3"}
++	if got, _ := r.ResolveForModel("k2", ""); got != "a2" {
++		t.Fatalf("移出 a1 后新会话 = %q want a2（顺延不跳漏）", got)
++	}
++}
++
++func TestRotationSameKeySticky(t *testing.T) {
++	r := New(Config{
++		TTL:       time.Minute,
++		Available: func() []string { return []string{"a1", "a2"} },
++	})
++	u1, _ := r.ResolveForModel("k1", "")
++	u2, _ := r.ResolveForModel("k1", "")
++	if u1 != u2 {
++		t.Fatalf("同会话两次解析应同账号：%q vs %q", u1, u2)
++	}
++	// 新会话轮转到另一个账号（而非哈希碰巧相同的旧行为）。
++	u3, _ := r.ResolveForModel("k2", "")
++	if u3 == u1 {
++		t.Fatalf("新会话应轮转到下一个账号，实际仍为 %q", u3)
++	}
++}
++
++func TestRotationCursorIndependentOfKey(t *testing.T) {
++	// 轮转游标只由"上一个被分配的账号"决定，与 key 内容无关：
++	// 交换 key 顺序不应改变分配序列（区别于原哈希实现）。
++	avail := []string{"a1", "a2", "a3"}
++	r1 := New(Config{TTL: time.Minute, Available: func() []string { return append([]string{}, avail...) }})
++	r2 := New(Config{TTL: time.Minute, Available: func() []string { return append([]string{}, avail...) }})
++	seq1 := []string{}
++	for _, k := range []string{"alpha", "beta", "gamma"} {
++		u, _ := r1.ResolveForModel(k, "")
++		seq1 = append(seq1, u)
++	}
++	seq2 := []string{}
++	for _, k := range []string{"zzz", "yyy", "xxx"} {
++		u, _ := r2.ResolveForModel(k, "")
++		seq2 = append(seq2, u)
++	}
++	for i := range seq1 {
++		if seq1[i] != seq2[i] {
++			t.Fatalf("轮转序列应与 key 无关：%v vs %v", seq1, seq2)
++		}
++	}
++}
