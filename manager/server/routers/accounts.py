@@ -3,17 +3,77 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import json
+import logging
+import shutil
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
-from .. import config, db, security
+from .. import config, db, security, upstreamsvc
 from ..services import (
     credits as creditsvc, modelcatalog, reload, tasklog, taskrun, tencent, wb2api,
 )
 from ..services.realm import realm_of, supports_checkin
 
+logger = logging.getLogger('workbuddy.accounts')
+
 router = APIRouter(prefix='/api', tags=['accounts'])
+
+# ── 服务端侧的授权轮询（用户反馈：被遮挡窗口的定时器节流）──────────────
+#
+# 前端每 2 秒轮询一次「授权好了没」，而浏览器对**被遮挡**（不是「不可见」）的窗口
+# 会节流定时器：实测降成约 1 分钟一次，而 `document.hidden` 仍是 false、
+# visibilitychange 也不触发——代码里那个兜底因此完全失效。
+#
+# 所以把「问腾讯」这件事搬到服务端（后台任务每 2 秒一次），前端只来读结果：
+# 检测节奏与页面是否被遮挡无关，顺带避免多个窗口重复问腾讯。
+_LOGIN_POLL_SECONDS = 2.0
+_LOGIN_POLL_MAX = 300.0          # 后台最多盯 5 分钟，之后当过期处理
+_LOGIN_RESULT_TTL = 900.0        # 终态结果留 15 分钟，够前端被节流后回来取
+_login_polls: dict[str, dict] = {}       # state → 响应（终态含成功结果）
+_login_tasks: dict[str, asyncio.Task] = {}
+_login_regions: dict[str, str] = {}      # state → 国际版地区（可能晚于 auth/start 到达）
+_login_owner: dict[str, str] = {}        # state → 发起人，用于收掉同一用户的旧轮询
+
+
+def _owner_key(user: dict, upstream_id: int | None) -> str:
+    return f"{user.get('username') or ''}|{upstream_id if upstream_id is not None else ''}"
+
+
+def _cancel_other_login_polls(state: str, owner: str) -> None:
+    """同一用户又发了一张新码：把旧码的后台轮询收掉。
+
+    不发新码就换码的路径只有一条 —— 用户在弹窗里改地区（前端会重新申请）。
+    不收的话，每改一次地区就多一个轮询在替一张废码问腾讯，5 分钟内都在跑，
+    而「避免重复调用腾讯」正是把轮询搬到服务端的理由之一。
+    同一用户的多扇窗口同理：只保留最新的那张码有后台轮询；旧的窗口靠自己的
+    前端轮询照常能拿到结果（那条路径一直可用，只是不享受后台加速）。
+    """
+    for st, task in list(_login_tasks.items()):
+        if st == state or _login_owner.get(st) != owner:
+            continue
+        if task.done():
+            # 已跑完的别动：它的终态结果前端可能还没来取（结果留 TTL 那么久）
+            continue
+        task.cancel()
+        _login_tasks.pop(st, None)
+        _login_polls.pop(st, None)
+        _login_regions.pop(st, None)
+        _login_owner.pop(st, None)
+        logger.info('同一用户重新发码，旧轮询已收掉（state=%s）', st)
+
+
+def _prune_login_polls() -> None:
+    # 清掉过期结果（state 是短命的，但别让它无限增长）
+    now = time.time()
+    for st in [k for k, v in _login_polls.items()
+               if now - float(v.get('_at') or 0) > _LOGIN_RESULT_TTL]:
+        _login_polls.pop(st, None)
+        _login_tasks.pop(st, None)
+        _login_regions.pop(st, None)
+        _login_owner.pop(st, None)
 
 
 def _today_start() -> int:
@@ -32,15 +92,104 @@ def _today_start() -> int:
     return int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
+def _group(upstream_id: int | None) -> dict:
+    """解析这次操作作用于哪个**分组**：None / 0 = 默认分组，否则查上游记录。
+
+    账号相关接口有十几个，每一个都要回答同一个问题——「这次操作读哪个目录、
+    问哪个上游实例」。集中在一处：默认分组的定义、未知分组的报错、空目录的
+    判定只有一份；多分组特性最容易错的地方就是某条路径忘了带分组、静默落到
+    默认分组上（那会让「B 组的账号」显示成 A 组的，判断全错）。
+    """
+    if not isinstance(upstream_id, int) or upstream_id == 0:
+        # 非 int 一律当「默认分组」：直呼路由函数（测试 / 内部复用）时拿到的是
+        # FastAPI 的 Query 默认哨兵而不是 None——放过它就会误报「分组不存在」。
+        return upstreamsvc.default_upstream()
+    row = upstreamsvc.get_upstream(upstream_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail='分组不存在（可能已被删除）')
+    return row
+
+
+def _group_dir(group: dict) -> Path | None:
+    """分组的本地账号目录；未配置时返回 None（该分组只做密钥转发）。"""
+    raw = str(group.get('auth_dir') or '').strip()
+    return Path(raw) if raw else None
+
+
+def _require_dir(group: dict) -> Path:
+    """要求该分组可管理账号：没有本地账号目录就明确拒绝。
+
+    为什么必须拒绝而不是落到默认目录：那会把 B 组的账号加到 A 组去（或相反），
+    而两种结果在界面上都「看起来成功了」——隔离失效且无人察觉。宁可报错。
+    """
+    d = _group_dir(group)
+    if d is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"分组「{group['name']}」没有配置本地账号目录，无法在面板里管理"
+                    "它的账号；请到「设置 → 上游」为它填写账号目录（与那套上游实例"
+                    "的 auths 目录一致）"),
+        )
+    return d
+
+
+def _reload_target(group: dict) -> dict | None:
+    """转给 reload 模块的分组参数：默认分组传 None（既有行为逐字不变）。
+
+    默认上游的启停走 WB2API_MODE / 启停脚本那套（native 部署依赖它），
+    只有非默认分组才按「容器名」重启。
+    """
+    return None if group.get('is_default') else group
+
+
+@router.get('/proxies')
+def available_proxies(user: dict = Depends(security.current_user)) -> dict:
+    return {'routes': sorted(config.proxy_routes()), 'default': config.DEFAULT_ACCOUNT_PROXY}
+
+
+@router.put('/accounts/{filename}/proxy')
+async def account_set_proxy(
+    filename: str, body: dict = Body(...),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    name = body.get('proxy')
+    if not isinstance(name, str):
+        raise HTTPException(status_code=400, detail='proxy 必须是线路名或空字符串')
+    name = name.strip()
+    group = _group(upstream_id)
+    try:
+        config.account_proxy({'proxy': name})
+        result = wb2api.set_account_proxy(filename, name, _require_dir(group))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail='账号文件不存在') from exc
+    creditsvc.invalidate()
+    scheduled = reload.request_restart(_reload_target(group))
+    return {'ok': True, **result, 'reload_triggered': scheduled}
+
+
 @router.get('/accounts')
-async def list_accounts(user: dict = Depends(security.current_user)) -> dict:
+async def list_accounts(upstream_id: int | None = Query(None),
+                        user: dict = Depends(security.current_user)) -> dict:
     """账号列表：本地授权信息 + 上游运行时状态（含积分余额）。
 
     积分（credits）优先使用上游 /status 的值：它是上游调度时写入的快照，
     与账号可用性判定一致，开销也小。前端可用「刷新积分」触发实时查询。
+
+    upstream_id 指定**分组**（缺省 = 默认分组）：账号文件读该分组的目录，
+    积分与运行状态问该分组的上游实例。两者必须一致——读 A 组的文件、问 B 组
+    的状态，界面会把「别的组的账号」标成在线/离线，判断全错。
     """
-    accounts = wb2api.list_auth_accounts()
-    status = await wb2api.get_status()
+    group = _group(upstream_id)
+    base_dir = _group_dir(group)
+    # 没有本地目录的分组**不能**去读默认目录：那会把默认池的账号显示成这个
+    # 分组的账号——与「移动时落错目录」是同一类串组错误。列表给空，由
+    # manageable 标记让界面说明「该分组未配置本地账号目录」。
+    accounts = wb2api.list_auth_accounts(base_dir) if base_dir else []
+    status = await wb2api.get_status(base_url=group['base_url'],
+                                     api_key=upstreamsvc.forward_api_key(group))
     wb2api.merge_pool_status(accounts, status)
     # 备注随列表一次带回（issue #67）：按 uid 取，没有备注的账号给空串而不是缺字段
     # —— 前端两处视图（手机卡片 / 桌面表格）都直接读它，缺字段会多一处判空。
@@ -61,12 +210,24 @@ async def list_accounts(user: dict = Depends(security.current_user)) -> dict:
         'accounts': accounts,
         'pool_synced': synced,
         'pool_available': bool(status.get('connected')),
+        # 分组上下文：前端据此标注「本列表来自哪个分组」，并决定能否在这里
+        # 管理账号（没有本地目录的分组只能看，不能加 / 移 / 删）。
+        'upstream': {
+            'id': group['id'],
+            'name': group['name'],
+            'is_default': bool(group['is_default']),
+        },
+        'auth_dir': str(base_dir or ''),
+        'manageable': base_dir is not None,
     }
 
 
 @router.get('/status')
-async def upstream_status(user: dict = Depends(security.current_user)) -> dict:
-    return await wb2api.get_status()
+async def upstream_status(upstream_id: int | None = Query(None),
+                          user: dict = Depends(security.current_user)) -> dict:
+    group = _group(upstream_id)
+    return await wb2api.get_status(base_url=group['base_url'],
+                                   api_key=upstreamsvc.forward_api_key(group))
 
 
 def _strip_cn_prefix(m: dict) -> dict:
@@ -128,6 +289,11 @@ async def auth_start(
         None,
         description='国内版 cn / 国际版 global；也可用 JSON body 传 {"realm": "..."}',
     ),
+    region: str | None = Query(
+        None,
+        description='国际版地区代码（如 HK）；也可用 JSON body 传 {"region": "..."}',
+    ),
+    upstream_id: int | None = Query(None),
     body: dict | None = Body(None),
     user: dict = Depends(security.current_user),
 ) -> dict:
@@ -138,13 +304,47 @@ async def auth_start(
     body 里的 realm 被静默忽略、恒回落到默认值 'cn'。后果是：切到「国际版」
     点添加账号，拿到的仍是国内版二维码（`copilot.tencent.com`），且**不报错**。
     现同时接受两处，body 优先（与前端一致），query 保留兼容旧调用方。
+
+    region 也在这里收：后台轮询（见 `_poll_login_background`）要用它做地区注册，
+    而它**不能只靠前端轮询带上来** —— 窗口被遮挡时前端可能一次都不补，那条
+    路径正是这个后台轮询存在的原因。用户在弹窗里改地区会重新发码，所以这里
+    拿到的就是当前那张码对应的地区。
     """
+    # 分组在这里只做**提前校验**：真正的落盘发生在 auth/poll（那里也要带
+    # 同一个分组）。先拒掉不存在的分组，用户不会扫完码才发现目标分组没了。
+    _group(upstream_id)
     raw = realm
     if isinstance(body, dict) and body.get('realm') is not None:
         raw = str(body.get('realm'))
     r = 'global' if str(raw or '').strip().lower() == 'global' else 'cn'
+    raw_region = region
+    if isinstance(body, dict) and body.get('region') is not None:
+        raw_region = str(body.get('region'))
+    reg = str(raw_region or '').strip() or None
     try:
-        return await tencent.start_login(r)
+        proxy_name = config.DEFAULT_ACCOUNT_PROXY
+        if isinstance(body, dict) and 'proxy' in body:
+            if not isinstance(body['proxy'], str):
+                raise HTTPException(status_code=400, detail='proxy 必须是线路名或空字符串')
+            proxy_name = body['proxy'].strip()
+        try:
+            config.account_proxy({'proxy': proxy_name})
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        out = await tencent.start_login(r, proxy_name) if proxy_name else await tencent.start_login(r)
+        # 起后台轮询：前端是否被节流都不影响检测节奏（见文件上方说明）
+        st = str(out.get('state') or '')
+        if st:
+            if reg:
+                _login_regions[st] = reg
+            if st not in _login_tasks or _login_tasks[st].done():
+                _prune_login_polls()
+                _login_polls.pop(st, None)
+                _cancel_other_login_polls(st, _owner_key(user, upstream_id))
+                _login_owner[st] = _owner_key(user, upstream_id)
+                _login_tasks[st] = asyncio.create_task(
+                    _poll_login_background(st, r, reg, upstream_id, user))
+        return out
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -154,6 +354,7 @@ async def auth_poll(
     state: str,
     realm: str | None = None,
     region: str | None = None,
+    upstream_id: int | None = Query(None),
     user: dict = Depends(security.current_user),
 ) -> dict:
     """轮询扫码结果；成功则落盘并触发上游重载。
@@ -163,6 +364,20 @@ async def auth_poll(
     """
     if not state:
         return {'status': 'invalid'}
+
+    # 后台已经跑出终态：直接返回那一份，**不再问腾讯**。
+    # 只对终态短路：失败态（落盘失败等）要继续走下面的原路径，那里有
+    # `provisioned` 重试语义（用户点「重试」时重新落盘，而不是重扫二维码）。
+    cached = _login_polls.get(state)
+    if cached and cached.get('status') not in (None, 'waiting'):
+        # 去掉内部记账字段（`_at`）再返回，别把实现细节漏给前端
+        return {k: v for k, v in cached.items() if not k.startswith('_')}
+
+    # 地区可能比 auth/start 更晚到（用户在弹窗里选、或另一扇窗口带上来）：
+    # 记下来给后台轮询用 —— 国际版漏了地区注册，聊天会报 14017。
+    if region:
+        _login_regions[state] = region
+    group = _group(upstream_id)
 
     # 落盘成功后 state 会在下面被丢弃，但如果**落盘失败**（issue #26），
     # 前端会继续轮询同一个 state 让用户重试 —— 那条路径不能把签到、领 trial
@@ -180,7 +395,8 @@ async def auth_poll(
     realm_of_result = result.get('realm') or 'cn'
     if provisioned:
         # 已经供给过：只补落盘（上次就是败在这一步），其余一律不重做
-        return _save_and_finish(result, realm_of_result, region_msg='', state=state)
+        return _save_and_finish(result, realm_of_result, region_msg='', state=state,
+                                group=group)
 
     # 探测 dict：billing 域身份头（X-User-Id / X-Domain 等）需要这些字段，
     # 与 _auth_dict 同构；device_token 此刻还没有（落盘时由外部写入）
@@ -190,6 +406,7 @@ async def auth_poll(
         'enterprise_id': result.get('enterprise_id', ''),
         'realm': realm_of_result,
         'domain': result.get('domain', ''),
+        'proxy': result.get('proxy', ''),
     }
 
     # 国际版：先做地区注册（未注册会导致后续聊天报 14017）
@@ -218,7 +435,8 @@ async def auth_poll(
     # 落位，否则「签到成功但标记没写」的窗口里重试仍会重跑一次。
     _mark_provisioned(state)
     creditsvc.invalidate(str(result.get('uid', '')))
-    return _save_and_finish(result, realm_of_result, region_msg, state)
+    return _save_and_finish(result, realm_of_result, region_msg, state,
+                            group=group)
 
 
 def _mark_provisioned(state: str) -> None:
@@ -234,8 +452,151 @@ def _mark_provisioned(state: str) -> None:
         _provisioned_states.pop(k, None)
 
 
+async def _poll_login_background(state: str, realm: str, region: str | None,
+                                  upstream_id: int | None,
+                                  user: dict) -> None:
+    """替前端把授权轮询跑完，直到出现终态（见文件上方说明）。
+
+    复用 `auth_poll` 本身：那条路径已经处理了地区注册 / trial / 签到 / 落盘与
+    各种错误分支，重写一份必然漂移。跑出终态就存住，前端来读即可。
+    """
+    deadline = time.time() + _LOGIN_POLL_MAX
+    while time.time() < deadline:
+        # 地区每轮取一次最新的：auth_start 时可能还没有（用户要先看到二维码
+        # 才会去选地区），而地区登记必须在**落盘前**完成，否则国际版新号
+        # 聊天报 14017。
+        region = _login_regions.get(state) or region
+        try:
+            resp = await auth_poll(state=state, realm=realm, region=region,
+                                   upstream_id=upstream_id, user=user)
+        except HTTPException as exc:
+            # 落盘失败这类：不存终态，让前端走原路径（那里有「重试即重新落盘」的
+            # 语义，且要保留 state 不丢）。
+            logger.warning('后台轮询遇到可重试的错误（等前端重试）: %s', exc.detail)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('后台轮询失败（不影响前端轮询）: %s', exc)
+            return
+        if resp.get('status') != 'waiting':
+            _login_polls[state] = {**resp, '_at': time.time()}
+            return
+        await asyncio.sleep(_LOGIN_POLL_SECONDS)
+    logger.info('后台轮询到时（%ss）：按过期处理', int(_LOGIN_POLL_MAX))
+
+
+# ── 系统自动禁用（disabled）的解除 ────────────────────────────────
+#
+# 上游把「账号不可用」拆成**两位独立的开关**：
+#
+#   · `manual_disabled` —— 运维主动摘的（面板的「临时停用」）；
+#   · `disabled`        —— 系统自动禁的（12153 连败 3 次、或 11140 被封）。
+#
+# 两者由不同的端点解除：`enable` 只清前者，`revive` 只清后者（上游 admin.go
+# 原话：「若账号仍被系统自动禁用，它不会因此回到选号池——那需要 revive」）。
+#
+# 面板此前**只调 disable/enable、从不调 revive**，于是被自动禁用的账号在面板里
+# 没有任何操作能救回来 —— 重新登录只换凭证（上游 upsert 保留 disabled）、签到被
+# `!e.disabled` 挡掉、一次成功又要求先被选中（自锁）、时间也不会让它过期。
+# 用户报的「国际版重新登录后连通性测试通过、账号池就是调不动」就是这条。
+
+
+async def _revive_if_disabled(uid: str, *, base_url: str | None = None,
+                              api_key: str | None = None) -> tuple[bool, str, bool | None]:
+    """账号若被上游**系统自动禁用**，解除它。
+
+    返回 `(是否真的解除了, 说明文案, 之后是否仍被禁用)` —— 第三位是**三态**：
+    `True` 仍禁用 / `False` 确认已回到池子 / `None` 读不到状态（不知道）。
+    为什么不是 bool：把「读不到」当 `False` 会让调用方**无条件报成功**
+    （「已启用」），而那时我们其实什么都没确认 —— 正是这个功能要消灭的误导。
+    调用方必须显式处理 `None`。
+
+    为什么抽成一个函数：有三处要用同一套判断 —— 面板的「启用」按钮、重新登录后的
+    自动恢复、以及将来可能的批量修复。写三遍必然漂移。
+
+    为什么拿 `/status` 而不是 admin 端点的回显做判据：回显里的 `disabled` 字段是
+    较新版本才有的，而 `/status` 一直带着它，且它正是**界面显示的那一份数据** ——
+    用同一个来源判断，才不会出现「接口说好了、界面还红着」。
+    """
+    still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+    if still is None:
+        return False, '读不到该账号在上游的状态（上游不可达，或它还没进入账号池）', None
+    if not still:
+        return False, '', False
+    ok, msg, code = await wb2api.revive_account(uid, base_url=base_url, api_key=api_key)
+    if not ok:
+        if code == 'no_route':
+            return False, ('上游未启用管理接口，无法解除系统禁用 —— 请到'
+                           '「设置 → 账号管理接口」开启后重试'), True
+        return False, f'解除系统禁用失败：{msg}', True
+    # 再确认一次：接口回 200 ≠ 真的回到池子（见 revive_account 的说明）。
+    # 这次读不到就如实返回 None（不知道），不要 `bool(None)` 谎报「已清干净」。
+    after = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+    return True, msg, after
+
+
+# 重新登录后的自动恢复。等待上限比热加载窗口（约 5 秒）宽一档：账号文件刚落盘时
+# 上游可能还没扫到，这时 `/status` 里读不到它（返回 None），要再等一轮。
+_REVIVE_WAIT_SECONDS = 20.0
+_REVIVE_POLL_SECONDS = 2.0
+
+# 在跑的自动恢复任务。**必须持有强引用**：asyncio 只保留对任务的弱引用，
+# `create_task()` 的结果没人接住时，任务可能在执行途中被 GC 掉 —— 症状是
+# 「这次修复有时不生效」，且完全不报错。与上面的 `_login_tasks` 同一套路。
+_revive_tasks: set[asyncio.Task] = set()
+
+
+async def _revive_after_login(uid: str, group: dict) -> None:
+    """登录成功后的后台收尾：等账号入池，若仍被系统禁用就自动解除。
+
+    **为什么重新登录应当自动恢复**：登录在语义上就是「刷新账号状态」—— 用户重新
+    授权了一次，凭证是全新的，上游那句「需重新登录」的禁用理由已经消失，没有道理
+    还让它留在池外。上游自己不做这件事（upsert 只换凭证），所以由面板补上。
+    """
+    base_url = group.get('base_url')
+    api_key = upstreamsvc.forward_api_key(group)
+    deadline = time.monotonic() + _REVIVE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+        if still is None:
+            await asyncio.sleep(_REVIVE_POLL_SECONDS)   # 还没被上游收录，再等等
+            continue
+        if not still:
+            return                                      # 没被禁用，无需处理
+        ok, msg, _ = await wb2api.revive_account(uid, base_url=base_url, api_key=api_key)
+        logger.info('重新登录后自动解除系统禁用 uid=%s：%s%s',
+                    uid[:8], '成功' if ok else '失败', f'（{msg}）' if msg else '')
+        return
+    logger.info('重新登录后等待账号入池超时，跳过自动解除禁用 uid=%s', uid[:8])
+
+
+def _schedule_revive_after_login(uid: str, group: dict) -> None:
+    """调度上面那个后台任务。
+
+    登录**已经成功**（账号文件确实落盘了），所以这里任何失败都不该反过来影响
+    登录结果 —— 拿不到事件循环、排不上任务都静默跳过（测试直呼路由函数、
+    或在没有循环的线程里调用，都是常见情形）。
+
+    整段都包在 try 里，不只包 `get_running_loop`：排任务那一步抛出来同样会
+    顺着 `_save_and_finish` 冒到 `auth_poll`，把一次**已经成功**的登录变成 500。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_revive_after_login(uid, group))
+        # 持有强引用：asyncio 只保留弱引用，没人接住的任务可能在执行途中被 GC 掉，
+        # 症状是「有时不生效」且不报错（与 _login_tasks 同一套路）。
+        if task is not None:
+            _revive_tasks.add(task)
+            task.add_done_callback(_revive_tasks.discard)
+    except Exception:  # noqa: BLE001 —— 排不上就算了，登录本身已经成功
+        logger.debug('调度「登录后自动解除系统禁用」失败（不影响登录结果）',
+                     exc_info=True)
+
+
 def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
-                     state: str) -> dict:
+                     state: str, group: dict | None = None) -> dict:
     """落盘 + 收尾（重载上游、丢弃 state）。落盘失败时抛出**可执行**的提示。
 
     单独抽出来是因为它有两条进入路径：首次供给后、以及「上次就是败在落盘」
@@ -245,8 +606,10 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
     # 把它包起来是为了给出可执行的提示 —— 失败的一个常见成因是 auths 目录
     # 权限不对（宝塔/1Panel 用 root 装、却以别的 uid 跑），而那个错误的原文
     # 只有一行 PermissionError，用户看不出「该 chown 哪个目录」。
+    group = group or upstreamsvc.default_upstream()
+    auth_dir = _group_dir(group)
     try:
-        filename, existed = tencent.write_auth_file(result)
+        filename, existed = tencent.write_auth_file(result, auth_dir)
     except ValueError as exc:
         # uid 形态异常（`write_auth_file` 会校验后才拼文件名）。这不是权限问题，
         # 给「去 chown」的提示会把用户引到错方向 —— 如实说明是上游返回的数据异常。
@@ -265,7 +628,7 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
             status_code=500,
             detail=(
                 f'账号已授权成功，但写入账号文件失败：{exc}。'
-                f'请检查 {config.AUTH_DIR} 的目录权限（容器部署见 compose 里 '
+                f'请检查 {auth_dir or config.AUTH_DIR} 的目录权限（容器部署见 compose 里 '
                 f'chown 10001:10001 的说明），修好后**直接重试本弹窗**即可，'
                 f'不需要重新扫码。'
             ),
@@ -279,7 +642,11 @@ def _save_and_finish(result: dict, realm_of_result: str, region_msg: str,
     # 不阻塞本次响应）。此前无脑重启，而重启期间上游 /status 不可用 —— 前端
     # 收到成功立刻刷新账号列表，那一刷会一直挂到容器起来，用户看到的是
     # 「登录成功却要等 20-30 秒」。详见 reload.request_reload_or_restart。
-    reload.request_reload_or_restart(str(result.get('uid') or ''))
+    reload.request_reload_or_restart(str(result.get('uid') or ''),
+                                     upstream=_reload_target(group))
+    # 重新登录 = 刷新账号状态：若它此前被系统禁用（12153 连败 / 11140 被封），
+    # 这时后台自动解除 —— 否则「重新登录」救不回账号，用户报的就是这条。
+    _schedule_revive_after_login(str(result.get('uid') or ''), group)
 
     return {
         'status': 'success',
@@ -308,12 +675,13 @@ def _auth_dict(raw: dict) -> dict:
         'domain': auth.get('domain', ''),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
+        'proxy': str(raw.get('proxy') or ''),
     }
 
 
-def _load(filename: str) -> dict:
+def _load(filename: str, auth_dir: Path | None = None) -> dict:
     try:
-        return wb2api.read_account_file_any(filename)
+        return wb2api.read_account_file_any(filename, auth_dir)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -321,8 +689,9 @@ def _load(filename: str) -> dict:
 
 
 @router.post('/accounts/{filename}/checkin')
-async def account_checkin(filename: str, user: dict = Depends(security.require_admin)) -> dict:
-    raw = _load(filename)
+async def account_checkin(filename: str, upstream_id: int | None = Query(None),
+                          user: dict = Depends(security.require_admin)) -> dict:
+    raw = _load(filename, _require_dir(_group(upstream_id)))
     acct = raw.get('account') or {}
     auth = raw.get('auth') or {}
     token = auth.get('accessToken', '')
@@ -356,6 +725,7 @@ async def account_checkin(filename: str, user: dict = Depends(security.require_a
         'domain': str(auth.get('domain') or ''),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
+        'proxy': str(raw.get('proxy') or ''),
     }, realm_of(auth))
     # 0 = 签到成功；10001 = 今日已签到，同样视为成功；
     # -2 = 该版本无签到体系（国际版），不是失败，也不该记成失败
@@ -388,6 +758,7 @@ async def account_checkin(filename: str, user: dict = Depends(security.require_a
 async def account_credits(
     filename: str,
     force: bool = False,
+    upstream_id: int | None = Query(None),
     user: dict = Depends(security.current_user),
 ) -> dict:
     """查询单个账号的实时积分余额与套餐到期时间（直接向腾讯查询，带 60s 缓存）。
@@ -395,7 +766,7 @@ async def account_credits(
     force=true 可绕过缓存强制查询。
     expiries: [{'at': epoch 秒, 'amount': 额度}]，按到期时间升序，只含仍有余额的套餐。
     """
-    raw = _load(filename)
+    raw = _load(filename, _require_dir(_group(upstream_id)))
     acct = raw.get('account') or {}
     ok, value, message, cached, age, expiries = await creditsvc.get_credits(
         _auth_dict(raw), force=force, nickname=str(acct.get('nickname') or ''),
@@ -413,6 +784,7 @@ async def account_credits(
 @router.post('/accounts/refresh-credits')
 async def refresh_all_credits(
     force: bool = True,
+    upstream_id: int | None = Query(None),
     user: dict = Depends(security.current_user),
 ) -> dict:
     """并发查询所有账号的积分，返回 {uid: credits} 与每条是否来自缓存。
@@ -437,13 +809,14 @@ async def refresh_all_credits(
     if force and str(user.get('role') or '') != 'admin':
         raise HTTPException(status_code=403, detail='刷新积分需要管理员权限')
 
-    accounts = wb2api.list_auth_accounts()
+    base_dir = _require_dir(_group(upstream_id))
+    accounts = wb2api.list_auth_accounts(base_dir)
 
     async def one(
         acc: dict,
     ) -> tuple[str, int | float | None, str, bool, int | None, list[dict]]:
         try:
-            raw = wb2api.read_account_file(acc['file'])
+            raw = wb2api.read_account_file(acc['file'], base_dir)
         except Exception as exc:  # noqa: BLE001
             return acc['uid'], None, f'读取失败: {exc}', False, None, []
         ok, value, message, cached, age, expiries = await creditsvc.get_credits(
@@ -482,7 +855,8 @@ def _checkin_semaphore() -> asyncio.Semaphore:
 
 
 @router.post('/accounts/checkin-all')
-async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
+async def checkin_all(upstream_id: int | None = Query(None),
+                      user: dict = Depends(security.require_admin)) -> dict:
     """对所有账号执行一次签到，并逐条记录结果。
 
     上游的自动签到只在失败时打日志、成功静默，且没有可触发的 HTTP 接口；
@@ -492,7 +866,8 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
     几十个账号叠加腾讯 RPC 耗时会超过前端 60 秒超时——前端报失败、
     后端却还在跑，用户容易重复点击。并发后总耗时约等于最慢的单个账号。
     """
-    accounts = wb2api.list_auth_accounts()
+    base_dir = _require_dir(_group(upstream_id))
+    accounts = wb2api.list_auth_accounts(base_dir)
     done_today = db.checkin_done_since(_today_start())
     sem = _checkin_semaphore()
 
@@ -501,7 +876,7 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
         uid = acc.get('uid', '')
         nickname = acc.get('nickname', '')
         try:
-            raw = wb2api.read_account_file(filename)
+            raw = wb2api.read_account_file(filename, base_dir)
             auth = raw.get('auth') or {}
             token = auth.get('accessToken', '')
         except Exception as exc:  # noqa: BLE001
@@ -537,6 +912,7 @@ async def checkin_all(user: dict = Depends(security.require_admin)) -> dict:
                 'domain': str(auth.get('domain') or ''),
                 'realm': auth.get('realm'),
                 'device_token': str(raw.get('device_token') or ''),
+                'proxy': str(raw.get('proxy') or ''),
             }, realm_of(auth))
         ok = code in (0, 10001)
         db.add_checkin_log(uid, nickname, 'manual-batch', ok, code, message)
@@ -680,17 +1056,25 @@ def _nickname_resolver() -> object:
     nick_by_prefix: dict[str, str] = {}
     ambiguous: set[str] = set()
     try:
-        for acc in wb2api.list_auth_accounts():
-            auid = str(acc.get('uid') or '')
-            nick = str(acc.get('nickname') or '')
-            if not auid or not nick:
-                continue
-            nick_by_uid[auid] = nick
-            prefix = auid[:8]
-            if prefix in nick_by_prefix and nick_by_prefix[prefix] != nick:
-                ambiguous.add(prefix)
-            else:
-                nick_by_prefix[prefix] = nick
+        # 默认目录 + 各分组登记的账号目录：日志里的 uid 可能来自任何一个池，
+        # 只扫默认目录会让分组账号在日志里显示成裸 uid。
+        dirs: list[Path | None] = [None]
+        for up in upstreamsvc.list_upstreams(include_default=False):
+            raw_dir = str(up.get('auth_dir') or '').strip()
+            if raw_dir:
+                dirs.append(Path(raw_dir))
+        for base_dir in dirs:
+            for acc in wb2api.list_auth_accounts(base_dir):
+                auid = str(acc.get('uid') or '')
+                nick = str(acc.get('nickname') or '')
+                if not auid or not nick:
+                    continue
+                nick_by_uid[auid] = nick
+                prefix = auid[:8]
+                if prefix in nick_by_prefix and nick_by_prefix[prefix] != nick:
+                    ambiguous.add(prefix)
+                else:
+                    nick_by_prefix[prefix] = nick
     except Exception:  # noqa: BLE001
         pass
 
@@ -938,8 +1322,9 @@ def upstream_logs(limit: int = 200, user: dict = Depends(security.current_user))
 
 
 @router.post('/accounts/{filename}/test')
-async def account_test(filename: str, user: dict = Depends(security.require_admin)) -> dict:
-    raw = _load(filename)
+async def account_test(filename: str, upstream_id: int | None = Query(None),
+                       user: dict = Depends(security.require_admin)) -> dict:
+    raw = _load(filename, _require_dir(_group(upstream_id)))
     acct = raw.get('account') or {}
     auth = raw.get('auth') or {}
     # 探测需要 uid / enterpriseId / domain 以复刻上游请求头，
@@ -951,12 +1336,14 @@ async def account_test(filename: str, user: dict = Depends(security.require_admi
         'domain': auth.get('domain', ''),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
+        'proxy': str(raw.get('proxy') or ''),
     })
     return {'ok': ok, 'message': message}
 
 
 @router.post('/accounts/{filename}/refresh')
-async def account_refresh(filename: str, user: dict = Depends(security.require_admin)) -> dict:
+async def account_refresh(filename: str, upstream_id: int | None = Query(None),
+                          user: dict = Depends(security.require_admin)) -> dict:
     """刷新该账号的 accessToken（issue #40）。
 
     **这里真的去续期了**。此前这个端点只是 `reload.restart_now()`——触发一次
@@ -970,7 +1357,9 @@ async def account_refresh(filename: str, user: dict = Depends(security.require_a
     等未知字段）→ 触发一次上游重载让新凭证立刻生效（不重载的话上游要等
     auths 热加载轮询，旧上游甚至要等重启）。
     """
-    raw = _load(filename)
+    group = _group(upstream_id)
+    base_dir = _require_dir(group)
+    raw = _load(filename, base_dir)
     auth = raw.get('auth') or {}
     acct = raw.get('account') or {}
     if not auth.get('accessToken'):
@@ -986,12 +1375,13 @@ async def account_refresh(filename: str, user: dict = Depends(security.require_a
         'domain': auth.get('domain', ''),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
+        'proxy': str(raw.get('proxy') or ''),
     })
     if not ok:
         return {'ok': False, 'message': message}
 
     try:
-        tencent.update_auth_tokens(filename, fields)
+        tencent.update_auth_tokens(filename, fields, base_dir)
     except (ValueError, FileNotFoundError, OSError) as exc:
         # 刷新成功但写不进去：如实说清。**不能报成功**——用户以为续期了，
         # 而磁盘上还是旧 token，重启后又变回过期状态，比直接失败更难查。
@@ -1001,11 +1391,17 @@ async def account_refresh(filename: str, user: dict = Depends(security.require_a
     # restart_now() 返回 (ok, message) 二元组，必须解包：直接当布尔用会因为
     # 非空元组恒为真，从而在重载失败时仍报「已重载生效」（且 reload_triggered
     # 会变成数组、与前端声明的 boolean 不符）。
-    reloaded, reload_error = await reload.restart_now()
+    reloaded, reload_error = await reload.restart_now(upstream=_reload_target(group))
+    if reloaded:
+        tail = '，上游已重载生效'
+    elif group['is_default'] or str(group.get('container') or '').strip():
+        tail = f'；上游重载失败：{reload_error}，请在宿主机重启上游容器'
+    else:
+        # 分组没登记容器名：不猜也不冒报错——上游的 auths 热加载会自己收录
+        tail = f'；{reload_error}；新凭证将由该分组的上游热加载（约 5 秒）自动收录'
     return {
         'ok': True,
-        'message': message + ('，上游已重载生效' if reloaded
-                              else f'；上游重载失败：{reload_error}，请在宿主机重启上游容器'),
+        'message': message + tail,
         'reload_triggered': reloaded,
         'expires_at': fields.get('expires_at'),
     }
@@ -1014,6 +1410,7 @@ async def account_refresh(filename: str, user: dict = Depends(security.require_a
 @router.post('/accounts/{filename}/clear-cooling')
 async def account_clear_cooling(
     filename: str,
+    upstream_id: int | None = Query(None),
     user: dict = Depends(security.require_admin),
 ) -> dict:
     """强制退出账号级冷却、熔断/降权和模型级限流状态。
@@ -1022,6 +1419,16 @@ async def account_clear_cooling(
     Flush 覆盖。因此这个动作必须：停上游 → 原子修改目标账号 → 启上游 →
     验证实时状态。只改目标 uid，不碰凭证、积分、禁用位或其它账号。
     """
+    group = _group(upstream_id)
+    if not group['is_default']:
+        # 清冷却要「停上游 → 改 state.json → 启上游」。分组的登记信息里没有
+        # state.json 的路径（只有地址 / 密钥 / 账号目录），去改默认实例的
+        # state.json 是**改错对象**——那种「成功」比失败更危险。明确拒绝。
+        raise HTTPException(
+            status_code=409,
+            detail=('该分组暂不支持从面板清除冷却（需要该实例的 state.json 路径）；'
+                    '可等它自然冷却，或在宿主机上重启该分组的上游实例'),
+        )
     try:
         raw = wb2api.read_account_file_any(filename)
     except FileNotFoundError as exc:
@@ -1038,6 +1445,7 @@ async def account_clear_cooling(
 async def account_set_note(
     filename: str,
     body: dict = Body(...),
+    upstream_id: int | None = Query(None),
     user: dict = Depends(security.require_admin),
 ) -> dict:
     """给账号写一句备注（issue #67）——比如「张叔叔」「备用号」「给小李用的」。
@@ -1051,7 +1459,8 @@ async def account_set_note(
     空串 = 删除备注（不留空行）。
     """
     try:
-        raw = wb2api.read_account_file_any(filename)
+        raw = wb2api.read_account_file_any(
+            filename, _require_dir(_group(upstream_id)))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail='账号文件不存在') from exc
     uid = str((raw.get('account') or {}).get('uid') or '').strip()
@@ -1073,24 +1482,108 @@ async def account_set_note(
 
 
 @router.delete('/accounts/{filename}')
-async def account_delete(filename: str, user: dict = Depends(security.require_session_admin)) -> dict:
+async def account_delete(filename: str, upstream_id: int | None = Query(None),
+                         user: dict = Depends(security.require_session_admin)) -> dict:
+    group = _group(upstream_id)
     try:
-        removed = wb2api.delete_auth_account(filename)
+        removed = wb2api.delete_auth_account(filename, _require_dir(group))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail='账号文件不存在')
-    reload.request_restart()
+    reload.request_restart(upstream=_reload_target(group))
     return {'success': True}
 
 
+@router.post('/accounts/{filename}/move')
+async def account_move(
+    filename: str,
+    body: dict = Body(...),
+    upstream_id: int | None = Query(None),
+    user: dict = Depends(security.require_session_admin),
+) -> dict:
+    """把一个账号**转移**到另一个分组（「默认分组的账号移进各组」的核心动作）。
+
+    语义与边界：
+      · 源分组 = upstream_id（缺省默认分组）；目标 = body['to_upstream_id']；
+      · 移动的是**账号文件本身**（含 `.json.disabled` 形态），凭证一个字节不改；
+      · 目标已有同名文件时拒绝（409）——覆盖等于丢掉目标那份凭据；
+      · 两侧都必须是登记过本地账号目录的分组（否则明确 409，绝不猜路径）。
+    生效方式：文件落到目标目录后，目标上游的 auths 热加载（约 5 秒）会收录
+    它；这里走 request_reload_or_restart——新上游不必等，旧版本回退重启。
+    """
+    src = _group(upstream_id)
+    to_raw = body.get('to_upstream_id')
+    if 'to_upstream_id' not in body or to_raw is None:
+        raise HTTPException(
+            status_code=400,
+            detail='to_upstream_id 必填（要移动到哪个分组；0 = 默认分组）',
+        )
+    try:
+        # 0 是**显式**的「默认分组」写法；「没填」（None / 键缺失）必须报错 ——
+        # 两者语义不同，把「没填」当默认池会把账号悄悄移错组。
+        to_id = None if to_raw in (0, '0') else int(to_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail='to_upstream_id 必须是分组 id') from None
+    dst = _group(to_id)
+    same = (src.get('id') is None and dst.get('id') is None) or (
+        src.get('id') is not None and src.get('id') == dst.get('id'))
+    if same:
+        raise HTTPException(status_code=400, detail='源分组与目标分组相同，无需移动')
+    src_dir = _require_dir(src)
+    dst_dir = _require_dir(dst)
+
+    # 找到磁盘上的真实文件（两种形态都试，与 read_account_file_any 同口径）
+    name = str(filename)
+    candidates = ([name, name[: -len('.disabled')]] if name.endswith('.disabled')
+                  else [name, name + '.disabled'])
+    src_path: Path | None = None
+    for cand in candidates:
+        cand_path = wb2api._safe_file(cand, src_dir)
+        if cand_path.exists():
+            src_path = cand_path
+            break
+    if src_path is None:
+        raise HTTPException(status_code=404, detail='账号文件不存在')
+
+    dst_path = dst_dir / src_path.name
+    if dst_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=(f'目标分组「{dst["name"]}」里已有同名文件 {src_path.name}；'
+                    '请先处理它（改名或删除）再移动，避免覆盖掉那份凭据'),
+        )
+    try:
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src_path), str(dst_path))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f'移动失败：{exc}') from exc
+
+    uid = ''
+    try:
+        moved = json.loads(dst_path.read_text(encoding='utf-8'))
+        uid = str((moved.get('account') or {}).get('uid') or '')
+    except Exception:  # noqa: BLE001 —— 读不出 uid 不影响移动，只是少了重载收尾
+        uid = ''
+    reload.request_reload_or_restart(uid, upstream=_reload_target(dst))
+    return {
+        'ok': True,
+        'file': src_path.name,
+        'uid': uid,
+        'from': {'id': src['id'], 'name': src['name']},
+        'to': {'id': dst['id'], 'name': dst['name']},
+    }
+
+
 @router.post('/restart')
-async def restart(user: dict = Depends(security.require_session_admin)) -> dict:
-    ok, message = await reload.restart_now()
+async def restart(upstream_id: int | None = Query(None),
+                  user: dict = Depends(security.require_session_admin)) -> dict:
+    group = _group(upstream_id)
+    ok, message = await reload.restart_now(upstream=_reload_target(group))
     return {'ok': ok, 'message': message}
 
 
-def _fallback_why(bit_code: str, disabled: bool) -> str:
+def _fallback_why(bit_code: str, disabled: bool, group: dict | None = None) -> str:
     """回退到改名方式时，把「为什么没走状态位」说到可操作（issue #45 追问）。
 
     `no_route` 有两种成因，界面上必须分得开：
@@ -1115,6 +1608,12 @@ def _fallback_why(bit_code: str, disabled: bool) -> str:
         tail = '已改用改名方式启用（该方式下账号退出账号池，任务也不执行）。'
         next_step = ('若希望以后停用时保留签到与保活，请到「设置 → 账号管理接口」'
                      '开启后重启上游容器')
+    if group is not None and not group.get('is_default'):
+        # 分组的上游配置文件路径不在登记信息里：这里**不能**引用默认实例的
+        # 配置路径（用户照着改的是另一个文件，改完仍无效）。
+        return (f'（该分组「{group["name"]}」的上游未提供管理接口：' + tail
+                + '；如需「只摘流量、任务照常」的语义，请在这个分组自己的上游'
+                '实例里开启 admin 后重启它）')
     enabled, where = wb2api.admin_enabled_in_config()
     if enabled:
         return (f'（上游配置里已开启管理接口（{where}），但运行中的上游没有提供它：'
@@ -1129,6 +1628,7 @@ def _fallback_why(bit_code: str, disabled: bool) -> str:
 async def account_set_disabled(
     filename: str,
     body: dict = Body(...),
+    upstream_id: int | None = Query(None),
     user: dict = Depends(security.require_admin),
 ) -> dict:
     """临时停用 / 启用一个账号（issue #21、#45）。
@@ -1155,13 +1655,15 @@ async def account_set_disabled(
         raise HTTPException(status_code=400, detail='disabled 必须是布尔值')
     disabled = bool(body['disabled'])
     reason = str(body.get('reason') or '').strip() or '面板手动停用'
+    group = _group(upstream_id)
+    base_dir = _require_dir(group)
 
     # uid 用于调上游的状态位接口。用 any 版本读：用户手里的文件名可能与磁盘
     # 形态不一致（刚停用/刚启用时界面仍持旧名），只按一个名字读会解析不出 uid，
     # 于是状态位那条路被静默跳过——「点了启用但没恢复」正是这么来的。
     uid = ''
     try:
-        uid = str((wb2api.read_account_file_any(filename).get('account') or {}).get('uid') or '')
+        uid = str((wb2api.read_account_file_any(filename, base_dir).get('account') or {}).get('uid') or '')
     except Exception:  # noqa: BLE001
         uid = ''
 
@@ -1172,7 +1674,9 @@ async def account_set_disabled(
     if disabled:
         # 停用：先试状态位（语义更精确，且不影响任务）；不行再改名。
         if uid:
-            ok, bit_msg, bit_code = await wb2api.set_manual_disabled(uid, True, reason)
+            ok, bit_msg, bit_code = await wb2api.set_manual_disabled(
+                uid, True, reason, base_url=group['base_url'],
+                api_key=upstreamsvc.forward_api_key(group))
             if ok:
                 return {
                     'ok': True,
@@ -1184,25 +1688,51 @@ async def account_set_disabled(
                     'message': f'已停用该账号（{bit_msg}）',
                 }
         try:
-            result = wb2api.set_account_disabled(filename, True)
+            result = wb2api.set_account_disabled(filename, True, base_dir)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if result['changed'] and body.get('reload', True) is not False:
-            reloaded = reload.request_restart()
+            reloaded = reload.request_restart(upstream=_reload_target(group))
     else:
         # 启用：两条路都要清。先解掉改名标记（本地、幂等），再清状态位——
         # 两种机制理论上不会同时命中同一个账号，但手工改过文件、或跨版本
         # 升级后就可能出现叠加态，一起清掉才能保证「点了启用就真的启用」。
         try:
-            result = wb2api.set_account_disabled(filename, False)
+            result = wb2api.set_account_disabled(filename, False, base_dir)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         renamed_back = bool(result['changed'])
         if renamed_back and body.get('reload', True) is not False:
-            reloaded = reload.request_restart()
+            reloaded = reload.request_restart(upstream=_reload_target(group))
         if uid:
-            ok, bit_msg, bit_code = await wb2api.set_manual_disabled(uid, False)
+            base_url = group['base_url']
+            api_key = upstreamsvc.forward_api_key(group)
+            ok, bit_msg, bit_code = await wb2api.set_manual_disabled(
+                uid, False, base_url=base_url, api_key=api_key)
             if ok:
+                # 「启用」要清的是**两位**，上面那步只清了 manual_disabled。
+                # 上游的 enable **不管系统自动禁用**（其 admin.go 原话：「若账号仍被
+                # 系统自动禁用（disabled），它不会因此回到选号池——那需要 revive」）。
+                # 面板此前从不调 revive，于是被自动禁用的账号（12153 连败 3 次、
+                # 或 11140 被封）点「启用」看着成功、实际还在池外 —— 这正是用户报的
+                # 「重新登录后连通性测试通过、账号池就是调不动」。
+                revived, revive_msg, still_disabled = await _revive_if_disabled(
+                    uid, base_url=base_url, api_key=api_key)
+                if still_disabled:
+                    # 两位都清了才算真的启用。清不掉就**如实说**，不再像以前那样
+                    # 无条件回一句「已启用」——那正是用户被误导的来源。
+                    return {
+                        'ok': False,
+                        'file': result['file'],
+                        'disabled': True,
+                        'changed': True,
+                        'via': 'manual_disabled',
+                        'reload_triggered': reloaded,
+                        'bit_code': bit_code,
+                        # 文案走 toast（纯文本），别用 markdown 记号
+                        'message': (f'已解除面板停用，但该账号仍被上游系统禁用，'
+                                    f'现在仍不会被调用。{revive_msg}'),
+                    }
                 return {
                     'ok': True,
                     'file': result['file'],
@@ -1210,8 +1740,33 @@ async def account_set_disabled(
                     'changed': True,
                     'via': 'manual_disabled',
                     'reload_triggered': reloaded,
-                    'message': f'已启用该账号（{bit_msg}）'
+                    'revived': revived,
+                    # 两位都清了才算真的回到池子：`still_disabled is None` 表示这一趟
+                    # **没读到**上游状态，那就别把话说满（上面 True 的分支已如实报失败）。
+                    'message': (f'已启用该账号（{bit_msg}'
+                                + ('；并已解除系统禁用' if revived else '')
+                                + ('；但读不到上游状态，未能确认它是否仍被系统禁用'
+                                   if still_disabled is None else '')
+                                + '）')
                                + ('，正在重载上游使其生效' if reloaded else ''),
+                }
+            # 状态位没走通（多半是上游没开管理接口）。这时**必须先看一眼**它是不是
+            # 被系统禁用了：若是，下面的改名回退救不了它 —— 改名只管「文件在不在
+            # 池里」，管不了上游的 disabled 位；而 revive 与 enable 同属那组没注册
+            # 的接口，所以此刻确实无解。如实说清，别跟着兜底文案一起报「已启用」。
+            still = await wb2api.account_disabled(uid, base_url=base_url, api_key=api_key)
+            if still:
+                return {
+                    'ok': False,
+                    'file': result['file'],
+                    'disabled': True,
+                    'changed': renamed_back,
+                    'via': 'rename',
+                    'reload_triggered': reloaded,
+                    'bit_code': bit_code,
+                    'message': ('该账号被上游系统禁用，而解除它需要上游的「账号管理接口」；'
+                                '当前上游没有提供这组接口，面板无法把它放回账号池。'
+                                + _fallback_why(bit_code, False, group)),
                 }
 
     return {
@@ -1231,7 +1786,7 @@ async def account_set_disabled(
             # 回退路径要如实说清代价，并给出**可操作的下一步**：「该上游未启用管理
             # 接口」只说了现状，用户不知道去哪儿开（实测反馈正是这个——看到提示后
             # 只能来问）。所以带上开关位置与生效条件。
-            + _fallback_why(bit_code, disabled)
+            + _fallback_why(bit_code, disabled, group)
             + ('，正在重载上游使其生效' if reloaded
                else ('；请手动重启上游以生效' if result.get('changed') else ''))
         ),

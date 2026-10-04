@@ -139,6 +139,12 @@ class RestartBehaviorTest(unittest.TestCase):
 
         with mock.patch.object(mod, 'run', side_effect=lambda cmd, **k: (calls.append(cmd), (0, ''))[1]):
             mod.restart_service(Rep())
+        if os.name == 'nt':
+            # Windows 没有 systemd，宿主形态在这里走的是 Windows 分支（如实提示
+            # 「新代码已就位，重启面板」）—— 调用一个不存在的命令会让本来已经成功的
+            # 更新被判成失败。该分支的细则见 test_update_lifecycle.RestartStepOnWindows。
+            self.assertEqual(calls, [], f'Windows 上不该执行任何命令，实际：{calls}')
+            return
         self.assertTrue(any('systemctl' in c for c in calls),
                         f'宿主形态应调用 systemctl，实际：{calls}')
 
@@ -714,7 +720,9 @@ class ContainerReloadHintTest(unittest.TestCase):
         self.assertNotIn('reload_hint', res)
 
     def test_frontend_surfaces_hint(self) -> None:
-        src = (_ROOT / 'web' / 'app' / '(main)' / 'settings' / 'page.tsx'
+        # 设置页的外壳在 `layout.tsx`（批次 4 起 7 个 Tab 变成 `/settings/<tab>`
+        # 子路由，取数与表单状态都留在不重挂载的 layout 上）。
+        src = (_ROOT / 'web' / 'app' / '(main)' / 'settings' / 'layout.tsx'
                ).read_text(encoding='utf-8')
         self.assertIn('reload_hint', src,
                       '设置页没读 reload_hint —— 用户会以为配置已生效')
@@ -991,3 +999,123 @@ class UpstreamSourceFallbackTest(unittest.TestCase):
             self.assertTrue((dest / 'scripts' / 'x.py').is_file(), '子目录内容也应在')
             self.assertFalse((dest / 'workbuddy2api-abc1234').exists(),
                              '顶层目录没被剥掉')
+
+
+class UpstreamHealthProbeAddressTest(unittest.TestCase):
+    """issue #123：就绪探测地址必须跟着部署形态走。
+
+    报障：容器部署（manager 与上游各一个容器，`WB2API_BASE=http://workbuddy2api:7863`）
+    下点「一键更新」，上游 18 秒就起来了，面板却空等 3 分钟才打一条「上游未在预期
+    时间内就绪」的假警告 —— 探测写死了 `127.0.0.1:7863`，那是**宿主机**的回环，
+    manager 容器里根本没有这个端口，90 轮全部 connection refused。
+
+    这里钉三件事：地址从哪来（面板同一个来源）、两个调用点都走它、
+    探测不被代理带偏（同一个假警告家族：容器内网地址交给代理也是必失败）。
+    """
+
+    def setUp(self) -> None:
+        self.m = _load_update_mod()
+
+    def _probe_url(self, mod=None, **env):
+        """在给定环境变量下求探测地址；其余相关变量一律先清干净。
+
+        `WB_UPSTREAM_PORT` 与其它常量一样是**导入期**读的，要换端口就得换一份模块
+        ——更新器在真实流程里也是先有环境变量、再启动（见 `_load_update_mod`）。
+        """
+        keys = ['WB2API_BASE', 'WB_UPSTREAM_HEALTH_URL', 'WB_UPSTREAM_PORT']
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in keys:
+                os.environ.pop(k, None)
+            os.environ.update({k: str(v) for k, v in env.items() if v})
+            return (mod or self.m).upstream_health_url()
+
+    def test_container_部署取容器_dns(self) -> None:
+        self.assertEqual(self._probe_url(WB2API_BASE='http://workbuddy2api:7863'),
+                         'http://workbuddy2api:7863/healthz',
+                         '容器里要用容器 DNS，不是回环')
+
+    def test_显式覆盖优先(self) -> None:
+        self.assertEqual(
+            self._probe_url(WB2API_BASE='http://workbuddy2api:7863',
+                            WB_UPSTREAM_HEALTH_URL='http://relay.example.com:8080/hz'),
+            'http://relay.example.com:8080/hz')
+
+    def test_宿主机原生回落回环(self) -> None:
+        self.assertEqual(self._probe_url(), 'http://127.0.0.1:7863/healthz')
+        self.assertEqual(self._probe_url(_load_update_mod(WB_UPSTREAM_PORT=7999)),
+                         'http://127.0.0.1:7999/healthz')
+
+    def test_反代与_IPV6_形态(self) -> None:
+        self.assertEqual(self._probe_url(WB2API_BASE='https://relay.example.com/wb'),
+                         'https://relay.example.com/healthz', '只取 scheme+host')
+        self.assertEqual(self._probe_url(WB2API_BASE='http://[::1]:9000'),
+                         'http://[::1]:9000/healthz', 'IPv6 字面量要带方括号')
+
+    def test_畸形值回落而不是抛错(self) -> None:
+        """更新器不能因为一个地址拼不出来就中断。"""
+        for bad in (':::garbage:::', 'http://host:notanum', '//', 'http://'):
+            with self.subTest(bad=bad):
+                self.assertEqual(self._probe_url(WB2API_BASE=bad),
+                                 'http://127.0.0.1:7863/healthz')
+
+    def test_就绪等待走派生地址(self) -> None:
+        rep = _Rep()
+        with mock.patch.dict(os.environ, {'WB2API_BASE': 'http://workbuddy2api:7863'}):
+            with mock.patch.object(self.m, 'wait_health', return_value=True) as wh:
+                ok = self.m.wait_upstream_ready(rep)
+        self.assertTrue(ok)
+        self.assertEqual(wh.call_args[0][0], 'http://workbuddy2api:7863/healthz',
+                         '还是一键更新那条路：地址必须派生')
+        self.assertIn('上游已就绪', rep.text())
+
+    def test_构建失败后的存活探测也走派生地址(self) -> None:
+        rep = _Rep()
+        with mock.patch.dict(os.environ, {'WB2API_BASE': 'http://workbuddy2api:7863'}):
+            with mock.patch.object(self.m, '_health_ok', return_value=True) as hk:
+                self.m._report_service_state(rep)
+        self.assertEqual(hk.call_args[0][0], 'http://workbuddy2api:7863/healthz')
+        self.assertIn('服务正常', rep.text())
+
+    def test_探测不被代理带偏(self) -> None:
+        """容器里常为拉 GitHub 配了 WB_HTTP_PROXY，探测内部地址不能跟着走代理。
+
+        真起一个本地服务：环境里把 http_proxy 指向一个**死地址**，
+        若探测走了代理必然失败；直连则通过。
+        """
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class H(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def log_message(self, *a) -> None:  # noqa: D102
+                pass
+
+            def do_GET(self) -> None:  # noqa: N802
+                body = b'{"ok":true}'
+                self.send_response(200)
+                self.send_header('content-length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f'http://127.0.0.1:{srv.server_address[1]}/healthz'
+        try:
+            with mock.patch.dict(os.environ, {
+                    'http_proxy': 'http://127.0.0.1:1', 'https_proxy': 'http://127.0.0.1:1',
+                    'HTTP_PROXY': 'http://127.0.0.1:1', 'HTTPS_PROXY': 'http://127.0.0.1:1'}):
+                self.assertTrue(self.m._health_ok(url, timeout=3),
+                                '探测走了代理（假警告家族的老毛病）')
+        finally:
+            srv.shutdown()
+
+    def test_回环字面量只剩派生函数里那一处(self) -> None:
+        """回归钉：别再把回环写回调用点（写回去就是 issue #123 复发）。"""
+        src = (_ROOT / 'deploy' / 'update.py').read_text(encoding='utf-8')
+        literal = "f'http://127.0.0.1:{UPSTREAM_PORT}/healthz'"
+        self.assertEqual(src.count(literal), 1,
+                         f'回环探测字面量应只在 upstream_health_url 里出现一次，'
+                         f'现在有 {src.count(literal)} 处')
+        self.assertIn('wait_health(upstream_health_url()', src,
+                      '就绪等待要传派生地址')

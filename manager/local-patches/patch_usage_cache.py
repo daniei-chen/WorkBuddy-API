@@ -7,8 +7,17 @@ cache_miss_tokens，但 `backfill_usage_from_logs` 与 `rebuild_usage_from_logs`
 从日志聚合重建 usage_daily 时**没有带上这两列**，一旦执行「修复统计 / 重建统计」，
 历史行的缓存数据即被清零（表现为「前几天没有命中率」）。
 
-覆盖两个代码世代（1.0.37 与 1.0.57+，重构后 rebuild 改走事务化 executemany）：
+覆盖三个代码世代（1.0.37 / 1.0.57+ / 1.0.79）：
 以「小片段」为锚点、逐条应用；缺失的可选锚点自动跳过，不误伤。
+
+2026-10-04 适配 1.0.79：
+  * 「聚合 SQL credit 行」由 expect=2 改为 opt —— 1.0.79 新增按桶聚合的
+    _usage_expected_rows()，该片段出现 3 次（历史版本 2 次）；替换与上下文无关
+    （只给 SELECT 补两列），故「有则全替换、无则跳过」更稳。
+  * 「ON CONFLICT」锚点改为只命中 usage_daily 整块。1.0.79 里 credit = MAX(...)
+    出现 2 次，第二处属于 usage_hourly —— 该表没有 cache_hit_tokens /
+    cache_miss_tokens 列，误改会让小时统计写入直接报 no such column。
+  * 末尾自检不再硬编码 2，改为「补上的列对数 == 本次实际替换次数」。
 
 用法：patch_usage_cache.py [db.py 路径]   # 缺省 /opt/workbuddy-manager/...
 幂等：检测到已含 cache 差额判断则跳过；异常只记录、返回 0，不阻塞启动。
@@ -27,11 +36,13 @@ BACKUP = '/opt/workbuddy-manager/local-patches/backup'
 #   expect 为整数 ≥ 1 —— 必须恰好命中该次数，否则整体中止；
 #   expect 为 'opt'    —— 可选锚点：0 次跳过（另一代码世代），>0 次全部替换。
 RULES = [
-    # ── 聚合 SQL 的 credit 行（backfill + rebuild 各一处；两代相同）──
+    # ── 聚合 SQL 的 credit 行 ──
+    #    1.0.37 / 1.0.57：2 处（backfill + rebuild）；1.0.79：3 处（多一个按桶聚合）。
+    #    替换与上下文无关（只给 SELECT 补两列），故用 opt；末尾自检核对列对数与替换次数。
     ('        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr "\n',
      '        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr, "\n'
      '        "COALESCE(SUM(cache_hit_tokens),0) AS ch, COALESCE(SUM(cache_miss_tokens),0) AS cm "\n',
-     2, '聚合 SQL credit 行'),
+     'opt', '聚合 SQL credit 行'),
 
     # ── backfill：current 查询（两代相同）──
     ("            'SELECT day, key_id, model, realm, requests, prompt_tokens, "
@@ -68,12 +79,24 @@ RULES = [
      "completion_tokens, credit, realm, cache_hit_tokens, cache_miss_tokens) '\n",
      'opt', 'INSERT 列清单（单行版）'),
 
-    # ── backfill：ON CONFLICT 子句（两代相同）──
-    ("            '  credit = MAX(credit, excluded.credit)',\n",
+    # ── usage_daily 的 ON CONFLICT 子句 ──
+    #    ⚠️ 不能只锚 credit = MAX(...) 那一行：1.0.79 起它同时出现在 usage_hourly 的
+    #    upsert 里，而 usage_hourly 没有缓存列，误改会让小时统计写入报 no such column。
+    #    故锚点带上 usage_daily 特有的 ON CONFLICT(day, key_id, model, realm) 那几行
+    #    （实测 1.0.37 / 1.0.57 / 1.0.79 三代均恰好 1 处）。
+    ("            'ON CONFLICT(day, key_id, model, realm) DO UPDATE SET '\n"
+     "            '  requests = MAX(requests, excluded.requests), '\n"
+     "            '  prompt_tokens = MAX(prompt_tokens, excluded.prompt_tokens), '\n"
+     "            '  completion_tokens = MAX(completion_tokens, excluded.completion_tokens), '\n"
+     "            '  credit = MAX(credit, excluded.credit)',\n",
+     "            'ON CONFLICT(day, key_id, model, realm) DO UPDATE SET '\n"
+     "            '  requests = MAX(requests, excluded.requests), '\n"
+     "            '  prompt_tokens = MAX(prompt_tokens, excluded.prompt_tokens), '\n"
+     "            '  completion_tokens = MAX(completion_tokens, excluded.completion_tokens), '\n"
      "            '  credit = MAX(credit, excluded.credit), '\n"
      "            '  cache_hit_tokens = MAX(cache_hit_tokens, excluded.cache_hit_tokens), '\n"
      "            '  cache_miss_tokens = MAX(cache_miss_tokens, excluded.cache_miss_tokens)',\n",
-     1, 'backfill ON CONFLICT'),
+     1, 'usage_daily ON CONFLICT'),
 
     # ── VALUES 占位符：backfill（尾随空格；两代相同）──
     ("            'VALUES(?, ?, ?, ?, ?, ?, ?, ?) '\n",
@@ -132,6 +155,7 @@ def main() -> int:
 
     out = src
     hits = 0
+    agg_hits = 0        # 「聚合 SQL credit 行」实际替换处数，供末尾自检
     for old, new, expect, label in RULES:
         n = out.count(old)
         if expect == 'opt':
@@ -143,15 +167,18 @@ def main() -> int:
             return 0
         out = out.replace(old, new)
         hits += 1
+        if label.startswith('聚合 SQL'):
+            agg_hits = n
         print(f'patch_usage_cache: 应用 {label}（{n} 处）')
 
     if hits == 0 or out == src:
         print('patch_usage_cache: 无需修改')
         return 0
 
-    # 替换后自检：关键特征必须到位，否则视为半套、不落盘
-    if out.count('AS ch, COALESCE(SUM(cache_miss_tokens),0) AS cm ') != 2:
-        print('patch_usage_cache: 自检失败（聚合列未成对出现），不写')
+    # 替换后自检：补上的列对数必须与「聚合 SQL」规则的实际替换次数一致
+    ch_pairs = out.count('AS ch, COALESCE(SUM(cache_miss_tokens),0) AS cm ')
+    if ch_pairs != agg_hits:
+        print(f'patch_usage_cache: 自检失败（补上的列对数 {ch_pairs} 与替换次数 {agg_hits} 不一致），不写')
         return 0
     try:
         compile(out, target, 'exec')

@@ -227,6 +227,12 @@ def patch_gateway(path: str) -> int:
     if '_usage_cache_tokens' in text:
         print('[skip] gateway.py 已含缓存采集补丁')
         return 0
+    # 2026-10-04：上游 1.0.79 起已原生采集缓存 token（gateway.py 里形如
+    # `cache_hit_tokens=cache_hit,`），本补丁对这类代码世代已过时。
+    # 明确 skip 而不是 [FAIL] —— 避免与「真正的锚点漂移」混在一起、掩盖真问题。
+    if 'cache_hit_tokens=' in text:
+        print('[skip] gateway.py 上游已原生采集缓存 token，本补丁无需施加')
+        return 0
     anchor = 'def _usage_credit(usage: dict | None) -> float | None:'
     if text.count(anchor) != 1:
         print('[FAIL] gateway.py: _usage_credit 锚点不唯一，未打补丁')

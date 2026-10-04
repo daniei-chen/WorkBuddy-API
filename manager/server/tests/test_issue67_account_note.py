@@ -232,7 +232,7 @@ class NoteInListTest(_DbCase):
         _write_auth(config.AUTH_DIR, other, '另一个号')
         db.set_account_note(UID, '张叔叔')
 
-        async def _fake_status() -> dict:
+        async def _fake_status(*, base_url=None, api_key=None) -> dict:
             return {'connected': False}
 
         with mock.patch.object(A.wb2api, 'get_status', _fake_status):

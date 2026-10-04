@@ -264,7 +264,7 @@ class UpdateEndToEndTest(unittest.TestCase):
         mod = self._load(inst)
         ok, rep = self._run_update(mod, pkg, None)
         self.assertFalse(ok)
-        self.assertIn('没有可用的签名文件', rep.text())
+        self.assertIn('尚未附带签名文件', rep.text())
         self.assertIn('# OLD', (inst / 'server' / 'main.py').read_text(encoding='utf-8'))
 
     def test_placeholder_pubkey_blocks_every_update(self) -> None:

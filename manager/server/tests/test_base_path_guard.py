@@ -92,7 +92,8 @@ class NavigationPathsTest(unittest.TestCase):
         判据是「赋值语句里出现 BASE_PATH，或它引用的标识符在本文件里被赋予了带
         BASE_PATH 的值」—— 只看赋值语句本身会误报（第一版就误报了 loginPath）。
         """
-        for rel in ('lib/auth-context.tsx', 'lib/api.ts', 'app/(main)/settings/page.tsx'):
+        # 设置页的外壳在 `layout.tsx`（批次 4 起 Tab 变成子路由，见那个文件顶部）
+        for rel in ('lib/auth-context.tsx', 'lib/api.ts', 'app/(main)/settings/layout.tsx'):
             src = _src(rel)
             for m in re.finditer(r'window\.location\.href\s*=\s*([^;\n]+)', src):
                 expr = m.group(1).strip()

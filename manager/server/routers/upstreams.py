@@ -6,11 +6,14 @@
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .. import security, upstreamsvc
 from ..iputil import client_ip
+from ..services import wb2api
 
 router = APIRouter(prefix='/api/upstreams', tags=['upstreams'])
 
@@ -22,6 +25,11 @@ class UpstreamIn(BaseModel):
     api_key: str = Field(default='', max_length=500)
     note: str = Field(default='', max_length=200)
     enabled: bool = True
+    # 分组的本地账号目录（绝对路径，见 upstreamsvc.normalize_auth_dir）。
+    # 空 = 该分组不由本面板管理账号（只用于密钥转发）。
+    auth_dir: str = Field(default='', max_length=500)
+    # 分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
+    container: str = Field(default='', max_length=64)
 
 
 class UpstreamPatch(BaseModel):
@@ -30,6 +38,8 @@ class UpstreamPatch(BaseModel):
     api_key: str | None = None
     note: str | None = None
     enabled: bool | None = None
+    auth_dir: str | None = None
+    container: str | None = None
 
 
 def _serialize(items: list[dict]) -> list[dict]:
@@ -72,6 +82,7 @@ def create_upstream(body: UpstreamIn, request: Request,
         created = upstreamsvc.create_upstream(
             name=body.name, base_url=body.base_url, api_key=body.api_key,
             note=body.note, enabled=body.enabled,
+            auth_dir=body.auth_dir, container=body.container,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -100,6 +111,22 @@ def update_upstream(upstream_id: int, body: UpstreamPatch, request: Request,
 @router.delete('/{upstream_id}')
 def delete_upstream(upstream_id: int, request: Request,
                     user: dict = Depends(security.require_session_admin)) -> dict:
+    upstream = upstreamsvc.get_upstream(upstream_id)
+    if upstream is None:
+        raise HTTPException(status_code=404, detail='上游不存在')
+    # 分组里还有账号时拒绝删除：删记录会让那个账号目录从面板里消失——文件仍在
+    # 磁盘上，但面板不再有它的任何入口（移不走、删不掉、也看不见），只能去
+    # 宿主机上手动处理。先把账号移走或删除，再删分组。
+    auth_dir = str(upstream.get('auth_dir') or '').strip()
+    if auth_dir:
+        remaining = len(wb2api.list_auth_accounts(Path(auth_dir)))
+        if remaining:
+            raise HTTPException(
+                status_code=409,
+                detail=(f'分组「{upstream["name"]}」里还有 {remaining} 个账号，'
+                        '先把它们移走或删除，再删除分组'
+                        '（本操作只删分组记录，不会删除账号目录与文件）'),
+            )
     deleted, used = upstreamsvc.delete_upstream(upstream_id)
     if not deleted:
         if used:

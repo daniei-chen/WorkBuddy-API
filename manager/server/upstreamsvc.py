@@ -19,7 +19,9 @@
 """
 from __future__ import annotations
 
+import re
 import time
+from pathlib import Path
 
 from . import config, db
 
@@ -31,6 +33,7 @@ DEFAULT_ID = None
 MAX_NAME = 64
 MAX_NOTE = 200
 MAX_URL = 500
+MAX_PATH = 500
 
 
 class UpstreamUnavailable(Exception):
@@ -60,6 +63,37 @@ def normalize_base_url(value: object) -> str:
     return url.rstrip('/')
 
 
+def normalize_auth_dir(value: object) -> str:
+    """分组的本地账号目录：空 = 不管理；非空必须是**绝对路径**。
+
+    这个值会直接进入文件系统操作（列目录、改文件名、移动账号文件），而面板
+    进程的 cwd 与上游部署目录无关——相对路径会解析到不可预期的位置，故障现场
+    也极难判断「它到底读了哪个目录」。部署约定本来就是「两边看到同一个绝对
+    路径」（同机 / bind mount），所以只接受绝对路径。
+    """
+    s = _clean(value, MAX_PATH)
+    if not s:
+        return ''
+    if not Path(s).is_absolute():
+        raise ValueError(f'账号目录必须是绝对路径（面板按该路径读写账号文件）：{s}')
+    return s
+
+
+def normalize_container(value: object) -> str:
+    """分组的容器名：空 = 不可从面板重启；非空必须符合 docker 名称字符集。
+
+    为什么校验：这个名字会被拼进 `docker restart <name>`。脏字符轻则让 docker
+    报错，重则变成对另一个对象的操作（甚至被解析成 docker 选项）。宁可在保存
+    时拒绝，也不在重启时猜。
+    """
+    s = _clean(value, MAX_NAME)
+    if not s:
+        return ''
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,62}', s):
+        raise ValueError(f'容器名不合法（只允许字母、数字、_ . -，且不以符号开头）：{s}')
+    return s
+
+
 def _row_to_dict(row) -> dict:
     return {
         'id': int(row['id']),
@@ -68,6 +102,8 @@ def _row_to_dict(row) -> dict:
         'api_key': str(row['api_key'] or ''),
         'note': str(row['note'] or ''),
         'enabled': bool(row['enabled']),
+        'auth_dir': str(row['auth_dir'] or ''),
+        'container': str(row['container'] or ''),
         'created_at': row['created_at'],
         'updated_at': row['updated_at'],
         'is_default': False,
@@ -83,6 +119,10 @@ def default_upstream() -> dict:
         'api_key': config.upstream_api_key(),
         'note': '来自 WB2API_BASE 与上游 config.json（未配置多上游时使用的接入点）',
         'enabled': True,
+        # 默认分组的账号目录即部署时的 WB_AUTH_DIR —— 只读展示，不由界面修改
+        # （改了它只会让面板与上游看到两个目录，属于配置漂移而不是功能）。
+        'auth_dir': str(config.AUTH_DIR),
+        'container': config.WB2API_CONTAINER,
         'created_at': None,
         'updated_at': None,
         'is_default': True,
@@ -113,17 +153,19 @@ def list_upstreams(*, include_default: bool = True) -> list[dict]:
 
 
 def create_upstream(name: object, base_url: object, api_key: object = '',
-                    note: object = '', enabled: object = True) -> dict:
+                    note: object = '', enabled: object = True,
+                    auth_dir: object = '', container: object = '') -> dict:
     nm = _clean(name, MAX_NAME)
     if not nm:
         raise ValueError('上游名称不能为空')
     url = normalize_base_url(base_url)
     now = int(time.time())
     uid = db.execute(
-        'INSERT INTO upstreams(name, base_url, api_key, note, enabled, created_at, updated_at) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO upstreams(name, base_url, api_key, note, enabled, auth_dir, container, '
+        'created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (nm, url, _clean(api_key, MAX_URL), _clean(note, MAX_NOTE),
-         1 if enabled else 0, now, now),
+         1 if enabled else 0, normalize_auth_dir(auth_dir), normalize_container(container),
+         now, now),
     )
     row = db.query_one('SELECT * FROM upstreams WHERE id = ?', (uid,))
     return _row_to_dict(row)
@@ -152,6 +194,10 @@ def update_upstream(upstream_id: object, patch: dict) -> dict | None:
         fields['note'] = _clean(patch['note'], MAX_NOTE)
     if 'enabled' in patch:
         fields['enabled'] = 1 if patch['enabled'] else 0
+    if 'auth_dir' in patch:
+        fields['auth_dir'] = normalize_auth_dir(patch['auth_dir'])
+    if 'container' in patch:
+        fields['container'] = normalize_container(patch['container'])
     if fields:
         fields['updated_at'] = int(time.time())
         assignments = ', '.join(f'{k} = ?' for k in fields)
@@ -232,6 +278,32 @@ def resolve_for_key(key: dict | None) -> dict:
         raise UpstreamUnavailable(
             f'密钥绑定的上游「{row["name"]}」已停用 —— 启用它，或把密钥改绑到其它上游')
     return row
+
+
+def _same_base(a: object, b: object) -> bool:
+    """两个 Base URL 是否指同一套实例（去首尾空白与末尾斜杠后逐字比较）。"""
+    return str(a or '').strip().rstrip('/') == str(b or '').strip().rstrip('/')
+
+
+def forward_api_key(upstream: dict | None) -> str:
+    """跟这套上游说话时该用的 api_key：自己填了用自己那把；留空且与默认分组
+    同址的，沿用默认上游那把。
+
+    为什么有后一条：账号页「添加分组」的默认形态就是**只填名称** —— 地址默认
+    沿用默认分组的地址，而 api_key 留空（默认分组的钥匙明文不出接口，前端填不
+    进去）。同址 = 同一套实例，钥匙本就是同一把：不沿用的话，绑定该分组的密钥
+    调用、该分组的 /status、停用 / 启用位都会吃上游 401 —— 而且只填名称恰恰是
+    产品的默认路径。
+
+    地址不同的留空维持「不带鉴权头」：既支持不鉴权的自建实例，也不把默认钥匙
+    发去别的地址。
+    """
+    key = str((upstream or {}).get('api_key') or '')
+    if key or not upstream or upstream.get('is_default'):
+        return key
+    if _same_base(upstream.get('base_url'), default_upstream().get('base_url')):
+        return str(default_upstream().get('api_key') or '')
+    return ''
 
 
 async def probe(upstream: dict) -> tuple[bool, str]:

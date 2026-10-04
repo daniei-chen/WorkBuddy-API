@@ -593,7 +593,7 @@ class CostExploreIntervalTest(unittest.TestCase):
         return json.loads(self.cfg_path.read_text(encoding='utf-8'))
 
     def test_valid_durations_accepted(self) -> None:
-        for good in ('30m', '1h', '45s', '2d'):
+        for good in ('30m', '1h', '45s', '48h'):
             with self.subTest(good=good):
                 wb2api.save_upstream_config({'pool': {'cost_explore_interval': good}})
                 self.assertEqual(self._read()['pool']['cost_explore_interval'], good)
@@ -614,7 +614,7 @@ class CostExploreIntervalTest(unittest.TestCase):
 
     def test_bad_format_rejected(self) -> None:
         """格式错误必须**当场拒绝** —— 放行会让上游启动失败。"""
-        for bad in ('not-a-duration', '30', '-5m', '十分钟', '1.5h'):
+        for bad in ('not-a-duration', '30', '-5m', '十分钟', '1.5h', '7d'):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 wb2api.save_upstream_config({'pool': {'cost_explore_interval': bad}})
 

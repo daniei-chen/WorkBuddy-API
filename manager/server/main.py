@@ -15,10 +15,10 @@ from . import config, db, redpacket, security
 from .iputil import client_ip
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
-    redpackets, responses, security as security_router, settings, stats,
-    system, tokens, upstreams,
+    pgsync as pgsync_router, redpackets, responses, security as security_router,
+    settings, stats, system, tokens, upstreams,
 )
-from .services import accountlog, renew, tasklog, taskrun
+from .services import accountlog, pgsync, renew, tasklog, taskrun
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,9 @@ async def lifespan(app: FastAPI):
     # 请求日志的「账号」回填（issue #69）：账号是上游选的、不在响应里回传，
     # 只能从它的容器日志里读出来再按时间对回去（见 accountlog 的说明）。
     accountlog.start_collector()
+    # PostgreSQL 定时备份（用户反馈：怕服务器暴雷丢数据）。默认关闭 ——
+    # 只有配好连接、打开开关并设了间隔才会真的推数据出去。
+    pgsync.start_scheduler()
     try:
         yield
     finally:
@@ -53,6 +56,7 @@ async def lifespan(app: FastAPI):
         taskrun.stop_scheduler()
         renew.stop_scheduler()
         accountlog.stop_collector()
+        pgsync.stop_scheduler()
 
 
 def _warn_if_exposed() -> None:
@@ -74,7 +78,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.71',
+    version='1.0.79',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -145,6 +149,8 @@ app.include_router(security_router.router)
 # 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
 app.include_router(tokens.router)
 app.include_router(settings.router)
+# PostgreSQL 异地备份：把本地数据镜像出去、需要时拉回来（见 services/pgsync）
+app.include_router(pgsync_router.router)
 # 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc
 app.include_router(upstreams.router)
 app.include_router(system.router)

@@ -309,6 +309,75 @@ def _daily_failures(days: int, realm: str | None = None) -> dict[str, int]:
         return {}
 
 
+@router.get('/hourly')
+def hourly(day: str | None = None, realm: str | None = None,
+           user: dict = Depends(security.current_user)) -> list[dict]:
+    """某天**按小时**聚合（默认今天）。「今日」趋势图用它 —— 范围只有一天时
+    按天聚合只会得到一根柱子，看不出「今天什么时候忙」。
+
+    与 `/daily` 同一套口径：
+      · 用量取自 `usage_hourly`，它与 `usage_daily` 由**同一处写入**累计，
+        所以这里的合计与页头卡片天然一致（清日志、日志保留期裁剪都不影响）；
+      · `failed` 仍来自 `request_logs`（`usage_*` 只累计有 token 或有扣费的请求，
+        被拒绝与零 token 的失败在里面根本不存在）。
+
+    **固定返回 24 个桶（补零）**：X 轴长度不随「今天走到几点」变化，图上不会
+    因为还没到的时段而抖动；没数据的时段就是 0，读起来也清楚。
+    """
+    d = (day or '').strip() or time.strftime('%Y-%m-%d')
+    # 只接受 YYYY-MM-DD：这是个查询参数，写错形态就回落到今天，而不是抛错
+    # （趋势图不该因为一个手改的 URL 变成红色错误态）。
+    if len(d) != 10 or d[4] != '-' or d[7] != '-':
+        d = time.strftime('%Y-%m-%d')
+    rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
+    rargs: tuple = (realm,) if rf else ()
+    rows = db.query(
+        'SELECT hour, SUM(requests) AS requests, '
+        'SUM(prompt_tokens) AS prompt_tokens, '
+        'SUM(completion_tokens) AS completion_tokens, '
+        'COALESCE(SUM(credit),0) AS credit '
+        f'FROM usage_hourly WHERE day = ?{rf} GROUP BY hour ORDER BY hour ASC',
+        (d,) + rargs,
+    )
+    by_hour = {int(r['hour']): r for r in rows}
+    failures = _hourly_failures(d, realm)
+    out: list[dict] = []
+    for h in range(24):
+        r = by_hour.get(h)
+        out.append({
+            'day': d,
+            'hour': h,
+            'requests': int(r['requests'] or 0) if r else 0,
+            'prompt_tokens': int(r['prompt_tokens'] or 0) if r else 0,
+            'completion_tokens': int(r['completion_tokens'] or 0) if r else 0,
+            'credit': float(r['credit'] or 0) if r else 0.0,
+            'failed': failures.get(h, 0),
+        })
+    return out
+
+
+def _hourly_failures(day: str, realm: str | None = None) -> dict[int, int]:
+    """某天**按小时**的失败请求数（4xx + 5xx）。口径与 `_failures` 一致。"""
+    try:
+        rf = " AND COALESCE(realm, 'cn') = ?" if realm in ('cn', 'global') else ''
+        # 过滤用 ts 范围（走索引），分组用小时表达式（要聚合，躲不开）
+        args = (db.day_start_ts(day), db.day_start_ts(day) + 86400) + ((realm,) if rf else ())
+        rows = db.query(
+            f"SELECT {db.hour_sql('ts')} AS bucket, COUNT(*) AS n FROM request_logs "
+            f"WHERE ts >= ? AND ts < ? AND status >= 400 AND key_id IS NOT NULL{rf} "
+            f'GROUP BY bucket',
+            args,
+        )
+        out: dict[int, int] = {}
+        for r in rows:
+            bucket = str(r['bucket'] or '')
+            if len(bucket) >= 13:
+                out[int(bucket[11:13])] = int(r['n'])
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 @router.get('/by-model')
 def by_model(days: int = 30, realm: str | None = None,
              user: dict = Depends(security.current_user)) -> list[dict]:

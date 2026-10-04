@@ -26,6 +26,7 @@ import asyncio
 import logging
 import time
 
+from .. import upstreamsvc
 from . import wb2api
 
 logger = logging.getLogger('workbuddy.reload')
@@ -74,12 +75,27 @@ async def _worker_loop() -> None:
             _state['pending'] = False
 
 
-def request_restart() -> bool:
+def request_restart(upstream: dict | None = None) -> bool:
     """请求一次上游重载（幂等：短时间内多次调用只重启一次）。
+
+    upstream 非空 = 该**分组**（多分组 / 账号池）：登记了容器名就后台
+    `docker restart` 它；没登记就**什么都不做**——账号文件的增删改会被上游的
+    auths 热加载（约 5 秒）自动收录，为「立刻生效」去重启别的对象才是灾难。
+    默认上游（upstream=None）保持既有行为：合并窗口 + 后台重启 + 状态上报。
 
     立即返回，不阻塞请求；实际重启在后台完成。
     返回 False 表示没有运行中的事件循环，无法调度后台任务。
     """
+    if upstream is not None:
+        container = str(upstream.get('container') or '').strip()
+        if not container:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        loop.create_task(_restart_container_bg(container))
+        return True
     global _pending, _worker
     _pending = True
     _state['pending'] = True
@@ -93,9 +109,27 @@ def request_restart() -> bool:
     return True
 
 
-async def restart_now() -> tuple[bool, str]:
-    """立即重启并等待结果，供「重启上游」这类显式操作使用。"""
-    return await wb2api.restart_container()
+async def _restart_container_bg(container: str) -> None:
+    """分组容器的后台重启，结果照常记进 reload 状态（设置页可见）。"""
+    ok, message = await wb2api.restart_container(container)
+    _state['restart_count'] += 1
+    _state['last_at'] = time.time()
+    _state['last_ok'] = ok
+    _state['last_message'] = message
+
+
+async def restart_now(upstream: dict | None = None) -> tuple[bool, str]:
+    """立即重启并等待结果，供「重启上游」这类显式操作使用。
+
+    upstream 非空 = 该**分组**：没登记容器名时明确报错——绝不能拿默认上游的
+    容器名去顶（那会重启另一个实例，而用户以为重启的是这一组）。
+    """
+    if upstream is None:
+        return await wb2api.restart_container()
+    container = str(upstream.get('container') or '').strip()
+    if not container:
+        return False, '该分组未配置容器名，无法从面板重启（账号改动由上游热加载自动收录）'
+    return await wb2api.restart_container(container)
 
 
 # ── 加账号后的收尾：优先热加载，超时才重启 ────────────────────────────
@@ -145,13 +179,18 @@ async def _reload_worker_loop(wait_seconds: float) -> None:
     _state['last_message'] = message
 
 
-def request_reload_or_restart(uid: str) -> bool:
+def request_reload_or_restart(uid: str, *, upstream: dict | None = None) -> bool:
     """新增账号后的收尾：先等热加载，超时才重启（见上面的说明）。
 
     与 `request_restart` 一样立即返回、后台执行；同时加多个账号只会重启一次
     （等待期间把后加入的 uid 一并纳入判断）。
+
+    upstream 非空 = 该**分组**：用独立的一套等待（见文件末尾），等待它的
+    /status 收录该 uid；等不到时只有登记了容器名才会重启。
     返回 False 表示没有运行中的事件循环，调用方自行决定。
     """
+    if upstream is not None:
+        return _request_group_reload(uid, upstream)
     global _reload_worker
     uid = str(uid or '').strip()
     try:
@@ -163,4 +202,59 @@ def request_reload_or_restart(uid: str) -> bool:
     if _reload_worker is None or _reload_worker.done():
         _reload_worker = loop.create_task(_reload_worker_loop(HOT_RELOAD_WAIT_SECONDS))
     return True
+
+
+# ── 分组（多账号池）专用的热加载等待 ──────────────────────────────────
+#
+# 与默认上游那套分开的理由：默认上游的等待状态是全局的（一个 uid 集合 +
+# 一个 worker），多分组并发加号时两个分组的 uid 会混进同一个判断。分组这边
+# 按 base_url 各自记账，互不干扰，也不改变默认路径的既有行为。
+_group_pending: dict[str, set[str]] = {}
+_group_workers: dict[str, asyncio.Task] = {}
+
+
+def _request_group_reload(uid: str, upstream: dict) -> bool:
+    base = str(upstream.get('base_url') or '').strip()
+    if not base:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    uid = str(uid or '').strip()
+    if uid:
+        _group_pending.setdefault(base, set()).add(uid)
+    task = _group_workers.get(base)
+    if task is None or task.done():
+        _group_workers[base] = loop.create_task(_group_reload_worker(upstream))
+    return True
+
+
+async def _group_reload_worker(upstream: dict) -> None:
+    base = str(upstream.get('base_url') or '').strip()
+    pending = _group_pending.get(base) or set()
+    if not pending:
+        return
+    saw_upstream = False
+    deadline = time.monotonic() + HOT_RELOAD_WAIT_SECONDS
+    while pending and time.monotonic() < deadline:
+        st = await wb2api.get_status(base_url=base,
+                                     api_key=upstreamsvc.forward_api_key(upstream))
+        if st.get('connected'):
+            saw_upstream = True
+            seen = {str(a.get('uid') or '') for a in (st.get('accounts') or [])}
+            pending.difference_update(seen)
+            if not pending:
+                _group_pending.pop(base, None)
+                logger.info('分组「%s」已热加载收录新账号', upstream.get('name'))
+                return
+        await asyncio.sleep(HOT_RELOAD_POLL_SECONDS)
+    _group_pending.pop(base, None)
+    container = str(upstream.get('container') or '').strip()
+    if not container:
+        logger.info('分组「%s」热加载未在 %.0fs 内收录（上游%s），未登记容器名，'
+                    '跳过重启', upstream.get('name'), HOT_RELOAD_WAIT_SECONDS,
+                    '可达' if saw_upstream else '不可达')
+        return
+    await _restart_container_bg(container)
 

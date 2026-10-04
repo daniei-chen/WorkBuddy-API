@@ -378,9 +378,16 @@ class ExpiringSoonFieldTest(unittest.TestCase):
 
     def test_duration_accepted(self) -> None:
         from server.services import wb2api
-        for val in ('168h', '7d', '30m'):
+        for val in ('168h', '30m'):
             out = wb2api._sanitize_section('pool', {'expiring_soon': val})
             self.assertEqual(out['expiring_soon'], val)
+
+    def test_day_suffix_rejected(self) -> None:
+        """上游是 Go time.ParseDuration，不认 `d`；面板保存前必须拦下。"""
+        from server.services import wb2api
+        for val in ('7d', '1d'):
+            with self.assertRaises(ValueError):
+                wb2api._sanitize_section('pool', {'expiring_soon': val})
 
     def test_empty_and_zero_mean_disabled(self) -> None:
         from server.services import wb2api

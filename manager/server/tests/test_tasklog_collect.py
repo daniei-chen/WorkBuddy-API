@@ -118,7 +118,7 @@ class NicknameResolution(unittest.TestCase):
         self._tmp.cleanup()
 
     def _resolve(self, row_uid: str, accounts: list[dict]) -> str:
-        wb2api.list_auth_accounts = lambda: accounts  # type: ignore[assignment]
+        wb2api.list_auth_accounts = lambda auth_dir=None: accounts  # type: ignore[assignment]
         db.clear_task_logs()
         db.add_task_logs([{
             'ts': 1, 'uid': row_uid, 'kind': 'travel', 'level': 'ok',

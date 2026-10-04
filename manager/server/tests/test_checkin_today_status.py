@@ -212,7 +212,7 @@ class CheckinTodayStatusTest(unittest.TestCase):
                     _acc('workbuddy-b.json', CN2_UID, '乙')]
         uid_by_file = {a['file']: a['uid'] for a in accounts}
 
-        def _read(f: str) -> dict:
+        def _read(f: str, auth_dir=None) -> dict:
             return _raw(uid_by_file[f])
 
         checkin = mock.AsyncMock(return_value=(0, 'ok'))
@@ -251,7 +251,7 @@ class CheckinTodayStatusTest(unittest.TestCase):
              mock.patch.object(realm, 'invalidate'), \
              mock.patch.object(wb2api, 'list_auth_accounts', return_value=accounts), \
              mock.patch.object(wb2api, 'read_account_file',
-                               side_effect=lambda f: _raw(uid_by_file[f])), \
+                               side_effect=lambda f, auth_dir=None: _raw(uid_by_file[f])), \
              mock.patch.object(tencent, 'checkin', checkin):
             out = self.c.post('/api/accounts/checkin-all').json()
 

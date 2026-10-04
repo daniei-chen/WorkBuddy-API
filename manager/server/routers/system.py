@@ -58,6 +58,15 @@ def set_upstream_ref(body: UpstreamRefIn, user: dict = Depends(security.require_
     return {'ok': True, 'upstream_ref': ref}
 
 
+@router.delete('/update-status')
+def clear_update_status(user: dict = Depends(security.require_session_admin)) -> dict:
+    """清除上次更新的结果与日志（issue #105：失败记录此前在面板里消除不掉）。"""
+    ok, message = updater.clear_status()
+    if not ok:
+        raise HTTPException(status_code=409, detail=message)
+    return {'ok': True, 'message': message}
+
+
 @router.get('/check-update')
 def check_update(force: bool = False, user: dict = Depends(security.current_user)) -> dict:
     """检测是否有新版本（管理端与上游）。

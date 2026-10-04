@@ -150,9 +150,9 @@ class NoFailFastFieldLeftUncheckedTest(unittest.TestCase):
     def test_duration_fields_accept_valid(self) -> None:
         cases = [
             ('cooldown', {'soft_rate': '600s', 'soft_rate_max': '2h'}),
-            ('pool', {'breaker_cooldown': '10m', 'degrade_cooldown_max': '1d'}),
+            ('pool', {'breaker_cooldown': '10m', 'degrade_cooldown_max': '24h'}),
             ('session_sticky', {'ttl': '30m', 'gc_interval': '5m'}),
-            ('pool', {'expiring_soon': '7d'}),
+            ('pool', {'expiring_soon': '168h'}),
             ('pool', {'cost_explore_interval': '30m'}),
         ]
         for section, incoming in cases:

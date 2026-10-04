@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent  # 仓库根目录
 
@@ -109,6 +110,7 @@ AUDIT_ALL_ACCESS = _env('WB_AUDIT_ALL_ACCESS', '0') == '1'
 # 留空时所有请求都不使用任何代理：httpx 默认 trust_env=True 会读取系统/环境代理，
 # 会把内网请求（如 127.0.0.1:7863）也交给系统代理，导致连接被劫持或长时间超时。
 HTTP_PROXY = _env('WB_HTTP_PROXY', '')
+DEFAULT_ACCOUNT_PROXY = _env('WB_DEFAULT_ACCOUNT_PROXY', '')
 
 # 本机一键导入：允许把新密钥直接写进**本机的** cc-switch / ZCode 配置。
 #
@@ -180,11 +182,41 @@ def upstream_api_key() -> str:
         return ''
 
 
+def proxy_routes() -> dict[str, str]:
+    """读取共享命名线路。客户端只能取得线路名，不能取得代理凭据。"""
+    try:
+        routes = json.loads(UPSTREAM_CONFIG.read_text(encoding='utf-8')).get('proxies') or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(routes, dict):
+        return {}
+    return {k: v for k, v in routes.items()
+            if isinstance(k, str) and k.strip() and isinstance(v, str)}
+
+
+def account_proxy(auth: dict) -> str | None:
+    """无绑定时沿用既有出口；绑定无效时拒绝发出请求。"""
+    name = str(auth.get('proxy') or '').strip()
+    if not name:
+        return None
+    url = proxy_routes().get(name)
+    if not url:
+        raise ValueError(f'账号绑定的代理线路 {name!r} 不存在')
+    try:
+        parsed = urlsplit(url)
+        valid = parsed.scheme in ('http', 'https') and bool(parsed.hostname) and parsed.port != 0
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError(f'代理线路 {name!r} 配置无效（需要 HTTP/HTTPS 代理）')
+    return url
+
+
 def new_secret() -> str:
     return secrets.token_urlsafe(48)
 
 
-def http_client(timeout, *, connect: float | None = None):
+def http_client(timeout, *, connect: float | None = None, proxy: str | None = None):
     """统一的 httpx 客户端：默认忽略系统/环境代理，避免内网请求被代理劫持。
 
     需要走代理时显式设置 WB_HTTP_PROXY。
@@ -202,6 +234,7 @@ def http_client(timeout, *, connect: float | None = None):
     else:
         tmo = httpx.Timeout(timeout)
     kwargs = {'timeout': tmo, 'trust_env': False}
-    if HTTP_PROXY:
-        kwargs['proxy'] = HTTP_PROXY
+    selected_proxy = HTTP_PROXY if proxy is None else proxy
+    if selected_proxy:
+        kwargs['proxy'] = selected_proxy
     return httpx.AsyncClient(**kwargs)

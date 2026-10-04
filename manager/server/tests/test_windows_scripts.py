@@ -142,3 +142,88 @@ class GitAttributesTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class WindowsUpdaterTrustChainTest(unittest.TestCase):
+    """Windows 一键更新脚本（`update.ps1`）的信任链守卫。
+
+    这个是真实踩出来的三条，每条都**不会让脚本报错**，只会让它悄悄失守：
+
+      · `Test-PackageSignature` 里 `$proc.WaitForExit()` 的返回值会进输出流，
+        函数于是返回 `@($true, $false)`；调用点是 `if (-not $isSigValid)`，
+        PowerShell 对**非空数组**取反恒为 `$false` —— **篡改包照样被安装**
+        （实测：篡改包 → `[True,False]` → 门禁放行）；
+      · `allowed_signers` 用 `[System.Text.Encoding]::UTF8` 写会带 **BOM**，
+        而 ssh-keygen 读到 BOM 整份文件解析失败 —— **真包也判「验签不过」**
+        （实测 exit=255 vs 无 BOM 的 exit=0）；
+      · 内嵌公钥一旦与 `deploy/update.py` 里的签发公钥不一致，所有更新都会被拒，
+        而错误看起来像「包坏了」。
+    """
+
+    UPDATER = _ROOT / 'update.ps1'
+
+    def test_script_exists(self) -> None:
+        self.assertTrue(self.UPDATER.is_file(), f'找不到 {self.UPDATER}')
+
+    def test_process_output_is_suppressed(self) -> None:
+        """`WaitForExit` 的返回值必须被吞掉（否则签名门禁恒真）。"""
+        src = self.UPDATER.read_text(encoding='utf-8-sig')
+        self.assertIn('WaitForExit', src)
+        bad = [l.strip() for l in src.splitlines()
+               if 'WaitForExit' in l and not l.strip().startswith(('#', '[void]', '$null ='))]
+        self.assertEqual(
+            bad, [],
+            'WaitForExit 的返回值没有被吞掉：它会进函数输出流，把返回值变成非空数组，'
+            '`-not $isSigValid` 因此恒为假 —— 验签失败也不会中止。'
+            '写成 `$null = $proc.WaitForExit(...)` 或 `[void]$proc.WaitForExit(...)`。',
+        )
+
+    def test_allowed_signers_has_no_bom(self) -> None:
+        """`allowed_signers` 必须以**无 BOM** 的 UTF-8 写。
+
+        PowerShell 5.1 的 `[System.Text.Encoding]::UTF8` 会写 BOM，ssh-keygen 直接
+        解析失败 —— 表现为「官方包也被判验签不过」，用户无法更新。
+        """
+        src = self.UPDATER.read_text(encoding='utf-8-sig')
+        writers = [l.strip() for l in src.splitlines()
+                   if 'WriteAllText' in l and 'tempSigners' in l]
+        self.assertTrue(writers, '没有找到写 allowed_signers 的那一行')
+        for line in writers:
+            self.assertNotIn('[System.Text.Encoding]::UTF8', line,
+                             f'allowed_signers 用了会写 BOM 的编码：{line}')
+            self.assertIn('UTF8Encoding($false)', line,
+                          f'allowed_signers 必须显式无 BOM：{line}')
+
+    def test_embedded_pubkey_matches_the_release_key(self) -> None:
+        """脚本内嵌的公钥必须与 `deploy/update.py` 的签发公钥一致（换密钥时同步）。"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('wb_upd_pub', _ROOT / 'deploy' / 'update.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        want = ' '.join(str(mod.RELEASE_PUBKEY).split())
+        src = self.UPDATER.read_text(encoding='utf-8-sig')
+        m = re.search(r"\$pubkey\s*=\s*'([^']+)'", src)
+        self.assertIsNotNone(m, '脚本里找不到内嵌公钥')
+        self.assertEqual(' '.join(m.group(1).split()), want,
+                         '内嵌公钥与 deploy/update.py 不一致 —— 所有真实更新都会被拒绝')
+        self.assertEqual(str(mod.RELEASE_SIGNER_ID), 'release')
+
+    def test_no_unverified_source_update(self) -> None:
+        """不许在更新流程里 `git reset/fetch`：那是**不经签名**的第二条代码来源。
+
+        会把 origin 指向的任意代码（fork、镜像）铺进用户目录，并丢弃本地改动。
+        """
+        src = self.UPDATER.read_text(encoding='utf-8-sig')
+        offending = [l.strip() for l in src.splitlines()
+                     if re.search(r'\bgit\s+(reset|fetch|pull|checkout)\b', l)
+                     and not l.strip().startswith('#')]
+        self.assertEqual(offending, [],
+                         f'更新脚本里出现了不经验签的 git 操作：{offending}')
+
+    def test_confirm_before_destructive_phase(self) -> None:
+        """停服务 / 清 web/out / 覆盖文件之前必须有一次确认。"""
+        src = self.UPDATER.read_text(encoding='utf-8-sig')
+        self.assertRegex(src, r'Read-Host\s+"[^"]*确认', '更新前没有确认提示')
+        # 且确认必须在「停服务」之前
+        self.assertLess(src.index('Read-Host'), src.index('stop.ps1'),
+                        '确认排在了停服务之后 —— 用户点「不要」时服务已经被停了')

@@ -198,6 +198,13 @@ class WebLocaleTest(unittest.TestCase):
         ]
         self.assertEqual(offenders, [], f'en 里有 {len(offenders)} 处未翻译的中文：{offenders[:10]}')
 
+    def test_account_pending_copy_is_translated(self) -> None:
+        """日志详情的「账号尚未回填」不能复用「非流式请求」文案。"""
+        for locale in _LOCALES:
+            text = self.flat[locale].get('logs.accountPending')
+            self.assertIsInstance(text, str, f'{locale} 缺少 logs.accountPending')
+            self.assertNotIn('非流式', str(text), f'{locale} 又把它说成非流式请求了')
+
     def test_no_duplicate_keys(self) -> None:
         """同一个段里**不能出现重复键**——JSON 会静默取最后一条，界面于是显示错的那句。
 
@@ -381,7 +388,9 @@ class WebPhraseTest(unittest.TestCase):
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
-        src = (_ROOT / 'web/app/(main)/settings/page.tsx').read_text(encoding='utf-8')
+        # 批次 4 起设置页的外壳在 `layout.tsx`（7 个 Tab 变成 `/settings/<tab>`
+        # 子路由，取数与表单状态必须留在不随子路由重挂载的 layout 上）
+        src = (_ROOT / 'web/app/(main)/settings/layout.tsx').read_text(encoding='utf-8')
         concats = mod._concat_strings(src)
         self.assertTrue(concats, '没解析到任何拼接文案 —— 解析器失效了（会假通过）')
         for text in concats:

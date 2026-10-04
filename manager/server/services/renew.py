@@ -50,8 +50,12 @@ import asyncio
 import logging
 import time
 
-from .. import config, db
+from pathlib import Path
+
+from .. import config, db, upstreamsvc
 from . import tencent, wb2api
+from .errtext import err_text
+
 
 logger = logging.getLogger(__name__)
 
@@ -89,17 +93,38 @@ def _account_payload(raw: dict) -> dict:
         'domain': auth.get('domain', ''),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
+        'proxy': str(raw.get('proxy') or ''),
     }
+
+
+def _iter_accounts():
+    """续期巡检覆盖的账号：默认目录 + 各分组登记的账号目录。
+
+    产出 `(目录, 账号)` 对——目录必须一路带着：读文件与回写必须落在同一个
+    目录里，否则会把 A 组的凭证写进 B 组（或读错对象）；两边文件名相同时
+    这种错误完全看不出来。
+    """
+    dirs: list[Path | None] = [None]
+    seen: set[str] = set()
+    for up in upstreamsvc.list_upstreams(include_default=False):
+        raw = str(up.get('auth_dir') or '').strip()
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        dirs.append(Path(raw))
+    for d in dirs:
+        for acct in wb2api.list_auth_accounts(d):
+            yield d, acct
 
 
 async def renew_once(now: int | None = None) -> dict:
     """巡检一遍所有账号，返回统计（`{checked, renewed, failed, skipped}`）。
 
     逐个串行：账号数是个位数到几十，且腾讯那边对高频请求有风控——并发刷新
-    得不偿失（上游保活也是串行）。
+    得不偿失（上游保活也是串行）。分组（多账号池）登记的目录一并巡检。
     """
     stats = {'checked': 0, 'renewed': 0, 'failed': 0, 'skipped': 0}
-    for acct in wb2api.list_auth_accounts():
+    for base_dir, acct in _iter_accounts():
         # 面板停用（改名）的账号不续期：它已退出账号池，用户明确表示不用它。
         # 但**状态位停用（manual_disabled）要照常续期**——那条路的语义是
         # 「只摘对话流量，凭证与积分保持活跃」（issue #45）。
@@ -110,33 +135,36 @@ async def renew_once(now: int | None = None) -> dict:
             continue
         stats['checked'] += 1
         name = acct['file']
+        # 日志与限频用的标签：不同分组的同名文件要区分开，否则两组的同名账号
+        # 会共用同一条限频记录，其中一组的问题被另一组静默掩盖。
+        label = name if base_dir is None else f'{base_dir.name}/{name}'
         try:
-            raw = wb2api.read_account_file_any(name)
+            raw = wb2api.read_account_file_any(name, base_dir)
         except Exception as exc:  # noqa: BLE001
-            _note_failure(name, f'读取失败: {exc}')
+            _note_failure(label, f'读取失败: {err_text(exc)}')
             stats['failed'] += 1
             continue
         payload = _account_payload(raw)
         if not payload['refresh_token']:
             # 没有 refreshToken 就是真的续不了（要么重新扫码，要么它本就只有
             # 一个长期令牌）。记一次日志，别静默——用户看任务记录能明白原因。
-            _note_failure(name, '缺少 refreshToken，无法续期（需重新扫码或登录）')
+            _note_failure(label, '缺少 refreshToken，无法续期（需重新扫码或登录）')
             stats['failed'] += 1
             continue
         ok, message, fields = await tencent.refresh_token(payload)
         if not ok:
-            _note_failure(name, message)
+            _note_failure(label, message)
             stats['failed'] += 1
             continue
         try:
-            tencent.update_auth_tokens(name, fields)
+            tencent.update_auth_tokens(name, fields, base_dir)
         except Exception as exc:  # noqa: BLE001
-            _note_failure(name, f'刷新成功但写入失败: {exc}')
+            _note_failure(label, f'刷新成功但写入失败: {err_text(exc)}')
             stats['failed'] += 1
             continue
         stats['renewed'] += 1
-        _last_fail_log.pop(name, None)
-        logger.info('token 已续期: %s（%s）', name, message)
+        _last_fail_log.pop(label, None)
+        logger.info('token 已续期: %s（%s）', label, message)
         _record(acct, 1, f'token 自动续期成功（{message}）')
     return stats
 

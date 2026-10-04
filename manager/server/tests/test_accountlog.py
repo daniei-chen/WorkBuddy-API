@@ -24,10 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # 上游日志的原样样本（含中英文昵称的列宽对齐）
 LINE_CN = ('2026-09-23T06:58:13.123895379Z | #971 | 14:58:13 | deepseek-v4.1-flash'
-           '        | stream | 200 | 6509授(3a3a19b1)       | TTFB=1083ms   | tok=20'
+           '        | stream | 200 | uid=3a3a19b1       | TTFB=1083ms   | tok=20'
            '     | 15.3tok/s   | total=1.3s |')
 LINE_EN = ('2026-09-23T06:58:21.402929620Z | #972 | 14:58:21 | deepseek-v4.1-flash'
-           '        | stream | 200 | Moonquakes(299e342b)   | TTFB=1031ms   | tok=17'
+           '        | stream | 200 | uid=299e342b   | TTFB=1031ms   | tok=17'
            '     | 13.5tok/s   | total=1.3s |')
 
 # 上面两行的时间戳（UTC）——用于断言时区解析正确
@@ -42,7 +42,7 @@ class ParseTest(unittest.TestCase):
         from server.services import accountlog
         got = accountlog.parse_request_lines([LINE_CN])
         self.assertEqual(len(got), 1, '正常的对话行必须被解析出来')
-        self.assertEqual(got[0]['account'], '6509授(3a3a19b1)')
+        self.assertEqual(got[0]['account'], '3a3a19b1')
         self.assertEqual(got[0]['model'], 'deepseek-v4.1-flash')
 
     def test_timestamp_is_utc(self) -> None:
@@ -55,15 +55,38 @@ class ParseTest(unittest.TestCase):
         got = accountlog.parse_request_lines([LINE_CN, LINE_EN])
         self.assertEqual([g['ts'] for g in got], [TS_CN, TS_EN])
 
-    def test_skips_lines_without_docker_stamp(self) -> None:
-        """没有 docker 时间戳的行一律跳过（原生部署读日志文件时就是这种）。
-
-        日志内容里那个 `HH:MM:SS` 精度只有秒、且是上游时区的墙钟——拿它去
-        匹配等于猜。宁可这条记录没有账号，也不能填一个错的上去。
-        """
+    def test_skips_native_without_mtime(self) -> None:
+        """原生行没有日期；没有 mtime 作为锚点时只能跳过，不能猜。"""
         from server.services import accountlog
-        bare = LINE_CN.split(' ', 1)[1]     # 去掉时间戳前缀
+        bare = LINE_CN.split(' ', 1)[1]
         self.assertEqual(accountlog.parse_request_lines([bare]), [])
+
+    def test_native_timestamp_from_mtime_anchor(self) -> None:
+        """原生模式用文件 mtime 锚定最后一行，按行内时钟回推。"""
+        import datetime
+        from server.services import accountlog
+        lines = [
+            '| #973 | 14:58:20 | deepseek-v4.1-flash | stream | 200 | A(aaaaaaaa) | TTFB=1ms | tok=1 | 1tok/s | total=1.0s |',
+            '| #974 | 14:58:22 | deepseek-v4.1-flash | stream | 200 | B(bbbbbbbb) | TTFB=1ms | tok=1 | 1tok/s | total=1.0s |',
+        ]
+        mtime = datetime.datetime(2026, 9, 23, 14, 58, 22).timestamp()
+        got = accountlog.parse_request_lines_with_mtime(lines, mtime)
+        self.assertEqual([g['account'] for g in got], ['A(aaaaaaaa)', 'B(bbbbbbbb)'])
+        self.assertEqual([g['ts'] - int(mtime) for g in got], [-2, 0])
+
+    def test_native_midnight_rollover(self) -> None:
+        """跨午夜时向左回推要减一天。"""
+        import datetime
+        from server.services import accountlog
+        lines = [
+            '| #1 | 23:59:59 | m | stream | 200 | A(1) | TTFB=1ms | tok=1 | 1tok/s | total=1s |',
+            '| #2 | 00:00:01 | m | stream | 200 | B(2) | TTFB=1ms | tok=1 | 1tok/s | total=1s |',
+        ]
+        mtime = datetime.datetime(2026, 9, 24, 0, 0, 1).timestamp()
+        got = accountlog.parse_request_lines_with_mtime(lines, mtime)
+        self.assertEqual(got[0]['ts'], int(mtime) - 2)
+        self.assertEqual(got[1]['ts'], int(mtime))
+
 
     def test_skips_non_chat_lines(self) -> None:
         """上游日志里混着调度器/池状态等行，不能被当成请求。"""
@@ -79,7 +102,7 @@ class ParseTest(unittest.TestCase):
     def test_skips_placeholder_account(self) -> None:
         """账号列是 `-` 时（上游没选出账号的异常情形）不解析，避免填个破折号进去。"""
         from server.services import accountlog
-        line = LINE_CN.replace('6509授(3a3a19b1)', '          -          ')
+        line = LINE_CN.replace('uid=3a3a19b1', '          -          ')
         self.assertEqual(accountlog.parse_request_lines([line]), [])
 
 

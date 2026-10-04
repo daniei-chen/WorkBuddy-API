@@ -510,7 +510,10 @@ def _upstream_headers(upstream: dict | None = None) -> dict:
     """
     up = upstream if upstream is not None else upstreamsvc.default_upstream()
     headers = {'Content-Type': 'application/json'}
-    api_key = str(up.get('api_key') or '')
+    # 分组把 api_key 留空、且地址与默认上游相同时沿用默认那把（见
+    # upstreamsvc.forward_api_key）——「添加分组」只填名称就是这个形态，
+    # 不沿用的话绑定这类分组的密钥一调用就吃上游 401。
+    api_key = upstreamsvc.forward_api_key(up)
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
     return headers
@@ -1009,7 +1012,7 @@ async def _chat(request: Request, upstream_path: str):
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
-            return _oai_error_with_blip_body(f'上游不可用: {exc}', 502, exc)
+            return _oai_error_with_blip(f'上游不可用: {exc}', 502, exc)
 
     # 流式转发
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
@@ -1020,7 +1023,7 @@ async def _chat(request: Request, upstream_path: str):
         await client.aclose()
         latency = int((time.time() - started) * 1000)
         _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True)
-        return _oai_error_with_blip_body(f'上游不可用: {exc}', 502, exc)
+        return _oai_error_with_blip(f'上游不可用: {exc}', 502, exc)
 
     status_code = resp.status_code
     content_type = resp.headers.get('content-type', 'text/event-stream')

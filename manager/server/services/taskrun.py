@@ -47,6 +47,8 @@ import time
 from pathlib import Path
 
 from .. import config, db
+from .errtext import err_text
+
 
 logger = logging.getLogger('workbuddy.taskrun')
 
@@ -216,7 +218,7 @@ def extract_scripts(rep: logging.Logger | None = None) -> tuple[bool, str]:
     except FileNotFoundError:
         return _fail('未找到 docker 命令，无法从上游容器提取脚本')
     except Exception as exc:  # noqa: BLE001
-        return _fail(f'从上游容器提取脚本失败：{exc}')
+        return _fail(f'从上游容器提取脚本失败：{err_text(exc)}')
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or '').strip()
@@ -409,6 +411,7 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
     # 显式指定账号目录：脚本自身的回落顺序（WB2A_AUTHS > 仓库内 auths/ >
     # /root/...）不一定指向本面板管的那批文件，传错会「跑了个寂寞」还看不出来。
     env['WB2A_AUTHS'] = str(config.AUTH_DIR)
+    env['WB2A_PROXY_CONFIG'] = str(config.UPSTREAM_CONFIG)
     # 与 argv 里的 `-u` 双保险：两者都是「不缓冲」的表达，任一被忽略时另一个兜住
     # （脚本将来若自己拉起子进程，环境变量也能继承下去）。
     env['PYTHONUNBUFFERED'] = '1'
@@ -465,7 +468,7 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
         code = await proc.wait()
         _state['exit_code'] = code
     except FileNotFoundError as exc:
-        _state['error'] = f'无法启动脚本：{exc}'
+        _state['error'] = f'无法启动脚本：{err_text(exc)}'
         logger.warning('任务脚本启动失败: %s', exc)
     except Exception as exc:  # noqa: BLE001
         _state['error'] = str(exc)[:300]
@@ -569,7 +572,20 @@ _claim_task: asyncio.Task | None = None
 
 
 def get_schedule() -> dict:
-    """定时领奖的配置（enabled + 整点数组）。"""
+    """定时领奖的配置（enabled + 整点数组）。
+
+    ⚠️ **这套配置有意不做前端入口**，别把它当「漏接线的功能」补上：
+
+      · 它跑的是**无人值守**的写操作。虽然只做幂等认领（不伪造行为），但用户
+        设完就忘了，上游限流 / 账号失效时没有任何人在场看到。
+      · 设置页的「定时任务」区块走的是**上游 config.json**（`SCHEDULE_FIELDS`），
+        与本模块（管理端自己的调度器）是**两套独立机制**。现在界面只暴露前者，
+        用户不会困惑；补了入口就会出现两个都叫「定时」的东西。
+
+    也就是说，缺的不是实现，是「两套机制合并还是分层」这个前置决策。
+    路由与封装都在（`/api/task-claim-schedule`、`web/lib/api.ts`），
+    决策之后接线即可。详见 UI-UX-ROADMAP 的 P1-8 / P1-9。
+    """
     raw = db.get_setting('task_claim_schedule')
     if not isinstance(raw, dict):
         raw = {}

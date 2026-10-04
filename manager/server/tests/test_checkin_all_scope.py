@@ -93,7 +93,7 @@ class CheckinAllScopeTest(unittest.TestCase):
 
         uid_by_file = {a['file']: a['uid'] for a in accounts}
 
-        def _read(f: str) -> dict:
+        def _read(f: str, auth_dir=None) -> dict:
             uid = uid_by_file[f]
             return _raw(uid, realm_by_uid[uid])
 

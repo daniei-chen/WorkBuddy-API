@@ -46,6 +46,28 @@ def day_sql(column: str = 'ts') -> str:
     return f"strftime('%Y-%m-%d', {column}, 'unixepoch', 'localtime')"
 
 
+def hour_of(ts: float | None = None) -> int:
+    """本地小时（0-23）。与 day_of 同一口径：**本地时区**，不是 UTC。"""
+    t = time.time() if ts is None else float(ts)
+    return int(time.strftime('%H', time.localtime(t)))
+
+
+def hour_sql(column: str = 'ts') -> str:
+    """在 SQL 里按本地小时分桶（'2026-09-29 09'）——「今日」按小时聚合用。
+
+    与 day_sql 同样的注意事项：表达式包住列就没法走索引，所以过滤条件仍应写成
+    `ts >= ?`（用 day_start_ts / hour_start_ts 换算），只有 GROUP BY 才用它。
+    """
+    return f"strftime('%Y-%m-%d %H', {column}, 'unixepoch', 'localtime')"
+
+
+def hour_start_ts(day: str | None = None, hour: int = 0) -> int:
+    """某天某小时（本地时区）的**起点时间戳**。day 为 None 时取今天。"""
+    d = day or day_of()
+    y, m, dd = (int(x) for x in d.split('-'))
+    return int(time.mktime((y, m, dd, max(0, min(23, int(hour))), 0, 0, 0, 0, -1)))
+
+
 def day_start_ts(day: str | None = None) -> int:
     """某一天（本地时区）的**零点时间戳**；day 为 None 时取今天。
 
@@ -147,6 +169,25 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   realm             TEXT    NOT NULL DEFAULT 'cn',
   PRIMARY KEY (day, key_id, model, realm)
 );
+
+-- 按小时的用量累计：给「今日」趋势图用（粒度随范围走，见 stats 页）。
+-- 为什么不直接查下面那张业务无关的请求日志：日志会被保留期裁剪、也能被用户
+-- 手动清空（「日志」页有清除入口），而页头卡片来自 usage_daily —— 两处一旦
+-- 不同源，清完日志就会出现「卡片 338、图上一片空」的自相矛盾。
+-- 所以小时维度**与 usage_daily 同一写入路径、同一口径**，只是多一个 hour 列。
+CREATE TABLE IF NOT EXISTS usage_hourly (
+  day               TEXT    NOT NULL,
+  hour              INTEGER NOT NULL,
+  key_id            INTEGER NOT NULL,
+  model             TEXT    NOT NULL,
+  requests          INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  credit            REAL    NOT NULL DEFAULT 0,
+  realm             TEXT    NOT NULL DEFAULT 'cn',
+  PRIMARY KEY (day, hour, key_id, model, realm)
+);
+CREATE INDEX IF NOT EXISTS idx_usage_hourly_day ON usage_hourly(day);
 
 -- 管理端审计日志：登录、改密码、增删用户、改安全配置等敏感操作留痕。
 -- 为什么单独一张表：这些操作不产生请求日志（那是网关的），出了事无从追溯。
@@ -338,6 +379,10 @@ CREATE TABLE IF NOT EXISTS upstreams (
   api_key    TEXT    NOT NULL DEFAULT '',
   note       TEXT    NOT NULL DEFAULT '',
   enabled    INTEGER NOT NULL DEFAULT 1,
+  -- 该分组的**本地账号目录**：面板按它列账号 / 添号 / 移动账号（见迁移注释）。
+  auth_dir   TEXT    NOT NULL DEFAULT '',
+  -- 该分组上游实例的容器名（可选）：面板「重启该分组」按它 docker restart。
+  container  TEXT    NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -436,6 +481,10 @@ def connect() -> sqlite3.Connection:
         _conn.commit()
         # 建表之后再收紧权限：库文件此刻才确定存在，WAL 伴生文件也在初始化后出现
         _restrict_db_permissions()
+        # 升级兜底：usage_hourly 是后加的表，存量库升级后它是空的 —— 用户点开
+        # 「今日」趋势图会是一片空白，而卡片数字明明有值。用请求日志补一次今天
+        # （幂等、只补今天、失败不影响启动）。
+        ensure_hourly_today()
     return _conn
 
 
@@ -464,6 +513,13 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 不设外键约束：SQLite 的外键要开 PRAGMA 且删除上游时语义是「级联删密钥」还是
     # 「拒绝删」都不合适 —— 本项目在应用层做「被引用就拒绝删」（见 upstreamsvc）。
     ('api_keys', 'upstream_id', 'INTEGER'),
+    # 分组（账号池）的**本地账号目录**：面板据此列账号 / 添号 / 移动账号。
+    # 空 = 不做账号管理（该分组只用于密钥转发）。默认分组的目录来自 WB_AUTH_DIR，
+    # 是运行时结果、不落库——与「默认上游不是数据库里的一行」同一个道理。
+    ('upstreams', 'auth_dir', "TEXT NOT NULL DEFAULT ''"),
+    # 分组上游实例的容器名（可选）：面板的「重启」用 `docker restart <name>`。
+    # 空 = 从面板重启该分组时明确报错；绝不猜一个名字去重启别的服务。
+    ('upstreams', 'container', "TEXT NOT NULL DEFAULT ''"),
     # 积分额度与已用量（issue #27）。存量密钥为 0/0 = **不限积分**，行为不变。
     #
     # 为什么要在 token 之外单独记一笔：两者**不成比例** —— 同样 1M token，
@@ -726,6 +782,18 @@ def bump_usage(
         '  cache_hit_tokens = cache_hit_tokens + excluded.cache_hit_tokens, '
         '  cache_miss_tokens = cache_miss_tokens + excluded.cache_miss_tokens',
         (day, key_id, model, prompt_tokens, completion_tokens, float(credit or 0), r, ch, cm),
+    )
+    # 同一份数据的**小时**维度，给「今日」趋势图用。两处必须一起写：只写一处
+    # 就会出现「卡片有数、小时图没有」或反过来的分歧（口径一致性见建表注释）。
+    execute(
+        'INSERT INTO usage_hourly(day, hour, key_id, model, requests, prompt_tokens, completion_tokens, credit, realm) '
+        'VALUES(?, ?, ?, ?, 1, ?, ?, ?, ?) '
+        'ON CONFLICT(day, hour, key_id, model, realm) DO UPDATE SET '
+        '  requests = requests + 1, '
+        '  prompt_tokens = prompt_tokens + excluded.prompt_tokens, '
+        '  completion_tokens = completion_tokens + excluded.completion_tokens, '
+        '  credit = credit + excluded.credit',
+        (day, hour_of(), key_id, model, prompt_tokens, completion_tokens, float(credit or 0), r),
     )
 
 
@@ -1194,6 +1262,30 @@ def clear_task_logs() -> None:
 
 
 # ── 用量回填 ─────────────────────────────────────────────
+# 归一化表达式：**必须同时**用在 SELECT 与 GROUP BY，且空串要与 Python 的
+# `or 'cn'` 同一规则。为什么这么讲究，见 rebuild_usage_from_logs 的长注释
+# （GROUP BY 复用别名会绑定到源列 → 撞 usage_daily 主键 → 接口 500）。
+# 收成常量是为了让「按天」与「按小时」两条回填路径共用同一份规则 —— 分别写就会漂移。
+_USAGE_MODEL_EXPR = "COALESCE(NULLIF(model,''),'')"
+_USAGE_REALM_EXPR = "COALESCE(NULLIF(realm,''),'cn')"
+
+
+def _usage_expected_rows(bucket_expr: str) -> list[dict]:
+    """按 `bucket_expr`（`day_sql('ts')` 或 `hour_sql('ts')`）聚合请求日志。
+
+    返回的每一行是「这个桶 × 密钥 × 模型 × 版本」应有的用量 —— 回填与重建都以
+    它为准（请求日志是唯一的原始事实）。
+    """
+    return query(
+        f"SELECT {bucket_expr} AS bucket, key_id, "
+        f"{_USAGE_MODEL_EXPR} AS model, {_USAGE_REALM_EXPR} AS realm, "
+        "COUNT(*) AS requests, COALESCE(SUM(prompt_tokens),0) AS pt, "
+        "COALESCE(SUM(completion_tokens),0) AS ct, COALESCE(SUM(credit),0) AS cr, "
+        "COALESCE(SUM(cache_hit_tokens),0) AS ch, COALESCE(SUM(cache_miss_tokens),0) AS cm "
+        "FROM request_logs WHERE key_id IS NOT NULL "
+        f"GROUP BY {bucket_expr}, key_id, {_USAGE_MODEL_EXPR}, {_USAGE_REALM_EXPR}"
+    )
+
 def backfill_usage_from_logs() -> dict:
     """把 request_logs 里尚未计入 usage_daily 的用量补进统计。
 
@@ -1207,8 +1299,8 @@ def backfill_usage_from_logs() -> dict:
     # 归一化表达式同样要**同时**用在 SELECT 与 GROUP BY，且空串也要折成默认值
     # （原因见 rebuild_usage_from_logs 里的说明：GROUP BY 复用别名会绑定到源列；
     #   SQL 的 COALESCE 不处理空串、Python 的 `or` 会 —— 两边规则必须一致）。
-    model_expr = "COALESCE(NULLIF(model,''),'')"
-    realm_expr = "COALESCE(NULLIF(realm,''),'cn')"
+    model_expr = _USAGE_MODEL_EXPR
+    realm_expr = _USAGE_REALM_EXPR
     day_expr = day_sql('ts')
     expected = query(
         f"SELECT {day_expr} AS day, key_id, {model_expr} AS model, {realm_expr} AS realm, "
@@ -1256,18 +1348,96 @@ def backfill_usage_from_logs() -> dict:
             '  cache_miss_tokens = MAX(cache_miss_tokens, excluded.cache_miss_tokens)',
             (row['day'], row['key_id'], row['model'], int(row['requests']),
              int(row['pt']), int(row['ct']), float(row['cr'] or 0),
-             str(row['realm'] or 'cn'),
-             int(row['ch'] or 0), int(row['cm'] or 0)),
+             int(row['ch'] or 0), int(row['cm'] or 0),
+             str(row['realm'] or 'cn')),
         )
         fixed += 1
         added_requests += max(0, d_req)
         added_tokens += max(0, d_pt) + max(0, d_ct)
 
+    # 小时维度用同一套规则再补一遍（「今日」趋势图读这张表）。与上面**同源同规则**：
+    # 请求日志 → 应有值 → 与现值比差额 → MAX 写入，所以重复执行不会重复计数。
+    fixed_h = _backfill_hourly_from_logs()
+
     return {
         'repaired': fixed,
+        'repaired_hourly': fixed_h,
         'requests': added_requests,
         'tokens': added_tokens,
     }
+
+
+def _backfill_hourly_from_logs() -> int:
+    """按小时回填 usage_hourly（幂等，MAX 语义，与按天那条同一规则）。返回修复桶数。"""
+    expected = _usage_expected_rows(hour_sql('ts'))
+    current = {
+        (r['day'], r['hour'], r['key_id'], r['model'], r['realm'] or 'cn'): r
+        for r in query('SELECT day, hour, key_id, model, realm, requests, prompt_tokens, '
+                       'completion_tokens FROM usage_hourly')
+    }
+    fixed = 0
+    for row in expected:
+        bucket = str(row['bucket'] or '')
+        if len(bucket) < 13:            # 'YYYY-MM-DD HH' —— 形态不对就跳过（不猜）
+            continue
+        day, hour = bucket[:10], int(bucket[11:13])
+        key = (day, hour, row['key_id'], row['model'], row['realm'] or 'cn')
+        cur = current.get(key)
+        cur_req = int(cur['requests']) if cur else 0
+        cur_pt = int(cur['prompt_tokens']) if cur else 0
+        cur_ct = int(cur['completion_tokens']) if cur else 0
+        if (int(row['requests']) <= cur_req and int(row['pt']) <= cur_pt
+                and int(row['ct']) <= cur_ct):
+            continue
+        execute(
+            'INSERT INTO usage_hourly(day, hour, key_id, model, requests, prompt_tokens, '
+            'completion_tokens, credit, realm) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(day, hour, key_id, model, realm) DO UPDATE SET '
+            '  requests = MAX(requests, excluded.requests), '
+            '  prompt_tokens = MAX(prompt_tokens, excluded.prompt_tokens), '
+            '  completion_tokens = MAX(completion_tokens, excluded.completion_tokens), '
+            '  credit = MAX(credit, excluded.credit)',
+            (day, hour, row['key_id'], row['model'], int(row['requests']),
+             int(row['pt']), int(row['ct']), float(row['cr'] or 0),
+             str(row['realm'] or 'cn')),
+        )
+        fixed += 1
+    return fixed
+
+
+def ensure_hourly_today() -> bool:
+    """升级兜底：今天的小时表若还是空的，就用请求日志补一次（幂等）。
+
+    为什么需要它：这张表是后加的，存量库升级后它一行都没有 —— 用户点开「今日」
+    趋势图会看到一片空白，而卡片数字明明有值（那正是最不想看到的观感）。
+    只补**今天**：它只被「今日」用到，补历史没有意义；代价是一次聚合查询。
+    返回是否真的补了。
+    """
+    try:
+        today = day_of()
+        if query_one('SELECT 1 FROM usage_hourly WHERE day = ? LIMIT 1', (today,)):
+            return False
+        if not query_one('SELECT 1 FROM request_logs WHERE ts >= ? LIMIT 1',
+                         (day_start_ts(today),)):
+            return False                # 今天还没有任何请求（或日志被清过）：无从补起
+        _backfill_hourly_from_logs()
+        return True
+    except Exception:                   # noqa: BLE001
+        return False                    # 旁路操作：失败不影响启动
+
+
+def hourly_rows(day: str, realm: str | None = None) -> list[dict]:
+    """某天**按小时**的用量（`/api/stats/hourly` 用）。realm 为空不过滤。"""
+    rf = ' AND realm = ?' if realm in ('cn', 'global') else ''
+    args: tuple = (day,) + ((realm,) if rf else ())
+    return query(
+        'SELECT hour, SUM(requests) AS requests, '
+        'SUM(prompt_tokens) AS prompt_tokens, '
+        'SUM(completion_tokens) AS completion_tokens, '
+        'COALESCE(SUM(credit),0) AS credit '
+        f'FROM usage_hourly WHERE day = ?{rf} GROUP BY hour ORDER BY hour ASC',
+        args,
+    )
 
 
 def rebuild_usage_from_logs() -> dict:
@@ -1296,8 +1466,8 @@ def rebuild_usage_from_logs() -> dict:
     # `x or 'cn'` 连空串一起兜住 —— 两边规则不同就会出现「SQL 分成两组、写库时
     # 都变成 cn」的第二次撞键。所以 SQL 侧用 NULLIF 把空串也折成 NULL，
     # 与 Python 的 `or 'cn'` 完全一致。
-    model_expr = "COALESCE(NULLIF(model,''),'')"
-    realm_expr = "COALESCE(NULLIF(realm,''),'cn')"
+    model_expr = _USAGE_MODEL_EXPR
+    realm_expr = _USAGE_REALM_EXPR
     day_expr = day_sql('ts')
     expected = query(
         f"SELECT {day_expr} AS day, key_id, {model_expr} AS model, {realm_expr} AS realm, "
@@ -1326,6 +1496,18 @@ def rebuild_usage_from_logs() -> dict:
                   int(row['pt']), int(row['ct']), float(row['cr'] or 0),
                   str(row['realm'] or 'cn'),
                   int(row['ch'] or 0), int(row['cm'] or 0)) for row in expected],
+            )
+            # 小时维度与按天**同一事务**重建：只重建一处会让「今日」图与卡片
+            # 在重建后对不上，而那正是分两张表要避免的事。
+            conn.execute('DELETE FROM usage_hourly')
+            hourly_rows = _usage_expected_rows(hour_sql('ts'))
+            conn.executemany(
+                'INSERT INTO usage_hourly(day, hour, key_id, model, requests, prompt_tokens, '
+                'completion_tokens, credit, realm) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [(str(row['bucket'])[:10], int(str(row['bucket'])[11:13]), row['key_id'],
+                  row['model'], int(row['requests']), int(row['pt']), int(row['ct']),
+                  float(row['cr'] or 0), str(row['realm'] or 'cn'))
+                 for row in hourly_rows if len(str(row['bucket'] or '')) >= 13],
             )
             conn.commit()
         except Exception:

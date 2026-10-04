@@ -268,6 +268,7 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
     # 服务级 / 不可逆 / 能提权或抹痕迹的动作，只对**会话**开放。
     SESSION_ONLY = {
         'DELETE /api/accounts/{filename}',
+        'DELETE /api/system/update-status',   # 清除更新结果与日志：属于「抹掉痕迹」类
         'DELETE /api/security/rules/{rule_id}',
         'DELETE /api/tokens/{token_id}',
         'DELETE /api/users/{username}',
@@ -292,6 +293,16 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'DELETE /api/upstreams/{upstream_id}',
         'PATCH /api/upstreams/{upstream_id}',
         'POST /api/upstreams',
+        # 账号分组互转：把账号文件在分组的目录之间移动——等于改「这个号属于哪个
+        # 池」，与删账号同级（都会改变池的构成），只对会话开放。
+        'POST /api/accounts/{filename}/move',
+        # PostgreSQL 异地备份：配置里带着能写整库的数据库凭据；导出会把全部数据
+        # （含密钥哈希、请求日志）复制出去，恢复会**覆盖本地库**。三条都远超
+        # 只读令牌该有的权限，与 /api/system/update 同级，只对会话开放。
+        'POST /api/settings/pg-sync',
+        'POST /api/settings/pg-sync/test',
+        'POST /api/settings/pg-sync/export',
+        'POST /api/settings/pg-sync/import',
     }
     # 写方法但只要求「已登录」——只读令牌也能调。必须逐个有理由。
     ANY_LOGGED_IN = {

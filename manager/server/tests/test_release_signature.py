@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -189,7 +190,9 @@ class SignatureVerifyTest(unittest.TestCase):
         """不能把「没签名」当成「通过」——否则攻击者只要不传 .sig 就绕过了。"""
         ok, rep, err = self._check(self.pkg, None)
         self.assertFalse(ok)
-        self.assertIn('没有可用的签名文件', rep.text() + err)
+        self.assertIn('尚未附带签名文件', rep.text() + err)
+        self.assertIn('稍后重试', rep.text() + err,
+                      '签名未就绪时要给出「稍后重试」这条路，而不是让人以为发布坏了')
 
     def test_wrong_public_key_rejected(self) -> None:
         """换成别人的公钥：签名对不上，必须拒绝。"""
@@ -250,7 +253,7 @@ class SignatureVerifyTest(unittest.TestCase):
         rep = _Rep()
         with self.assertRaises(RuntimeError) as ctx:
             mod.verify_release_signature(pkg, '', rep)
-        self.assertIn('没有可用的签名文件', str(ctx.exception))
+        self.assertIn('尚未附带签名文件', str(ctx.exception))
         self.assertFalse(Path(str(pkg) + '.sig').exists(), '不应凭空造出签名文件')
 
     def test_sig_download_failure_rejected(self) -> None:
@@ -261,9 +264,13 @@ class SignatureVerifyTest(unittest.TestCase):
         shutil.copyfile(self.pkg, pkg)
         missing = (work / 'does-not-exist.sig').as_uri()
         rep = _Rep()
-        with self.assertRaises(RuntimeError) as ctx:
-            mod.verify_release_signature(pkg, missing, rep)
-        self.assertIn('没有可用的签名文件', str(ctx.exception))
+        with mock.patch.object(mod.time, 'sleep', lambda *_: None):   # 别真等退避
+            with self.assertRaises(RuntimeError) as ctx:
+                mod.verify_release_signature(pkg, missing, rep)
+        # 这条是关键回归（issue #129）：下载失败是**网络问题**，不能报成
+        # 「没有签名文件 → 发布流程可能被改动」——那是把用户引向错误的方向。
+        self.assertIn('网络问题', str(ctx.exception))
+        self.assertNotIn('没有可用的签名文件', str(ctx.exception))
 
 
 class UpdateManagerWiringTest(unittest.TestCase):
@@ -321,6 +328,37 @@ class ReleaseWorkflowTest(unittest.TestCase):
     def test_workflow_mentions_sig_asset(self) -> None:
         wf = (_ROOT / '.github' / 'workflows' / 'release.yml').read_text(encoding='utf-8')
         self.assertIn('.sig', wf, '发布流程未涉及签名文件')
+
+    # ── issue #127/#129：CI 建的 Release 必须是**草稿** ──────────────
+    #
+    # 以前 CI 直接公开发布：维护者签名要几分钟到几十分钟，这期间任何人点
+    # 「一键更新」都会被「没有可用的签名文件」拒绝。`releases/latest`（面板与
+    # 更新器的版本检查都读它）会跳过草稿，于是把 release 建为草稿，这个窗口就
+    # 从用户侧消失了 —— 只有签名并 `gh release edit --draft=false` 之后才可见。
+
+    def test_release_is_created_as_draft(self) -> None:
+        wf = (_ROOT / '.github' / 'workflows' / 'release.yml').read_text(encoding='utf-8')
+        m = re.search(r'gh release create[^\n]*(?:\n[^\n]*){0,6}', wf)
+        self.assertIsNotNone(m, '找不到 gh release create')
+        self.assertIn('--draft', m.group(0),
+                      'CI 直接公开发布 —— 未签名的版本会立刻对用户可见（#127/#129 的窗口期）')
+
+    def test_docs_tell_you_to_publish_after_signing(self) -> None:
+        for name in ('release-process.md', 'release-signing.md'):
+            doc = (_ROOT / 'docs' / name).read_text(encoding='utf-8')
+            self.assertIn('--draft=false', doc,
+                          f'{name} 没写「签名核对后把草稿发布出去」这一步 —— '
+                          '漏了它用户永远看不到新版本')
+
+    def test_guard_is_not_vacuous(self) -> None:
+        """反证：把 create 换回公开发布，第一条必须能看出来。"""
+        wf = ('          else\n'
+              '            gh release create "$TAG" \\\n'
+              '              --title "$TAG" \\\n'
+              '              "${STAGE}.tar.gz"\n')
+        m = re.search(r'gh release create[^\n]*(?:\n[^\n]*){0,6}', wf)
+        self.assertIsNotNone(m)
+        self.assertNotIn('--draft', m.group(0))
 
 
 class PubkeyConsistencyTest(unittest.TestCase):

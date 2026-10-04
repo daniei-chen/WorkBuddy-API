@@ -20,6 +20,7 @@ import urllib.request
 from pathlib import Path
 
 from .. import config
+from .errtext import err_text
 
 STATUS_FILE = config.DATA_DIR / 'update-status.json'
 # docker 可用性缓存（(时间, 布尔)）。每次探测要跑 docker info（~50ms），
@@ -210,6 +211,8 @@ def _pid_alive(pid: object) -> bool:
         return False
     if pid_int <= 0:
         return False
+    if os.name == 'nt':
+        return _pid_alive_windows(pid_int)
     try:
         os.kill(pid_int, 0)
         return True
@@ -219,6 +222,54 @@ def _pid_alive(pid: object) -> bool:
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _pid_alive_windows(pid_int: int) -> bool:
+    """Windows 探活：OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetExitCodeProcess。
+
+    为什么不用 os.kill(pid, 0)：在 Windows 上 sig=0 等价 CTRL_C_EVENT，走
+    GenerateConsoleCtrlEvent 分支——对**已退出但内核对象尚可打开**的 pid
+    静默成功（误判存活）。后果是更新进程死后 update.lock 仍被当作活跃，
+    read_status 把状态强制拉回 running=true，前端一直显示「正在更新：执行中」。
+    而「对象还在但已终止」用 GetExitCodeProcess 就能区分（退出码 != STILL_ACTIVE）。
+
+    OpenProcess 失败按 GetLastError 区分：
+      * 87 (ERROR_INVALID_PARAMETER) / 6 (ERROR_INVALID_HANDLE) → pid 不存在；
+      * 5  (ERROR_ACCESS_DENIED) → 打不开但进程多半存在（受保护进程），视为
+        存活。QUERY_LIMITED 本就是为低权限探测设计的，实际极少被拒——
+        宁可保守判活，也不误清锁放进第二个并发更新。
+    """
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_INVALID_PARAMETER = 87
+    ERROR_INVALID_HANDLE = 6
+    if pid_int > 0xFFFFFFFF:  # DWORD 上限之外必不存在（也防 ctypes 溢出报错）
+        return False
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_int)
+    if not handle:
+        err = ctypes.get_last_error()
+        if err in (ERROR_INVALID_PARAMETER, ERROR_INVALID_HANDLE):
+            return False
+        # 其余打不开的情形（含 5）：保守视为存活，避免误判造成并发更新
+        return True
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True  # 查询失败：保守视为存活
+        return exit_code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _lock_active() -> bool:
@@ -292,6 +343,38 @@ def set_upstream_ref(ref: str) -> str:
     return val
 
 
+def _write_initial_status(target: str, pid: int) -> None:
+    """写入更新刚启动时的占位状态（running=true / ok=null）。
+
+    字段口径与 deploy/update.py 的 Reporter 对齐：read_status 会把它合并进
+    返回值；子进程若瞬间死亡，「running 且 pid 已死」分支会用 _update_landed
+    收敛出终止态——初始状态没有 target_version、logs 为空，正好落到
+    ok=false「更新进程异常中断」，前端就能停下转圈并显示失败。
+    """
+    now = int(time.time())
+    data = {
+        'running': True,
+        'ok': None,
+        'target': target,
+        'step': '已启动更新进程',
+        'logs': [],
+        'started_at': now,
+        'finished_at': None,
+        'duration': 0,
+        'pid': pid,
+    }
+    try:
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # 与 Reporter.flush 相同的「临时文件 + 原子替换」写法，
+        # 避免轮询读到写了一半的 JSON
+        tmp = STATUS_FILE.with_suffix('.tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(STATUS_FILE)
+    except Exception:  # noqa: BLE001
+        # 状态写不出去也不必拦启动：子进程自己的 Reporter 还会再写
+        pass
+
+
 def start_update(target: str) -> tuple[bool, str]:
     """启动更新（后台脱离运行）。返回 (是否已启动, 说明)。"""
     if target not in ('manager', 'upstream', 'both'):
@@ -336,6 +419,11 @@ def start_update(target: str) -> tuple[bool, str]:
         # 上游版本固定（空 = 跟随分支）；worker 据此决定检出哪个版本
         'WB_UPSTREAM_REF': upstream_ref(),
         'WB_UPSTREAM_REF_FILE': str(UPSTREAM_REF_FILE),
+        # 子进程 stdio 与默认编码强制 UTF-8：中文 Windows 上重定向 stdout 的
+        # 默认编码是 cp936（GBK），print('✓'/'⚠️') 会 UnicodeEncodeError 直接
+        # 杀死更新进程（2026-09-26 实测：验签通过后即在 ✓ 日志行中断）。
+        'PYTHONIOENCODING': 'utf-8',
+        'PYTHONUTF8': '1',
     })
 
     try:
@@ -351,11 +439,11 @@ def start_update(target: str) -> tuple[bool, str]:
             stdout=logfh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            # 脱离父进程：管理端重启不影响更新流程
-            start_new_session=True,
+            **({'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+   if os.name == 'nt' else {'start_new_session': True}),
         )
     except Exception as exc:  # noqa: BLE001
-        return False, f'启动更新失败：{exc}'
+        return False, f'启动更新失败：{err_text(exc)}'
     finally:
         try:
             if logfh not in (subprocess.DEVNULL,):  # type: ignore[comparison-overlap]
@@ -363,12 +451,32 @@ def start_update(target: str) -> tuple[bool, str]:
         except Exception:  # noqa: BLE001
             pass
 
+    _write_initial_status(target, proc.pid)
+
     try:
         LOCK_FILE.write_text(str(proc.pid), encoding='utf-8')
     except Exception:  # noqa: BLE001
         pass
 
     return True, f'更新已开始（pid={proc.pid}）'
+
+
+def clear_status() -> tuple[bool, str]:
+    """清除上次更新的结果与日志。返回 (是否成功, 说明)。
+
+    为什么需要它（issue #105）：一次失败的更新会**长期驻留** —— 状态文件只在下次
+    `start_update` 时被删，`update.log` 只追加从不截断，于是界面上那条「更新未完成」
+    与日志永远擦不掉，用户只能进容器手删文件。而失败记录恰恰是最想清掉的东西。
+    """
+    if _lock_active():
+        # 运行中清状态会让前端把「正在更新」看丢；等它结束（或锁过期）再清。
+        return False, '更新正在进行中，等它结束后再清除'
+    for f in (STATUS_FILE, LOG_FILE):
+        try:
+            f.unlink(missing_ok=True)
+        except OSError as exc:
+            return False, f'清除失败：{err_text(exc)}'
+    return True, '已清除上次更新的结果与日志'
 
 
 def tail_log(lines: int = 80) -> str:
@@ -386,6 +494,9 @@ def tail_log(lines: int = 80) -> str:
 # 避免每次打开页面都去请求；用户可手动强制刷新。
 _VERSION_CACHE_FILE = config.DATA_DIR / 'version-check.json'
 VERSION_CACHE_TTL = 6 * 3600          # 6 小时
+# 「新版本已发布但还没有签名」时的短 TTL：这时结论随时会变（维护者签完就好），
+# 用 5 分钟换来界面及时恢复。
+_SIG_PENDING_TTL = 5 * 60
 UPSTREAM_API_REPO = os.environ.get('WB_UPSTREAM_API_REPO') or 'daniei-chen/WorkBuddy-API'
 # 管理端仓库（owner/name），用于查询最新 Release
 MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
@@ -531,7 +642,7 @@ def _fetch_remote_versions() -> dict:
     """向 GitHub 查询管理端与上游的最新版本（不做缓存判断）。"""
     result: dict = {
         'checked_at': int(time.time()),
-        'manager': {'latest': '', 'url': '', 'error': ''},
+        'manager': {'latest': '', 'url': '', 'sig_ready': None, 'error': ''},
         'upstream': {'latest': '', 'date': '', 'subject': '', 'error': ''},
     }
 
@@ -541,6 +652,12 @@ def _fetch_remote_versions() -> dict:
         if isinstance(rel, dict):
             result['manager']['latest'] = str(rel.get('tag_name') or '')
             result['manager']['url'] = str(rel.get('html_url') or '')
+            # 是否已附带签名（发布后维护者签名前会有一段窗口期，见 issue #127/#129）：
+            # 现在就在版本检查里说清，别让用户点下去才被拒绝。
+            assets = rel.get('assets') or []
+            result['manager']['sig_ready'] = any(
+                str((a or {}).get('name') or '').endswith('.tar.gz.sig')
+                for a in assets if isinstance(a, dict))
     except urllib.error.HTTPError as exc:
         result['manager']['error'] = '未找到 Release' if exc.code == 404 else f'HTTP {exc.code}'
     except Exception as exc:  # noqa: BLE001
@@ -574,7 +691,10 @@ def check_updates(force: bool = False) -> dict:
     """检测是否有新版本。结果缓存 6 小时（GitHub 未认证 API 限流较严）。"""
     cache = _read_cache()
     age = time.time() - float(cache.get('checked_at') or 0)
-    if force or not cache or age > VERSION_CACHE_TTL:
+    # 已知「该版本还没有签名」时用短 TTL：签名一上传（通常几分钟）界面就该恢复
+    # 正常，而不是继续拿旧结论劝退用户。
+    ttl = _SIG_PENDING_TTL if cache.get('manager', {}).get('sig_ready') is False         else VERSION_CACHE_TTL
+    if force or not cache or age > ttl:
         fresh = _fetch_remote_versions()
         # 保留上次成功结果：临时网络故障不应让界面显示「未知」
         for key in ('manager', 'upstream'):
@@ -604,6 +724,7 @@ def check_updates(force: bool = False) -> dict:
             'latest': m_latest,
             'has_update': manager_has,
             'url': str(cache.get('manager', {}).get('url') or ''),
+            'sig_ready': cache.get('manager', {}).get('sig_ready'),
             'error': str(cache.get('manager', {}).get('error') or ''),
             'repo': MANAGER_REPO,
         },

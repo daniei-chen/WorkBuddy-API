@@ -132,14 +132,19 @@ class FrontendPostShapeTest(unittest.TestCase):
                       'post() 应把第二个参数作为 body 发出')
 
     def test_auth_start_passes_realm_in_body(self) -> None:
-        """前端这一行就是当初那条 bug 的另一半：{realm} 是 body 不是 query。"""
+        """前端这一行就是当初那条 bug 的另一半：{realm, region} 是 body 不是 query。
+
+        region 与 realm 同一条规矩：服务端的后台轮询要用它做国际版地区登记，
+        而它拿不到前端组件的 state —— 只能跟着发码请求一起传（见 api.ts 注释）。
+        """
         api = self.API_TS.read_text(encoding='utf-8')
         idx = api.find("'/api/auth/start'")
         self.assertGreater(idx, 0, '找不到 auth/start 的前端调用')
-        snippet = api[max(0, idx - 160):idx + 60]
+        snippet = api[max(0, idx - 200):idx + 80]
         self.assertIn("post<", snippet, 'auth/start 应通过 post() 调用')
-        self.assertIn('{realm}', snippet,
-                      'realm 应以对象形式作为 body 传入 —— 后端已按 body 解析')
+        self.assertRegex(snippet, r'\{\s*realm\s*,\s*region\s*(?:,|\})',
+                         'realm 与 region 都应以对象形式作为 body 传入 —— '
+                         '后端已按 body 解析（写成 query 会静默失效）')
 
 
 class PostParamLocationAuditTest(unittest.TestCase):
@@ -155,8 +160,20 @@ class PostParamLocationAuditTest(unittest.TestCase):
 
     # 允许使用 query 参数的 POST 端点（前端必须相应发 query）
     ALLOWED_QUERY_POSTS = {
-        '/api/accounts/refresh-credits': {'force'},
-        '/api/auth/start': {'realm'},  # 同时接受 body，query 仅为兼容旧调用方
+        '/api/accounts/refresh-credits': {'force', 'upstream_id'},
+        '/api/auth/start': {'realm', 'region', 'upstream_id'},
+        # 账号分组（多账号池）：下列写端点都接受 `?upstream_id=` 指定作用于哪个
+        # 分组（前端 accountApi 统一按 query 拼；缺省不传 = 默认分组）。
+        '/api/accounts/checkin-all': {'upstream_id'},
+        '/api/accounts/{filename}/checkin': {'upstream_id'},
+        '/api/accounts/{filename}/test': {'upstream_id'},
+        '/api/accounts/{filename}/refresh': {'upstream_id'},
+        '/api/accounts/{filename}/clear-cooling': {'upstream_id'},
+        '/api/accounts/{filename}/note': {'upstream_id'},
+        '/api/accounts/{filename}/proxy': {'upstream_id'},
+        '/api/accounts/{filename}/disabled': {'upstream_id'},
+        '/api/accounts/{filename}/move': {'upstream_id'},
+        '/api/restart': {'upstream_id'},
     }
 
     # 覆盖的方法：**所有带 body 的写方法**，不只是 POST。

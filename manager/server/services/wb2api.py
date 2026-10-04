@@ -10,17 +10,22 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import tempfile
 import time
 from pathlib import Path
 
 from .. import config
 from . import realm as _realm
+from .errtext import err_text
 from .realm import realm_of, supports_checkin
 
 
-def _safe_file(filename: str) -> Path:
+def _safe_file(filename: str, auth_dir: Path | None = None) -> Path:
     """把请求里的文件名解析为 auths 目录下的真实路径，非法即抛错。
+
+    auth_dir 非空时按该**分组**的账号目录解析（多分组 / 账号池，见 upstreamsvc），
+    缺省仍是本部署的 config.AUTH_DIR —— 存量调用方的行为逐字不变。
 
     穿越防线（`/`、反斜杠、`..`、NUL）是根本；此外只接受 `workbuddy*.json`
     这一种形态，避免越权读到目录里的其他文件（例如隐藏文件或临时文件）。
@@ -42,15 +47,34 @@ def _safe_file(filename: str) -> Path:
     # 不再匹配上游的 `workbuddy*.json` glob，于是上游不会加载它）。
     if not re.fullmatch(r'workbuddy[0-9A-Za-z_-]{0,80}\.json(\.disabled)?', filename):
         raise ValueError('非法的文件名')
-    target = config.AUTH_DIR / filename
+    base = auth_dir or config.AUTH_DIR
+    target = base / filename
     # 结尾必须是 .json 或 .json.disabled（上面正则已保证，这里再兜一层）
     if not (target.name.endswith('.json') or target.name.endswith('.json.disabled')):
         raise ValueError('非法的文件名')
     return target
 
 
-def read_account_file(filename: str) -> dict:
-    return json.loads(_safe_file(filename).read_text(encoding='utf-8'))
+def read_account_file(filename: str, auth_dir: Path | None = None) -> dict:
+    return json.loads(_safe_file(filename, auth_dir).read_text(encoding='utf-8'))
+
+
+def set_account_proxy(filename: str, proxy: str, auth_dir: Path | None = None) -> dict:
+    """只更新线路，保留凭据及其他字段；写入复用账号文件的原子替换。"""
+    from .tencent import _atomic_write_json
+
+    path = _safe_file(filename, auth_dir)
+    if path.is_symlink():
+        raise ValueError('账号文件不能是符号链接')
+    raw = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(raw, dict):
+        raise ValueError('账号文件格式异常')
+    if proxy:
+        raw['proxy'] = proxy
+    else:
+        raw.pop('proxy', None)
+    _atomic_write_json(path, raw)
+    return {'file': filename, 'proxy': proxy}
 
 
 def _jwt_times(access_token: str) -> tuple[int, int] | None:
@@ -104,8 +128,11 @@ def token_issued_at(access_token: str) -> int | None:
     return times[0] if times else None
 
 
-def list_auth_accounts() -> list[dict]:
+def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
     """读取 auths/ 目录下的本地账号（与 /status 的运行时状态互补）。
+
+    auth_dir 非空时读该**分组**的账号目录（多分组 / 账号池，见 upstreamsvc）；
+    缺省读 config.AUTH_DIR —— 存量行为不变。
 
     同时收上游**加载不到**的两类文件，否则它们会在面板上「凭空消失」：
       · `workbuddy*.json.disabled` —— 本面板「临时禁用」改名的产物（见
@@ -113,12 +140,13 @@ def list_auth_accounts() -> list[dict]:
         否则「禁用」在使用体验上等同于「删除」。
     """
     out: list[dict] = []
-    if not config.AUTH_DIR.is_dir():
+    base = auth_dir or config.AUTH_DIR
+    if not base.is_dir():
         return out
     now = time.time()
     # 上游只加载 workbuddy*.json；我们额外收 .disabled，以便展示与恢复
-    files = sorted(config.AUTH_DIR.glob('workbuddy*.json'))
-    files += sorted(config.AUTH_DIR.glob('workbuddy*.json.disabled'))
+    files = sorted(base.glob('workbuddy*.json'))
+    files += sorted(base.glob('workbuddy*.json.disabled'))
     for path in files:
         try:
             raw = json.loads(path.read_text(encoding='utf-8'))
@@ -157,6 +185,7 @@ def list_auth_accounts() -> list[dict]:
         out.append(
             {
                 'file': path.name,
+                'proxy': str(raw.get('proxy') or ''),
                 'uid': str(acct.get('uid', '')),
                 'nickname': acct.get('nickname') or '未命名',
                 'enterprise_id': acct.get('enterpriseId', '') or '',
@@ -287,8 +316,8 @@ def merge_pool_status(accounts: list[dict], status: dict) -> list[dict]:
     return accounts
 
 
-def delete_auth_account(filename: str) -> bool:
-    target = _safe_file(filename)
+def delete_auth_account(filename: str, auth_dir: Path | None = None) -> bool:
+    target = _safe_file(filename, auth_dir)
     if target.exists():
         target.unlink()
         return True
@@ -303,7 +332,7 @@ DISABLED_SUFFIX = '.disabled'
 _DISABLED_SUFFIX = DISABLED_SUFFIX
 
 
-def read_account_file_any(filename: str) -> dict:
+def read_account_file_any(filename: str, auth_dir: Path | None = None) -> dict:
     """读账号文件，`workbuddy-x.json` 与 `workbuddy-x.json.disabled` **两种形态都试**。
 
     为什么需要：调用方手里的文件名可能与磁盘上的形态不一致——界面在「停用」
@@ -322,14 +351,15 @@ def read_account_file_any(filename: str) -> dict:
     last: FileNotFoundError | None = None
     for name in candidates:
         try:
-            return read_account_file(name)
+            return read_account_file(name, auth_dir)
         except FileNotFoundError as exc:
             last = exc
     assert last is not None          # 至少两个候选，循环必然执行过
     raise last
 
 
-def set_account_disabled(filename: str, disabled: bool) -> dict:
+def set_account_disabled(filename: str, disabled: bool,
+                         auth_dir: Path | None = None) -> dict:
     """临时禁用 / 启用一个账号（改名实现）。返回 {file, disabled, ...}。
 
     实现原理
@@ -363,11 +393,12 @@ def set_account_disabled(filename: str, disabled: bool) -> dict:
     · 只接受 `workbuddy*.json(.disabled)` 形态（走 `_safe_file` 的校验）；
     · 文件不存在时报错，避免「禁用成功」的假象。
     """
-    target = _safe_file(filename)
+    base_dir = auth_dir or config.AUTH_DIR
+    target = _safe_file(filename, base_dir)
     # 规范化成「原始账号名」与「禁用名」两种形态
     base = target.name[:-len(_DISABLED_SUFFIX)] if target.name.endswith(_DISABLED_SUFFIX) else target.name
-    base_path = _safe_file(base)
-    disabled_path = config.AUTH_DIR / (base + _DISABLED_SUFFIX)
+    base_path = _safe_file(base, base_dir)
+    disabled_path = base_dir / (base + _DISABLED_SUFFIX)
 
     if disabled:
         if disabled_path.exists():
@@ -389,21 +420,26 @@ ASYNC_HEADERS = {'Content-Type': 'application/json'}
 
 
 def _err_text(exc: Exception) -> str:
-    """异常文本可能为空（如 AssertionError），补上类型名便于排查。"""
-    detail = str(exc).strip()
-    return f'{type(exc).__name__}: {detail}' if detail else type(exc).__name__
+    """异常文本可能为空（如 AssertionError / TimeoutError），补上类型名便于排查。
+
+    统一走 `errtext.err_text`：空文本的超时还会给「超时（等不到响应）」这种人话。
+    """
+    return err_text(exc)
 
 
-def _auth_headers() -> dict:
-    key = config.upstream_api_key()
+def _auth_headers(api_key: str | None = None) -> dict:
+    """鉴权头。api_key=None 时取默认上游那把（config）；空串 = 不带鉴权头。"""
+    key = config.upstream_api_key() if api_key is None else api_key
     return {'Authorization': f'Bearer {key}'} if key else {}
 
 
-async def get_status() -> dict:
+async def get_status(*, base_url: str | None = None, api_key: str | None = None) -> dict:
+    """上游 /status。base_url / api_key 非空时查**指定分组**的实例（多分组）。"""
     # 连接超时短一些：上游未运行时快速失败，避免拖慢管理端页面
+    base = (base_url or config.WB2API_BASE).rstrip('/')
     try:
         async with config.http_client(10, connect=3) as client:
-            resp = await client.get(f'{config.WB2API_BASE}/status', headers=_auth_headers())
+            resp = await client.get(f'{base}/status', headers=_auth_headers(api_key))
         if resp.status_code >= 400:
             return {'connected': False, 'error': f'上游返回 {resp.status_code}'}
         data = resp.json()
@@ -439,15 +475,61 @@ def _admin_route_missing(resp: object) -> bool:
     return not (isinstance(data, dict) and isinstance(data.get('error'), dict))
 
 
-async def set_manual_disabled(uid: str, disabled: bool, reason: str = '') -> tuple[bool, str, str]:
-    """用上游的 `manual_disabled` 状态位停用/启用账号。
+async def _admin_account_call(uid: str, action: str, *, reason: str = '',
+                              base_url: str | None = None,
+                              api_key: str | None = None) -> tuple[bool, str, str, dict]:
+    """调上游的 `POST /admin/accounts/{uid}/{action}`，返回 (成功, 说明, 结果码, 回显)。
 
-    返回 `(是否成功, 说明文案, 结果码)`。结果码用于调用方决定是否回退：
+    三个 action（disable / enable / revive）的**错误语义完全一样**，所以只写一份；
+    差别只在成功文案与「回显里哪个字段是我们要的」。
 
-      · `ok`        —— 状态位已生效；
+    结果码：
+
+      · `ok`        —— 调用成功（注意：成功 ≠ 账号已回到选号池，见 revive_account）；
       · `no_route`  —— 上游没注册这组接口（旧版本、或 `admin.enabled=false`）；
-      · `not_found` —— 接口在，但该 uid 不在池里（文件没被加载等）；
+      · `not_found` —— 接口在，但该 uid 不在池里（文件还没被加载等）；
       · `error`     —— 其它失败（网络、5xx、鉴权）。
+
+    ## 关于 `admin.enabled` 默认关闭
+
+    上游这组接口**默认不注册**（`admin.enabled` 默认 false，关闭时一律 404，
+    其注释写明是「不向外暴露管理面」的有意设计）。所以能拿到 `no_route` 是
+    **常见且正常**的，不是故障——调用方据此回退改名即可，并把开启方式告诉用户。
+
+    ## 鉴权
+
+    与 `/status` 同源（`api_key`）。`_auth_headers()` 已带上；上游未配 api_key 时
+    它自己的启动校验会拒绝 `admin.enabled=true`，所以这里不需要额外分支。
+    """
+    if not uid:
+        return False, 'uid 为空', 'error', {}
+    base = (base_url or config.WB2API_BASE).rstrip('/')
+    url = f'{base}/admin/accounts/{uid}/{action}'
+    body: dict = {'reason': reason} if (action == 'disable' and reason) else {}
+    try:
+        async with config.http_client(10, connect=3) as client:
+            resp = await client.post(url, json=body, headers=_auth_headers(api_key))
+    except Exception as exc:  # noqa: BLE001
+        return False, _err_text(exc), 'error', {}
+    if resp.status_code == 404:
+        if _admin_route_missing(resp):
+            return False, '上游未启用管理接口（admin.enabled=false 或版本较旧）', 'no_route', {}
+        return False, '该账号不在上游账号池里', 'not_found', {}
+    if resp.status_code == 401:
+        return False, '上游拒绝了鉴权（api_key 不一致）', 'error', {}
+    if resp.status_code >= 400:
+        return False, f'上游返回 {resp.status_code}', 'error', {}
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001 —— 回显只是锦上添花，解析不了不算失败
+        payload = {}
+    return True, '', 'ok', payload if isinstance(payload, dict) else {}
+
+
+async def set_manual_disabled(uid: str, disabled: bool, reason: str = '',
+                              *, base_url: str | None = None,
+                              api_key: str | None = None) -> tuple[bool, str, str]:
+    """用上游的 `manual_disabled` 状态位停用/启用账号。
 
     ## 为什么优先用它，而不是改文件名（issue #45）
 
@@ -463,37 +545,75 @@ async def set_manual_disabled(uid: str, disabled: bool, reason: str = '') -> tup
     对「这个号在拖后腿，先停一会儿」这种用法，后者副作用过大——积分不再增长、
     token 不再续期，回来时可能已经过期。所以两条路并存，优先走状态位。
 
-    ## 关于 `admin.enabled` 默认关闭
-
-    上游这组接口**默认不注册**（`admin.enabled` 默认 false，关闭时一律 404，
-    其注释写明是「不向外暴露管理面」的有意设计）。所以能拿到 `no_route` 是
-    **常见且正常**的，不是故障——调用方据此回退改名即可，并把开启方式告诉用户。
-
-    ## 鉴权
-
-    与 `/status` 同源（`api_key`）。`_auth_headers()` 已带上；上游未配 api_key 时
-    它自己的启动校验会拒绝 `admin.enabled=true`，所以这里不需要额外分支。
+    ⚠️ **它只管 manual_disabled 这一位**。若账号同时被**系统自动禁用**
+    （`disabled`，12153 连败或 11140 被封），`enable` 不会把它放回选号池——
+    那需要 `revive_account()`。调用方拿到 `ok` 之后必须再确认一次
+    （见 `revive_account` 的说明）。
     """
-    if not uid:
-        return False, 'uid 为空', 'error'
-    action = 'disable' if disabled else 'enable'
-    url = f'{config.WB2API_BASE}/admin/accounts/{uid}/{action}'
-    body: dict = {'reason': reason} if (disabled and reason) else {}
-    try:
-        async with config.http_client(10, connect=3) as client:
-            resp = await client.post(url, json=body, headers=_auth_headers())
-    except Exception as exc:  # noqa: BLE001
-        return False, _err_text(exc), 'error'
-    if resp.status_code == 404:
-        if _admin_route_missing(resp):
-            return False, '上游未启用管理接口（admin.enabled=false 或版本较旧）', 'no_route'
-        return False, '该账号不在上游账号池里', 'not_found'
-    if resp.status_code == 401:
-        return False, '上游拒绝了鉴权（api_key 不一致）', 'error'
-    if resp.status_code >= 400:
-        return False, f'上游返回 {resp.status_code}', 'error'
+    ok, msg, code, _ = await _admin_account_call(
+        uid, 'disable' if disabled else 'enable', reason=reason,
+        base_url=base_url, api_key=api_key)
+    if not ok:
+        return False, msg, code
     return True, ('已通过上游状态位停用（签到与保活照常执行）' if disabled
                   else '已通过上游状态位启用'), 'ok'
+
+
+async def revive_account(uid: str, *, base_url: str | None = None,
+                         api_key: str | None = None) -> tuple[bool, str, str]:
+    """解除上游的**系统自动禁用**（`disabled`）—— 与 manual_disabled 是两位。
+
+    ## 为什么必须有它（用户反馈：国际版重新登录后账号池调不动）
+
+    上游 admin.go 的注释写得很明确：
+
+    > `adminAccountEnable` 解除手动停用。若账号仍被系统自动禁用（disabled），
+    > 它**不会**因此回到选号池——那需要 revive。
+
+    而面板此前**只调 disable/enable、从不调 revive**，于是被自动禁用的账号在
+    面板里没有任何操作能救回来，四条自救路径全被堵死：
+
+      · 重新登录 → 上游 `upsertLocked` 只换凭证，**disabled 原样保留**；
+      · 签到解冻 → `ReenableIfCredits` 里 `if remain > 0 && !e.disabled` 直接跳过；
+      · 一次成功 → `NoteSuccess` 要求账号先被选中，而 disabled 的号永不被选中（自锁）；
+      · 等时间 → `healthy()` 里 `if e.disabled` 没有任何时间判据，**永不过期**；
+      · 面板「强制退出冷却」→ 刻意只清冷却域，`disabled` 不在其中。
+
+    表现就是用户报的：**重新登录成功、连通性测试通过（那是直接拿凭证打腾讯，
+    绕过选号池）、但账号池就是调不动**。
+
+    `changed=false`（本来就没被禁用）也算成功——幂等，调用方不必先查状态。
+    """
+    ok, msg, code, payload = await _admin_account_call(
+        uid, 'revive', base_url=base_url, api_key=api_key)
+    if not ok:
+        return False, msg, code
+    if payload.get('disabled') is True:
+        # 上游回了 200 但禁用位还在：这不该发生（除非它改了语义），如实报出来，
+        # 不能像以前那样无条件回一句「已启用」——那正是用户被误导的来源。
+        return False, '上游已接受请求，但账号仍处于禁用状态', 'error'
+    return True, ('已解除系统禁用' if payload.get('changed') else '该账号未被系统禁用'), 'ok'
+
+
+async def account_disabled(uid: str, *, base_url: str | None = None,
+                           api_key: str | None = None) -> bool | None:
+    """从 `/status` 读某账号当前的**系统自动禁用**位。
+
+    返回 True/False；读不到（上游不可达、uid 不在池里）返回 None。
+    用它做「enable 之后到底有没有真的回到池子」的最终判据：admin 端点的回显
+    在旧版本上可能没有 `disabled` 字段，而 `/status` 一直是有的。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        return None
+    try:
+        st = await get_status(base_url=base_url, api_key=api_key)
+    except Exception:  # noqa: BLE001
+        return None
+    for a in st.get('accounts') or []:
+        if str(a.get('uid') or '') == uid:
+            return bool(a.get('disabled'))
+    return None
 
 
 def upstream_state_file() -> Path:
@@ -877,8 +997,15 @@ def _kill_quietly(proc) -> None:
         pass
 
 
-async def restart_container() -> tuple[bool, str]:
-    """重启上游；native 模式走启停脚本，其余部署保持 Docker 行为。"""
+async def restart_container(container: str | None = None) -> tuple[bool, str]:
+    """重启上游；native 模式走启停脚本，其余部署保持 Docker 行为。
+
+    container 非空时**总是走 `docker restart <name>`**：多分组部署里每组一个
+    容器，而面板并不知道各组是 docker 还是 native —— 名字是用户在分组里填的，
+    填错会得到 docker 的原样报错（找不到容器），不会误伤别的对象。
+    """
+    if container:
+        return await _docker_restart(container)
     if config.WB2API_MODE == 'native':
         scripts = (config.WB2API_STOP_SCRIPT, config.WB2API_START_SCRIPT)
         missing = [str(path) for path in scripts if not path.is_file()]
@@ -918,7 +1045,11 @@ async def restart_container() -> tuple[bool, str]:
                 return False, f'{script.name} 退出码 {proc.returncode}'
         return True, '原生 workbuddy2api 已重启'
 
-    name = config.WB2API_CONTAINER
+    return await _docker_restart(config.WB2API_CONTAINER)
+
+
+async def _docker_restart(name: str) -> tuple[bool, str]:
+    """`docker restart <name>`。抽出来是因为「默认上游」与「分组」都要用它。"""
     try:
         proc = await asyncio.create_subprocess_exec(
             'docker', 'restart', name,
@@ -935,19 +1066,25 @@ async def restart_container() -> tuple[bool, str]:
         return False, str(exc)
 
 
-def read_container_logs(limit: int = 200, timestamps: bool = True) -> list[str]:
+def read_container_logs(limit: int = 200, timestamps: bool = True,
+                        with_mtime: bool = False) -> list[str] | tuple[list[str], float | None]:
     """读取上游日志（原生日志文件或 Docker，失败返回空列表）。
 
     默认带 `--timestamps`：docker 会在每行前面加上精确到纳秒的 RFC3339 时间，
     自动任务日志据此获得准确时间并据此去重（上游自己的 log 前缀精度只到秒）。
+
+    `with_mtime=True` 额外返回原生日志文件的 mtime；Docker 模式返回 None。
+    账号回填需要它：原生日志行只有 `HH:MM:SS`，没有日期，不能单独还原 epoch。
     """
     if config.WB2API_MODE == 'native':
         try:
             count = max(1, min(5000, limit))
+            mtime = config.WB2API_LOG_FILE.stat().st_mtime
             with config.WB2API_LOG_FILE.open('r', encoding='utf-8', errors='replace') as fh:
-                return [ln.rstrip('\r\n') for ln in deque(fh, maxlen=count) if ln.strip()]
+                lines = [ln.rstrip('\r\n') for ln in deque(fh, maxlen=count) if ln.strip()]
+            return (lines, mtime) if with_mtime else lines
         except Exception:  # noqa: BLE001
-            return []
+            return ([], None) if with_mtime else []
 
     import subprocess
 
@@ -959,9 +1096,10 @@ def read_container_logs(limit: int = 200, timestamps: bool = True) -> list[str]:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
         # docker logs 把应用日志写到 stderr
         raw = (proc.stdout or '') + (proc.stderr or '')
-        return [ln for ln in raw.splitlines() if ln.strip()]
+        lines = [ln for ln in raw.splitlines() if ln.strip()]
+        return (lines, None) if with_mtime else lines
     except Exception:  # noqa: BLE001
-        return []
+        return ([], None) if with_mtime else []
 
 
 # 管理端**允许读写**的上游配置段。既是 `save_upstream_config` 的写入白名单，
@@ -1072,7 +1210,7 @@ def load_upstream_config() -> dict:
 
 
 # 上游 config.json 的可视化字段类型约束：
-#   *_hours 是 []int（整点数组），cooldown.* 是时长字符串（30s/10m/2h/1d）
+#   *_hours 是 []int（整点数组），cooldown.* 是时长字符串（30s/10m/2h）
 def _has_control_chars(v: str) -> bool:
     """是否含换行或控制字符（路径 / UA 这类单行文本不允许）。"""
     return any(ord(ch) < 32 for ch in v)
@@ -1140,7 +1278,9 @@ def _check_float(key: str, raw: object) -> float:
     if not lo <= val <= hi:
         raise ValueError(f'{key} 必须在 {lo}-{hi}{unit} 之间（收到 {raw}）')
     return val
-_DURATION_RE = re.compile(r'^\d+\s*(s|m|h|d)$', re.IGNORECASE)
+# 上游用 Go time.ParseDuration，**不认 `d`**：写 `7d` 会让上游启动失败。
+# 面板与后端必须用同一份口径，只放行 Go 能解析的 s/m/h。
+_DURATION_RE = re.compile(r'^\d+\s*(s|m|h)$', re.IGNORECASE)
 
 
 def _sanitize_section(section: str, incoming: dict) -> dict:
@@ -1164,7 +1304,7 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             or key in ('ttl', 'gc_interval')
         ):
             if not _DURATION_RE.match(raw.strip()):
-                raise ValueError(f'{key} 时长格式有误，应为 30s / 10m / 2h / 1d')
+                raise ValueError(f'{key} 时长格式有误，应为 30s / 10m / 2h')
             out[key] = raw.strip()
         elif section == 'prompt' and key == 'mode':
             # 上游对非法值是**启动报错**（cmd/server/config.go:429
@@ -1219,7 +1359,7 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             # 所以不能套上面那条「必须匹配时长格式」的规则（否则用户没法关掉）。
             val = str(raw or '').strip()
             if val and val != '0' and not _DURATION_RE.match(val):
-                raise ValueError('expiring_soon 时长格式有误，应为 168h / 7d；留空或 0 = 禁用')
+                raise ValueError('expiring_soon 时长格式有误，应为 168h / 1h；留空或 0 = 禁用')
             out[key] = val
         elif key in _INT_RANGES:
             # 统一区间校验（activity_report_count 等；见 _INT_RANGES 注释）
@@ -1495,12 +1635,139 @@ def _reject_internal_host(host: str) -> str | None:
     return None
 
 
-async def test_upstash(url: str, token: str | None = None) -> tuple[bool, str]:
-    """用 Upstash REST 接口探测连通性（PING）。token 留空时取配置文件中的值。
+_REDIS_SCHEMES = ('redis', 'rediss')
 
-    安全：地址经 `_reject_internal_host` 过滤——这是服务端代发起请求的接口，
-    不能让它打到内网或云元数据端点（SSRF）。
+
+def _redis_target(url: str) -> dict | None:
+    """把 redis:// / rediss:// 地址拆成 (scheme, host, port, username, password)。
+
+    只认标准写法，不做安全判定（与 `_upstash_rest_base` 同一条约定：判定在调用方）：
+      redis://host:6379          redis://:密码@host:6379/0
+      redis://用户名:密码@host:6379   rediss://host:6380（TLS）
+    非 redis/rediss 的 scheme 返回 None —— 那条路走 Upstash REST。
     """
+    raw = (url or '').strip()
+    if '://' not in raw:
+        return None
+    scheme, rest = raw.split('://', 1)
+    scheme = scheme.lower()
+    if scheme not in _REDIS_SCHEMES:
+        return None
+    userinfo, _, hostpart = rest.rpartition('@')
+    hostpart = hostpart.split('/', 1)[0]          # 去掉 /0 这类 db 序号（PING 不挑库）
+    host, _, port = hostpart.rpartition(':')
+    if not host:                                  # 没写端口
+        host, port = hostpart, ''
+    username = password = ''
+    if userinfo:
+        username, sep, password = userinfo.partition(':')
+        if not sep:                               # redis://user@host：只有用户名
+            username, password = userinfo, ''
+    return {
+        'scheme': scheme,
+        'host': host.strip(),
+        'port': int(port) if port.strip().isdigit() else 6379,
+        'username': username,
+        'password': password,
+    }
+
+
+def _resp_command(*parts: str) -> bytes:
+    """按 RESP 数组编码一条命令（内联命令在密码含空格/二进制时不安全）。"""
+    out = [f'*{len(parts)}\r\n'.encode()]
+    for part in parts:
+        raw = part.encode('utf-8')
+        out.append(b'$%d\r\n%s\r\n' % (len(raw), raw))
+    return b''.join(out)
+
+
+async def _resp_read_reply(reader: asyncio.StreamReader) -> tuple[str, str]:
+    """读一条 RESP 回复 → (kind, text)。kind ∈ {'+', '-', ':', '$', '*'}。"""
+    line = (await reader.readline()).decode('utf-8', 'replace').rstrip('\r\n')
+    if not line:
+        raise ConnectionError('连接被对端关闭')
+    kind, body = line[0], line[1:]
+    if kind == '$':                               # 批量字符串：还要读正文
+        size = int(body or -1)
+        if size < 0:
+            return kind, ''
+        data = await reader.readexactly(size + 2)
+        return kind, data[:-2].decode('utf-8', 'replace')
+    if kind == '*':                               # 数组：这里只关心有没有报错
+        return kind, body
+    return kind, body
+
+
+async def _redis_ping(url: str, timeout: float = 5.0) -> tuple[bool, str]:
+    """用 RESP 协议真发一个 PING —— 自建 Redis 的连通性只能这样验。
+
+    为什么**不套用** REST 那套「只放行公网」的判定：自建 Redis 在私网、甚至回环
+    （宿主机原生部署就是 127.0.0.1:6379）都是正常形态，而这条路上探测的地址本就
+    是用户自己填给上游用的存储地址；拦掉的话按钮就变成必现误报 —— 明明上游连得
+    上，面板却说地址不允许（issue #125）。元数据主机名仍然拒绝（见 `_BLOCKED_HOSTNAMES`），
+    那是最小的一块高风险面，且不影响任何正常部署。
+    """
+    target = _redis_target(url)
+    if not target or not target['host']:
+        return False, '请先填写 Redis 地址'
+    host = target['host']
+    if host.strip().lower() in _BLOCKED_HOSTNAMES:
+        return False, f'{host} 是不允许探测的内部地址'
+
+    ssl_ctx = ssl.create_default_context() if target['scheme'] == 'rediss' else None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, target['port'], ssl=ssl_ctx), timeout)
+    except asyncio.TimeoutError:
+        return False, f'无法连接：{host}:{target["port"]} 超时'
+    except Exception as exc:  # noqa: BLE001
+        return False, f'无法连接：{_err_text(exc)}'
+
+    try:
+        if target['password']:
+            # 新老服务端都要能用：给了用户名（且不是 default）才发三参数 AUTH
+            # （Redis 6+ 的 ACL 写法），否则用两参数 —— 老版本只认这一种。
+            if target['username'] and target['username'] != 'default':
+                writer.write(_resp_command('AUTH', target['username'], target['password']))
+            else:
+                writer.write(_resp_command('AUTH', target['password']))
+            await writer.drain()
+            kind, body = await asyncio.wait_for(_resp_read_reply(reader), timeout)
+            if kind == '-':
+                return False, f'认证失败：{body[:80]}'
+        writer.write(_resp_command('PING'))
+        await writer.drain()
+        kind, body = await asyncio.wait_for(_resp_read_reply(reader), timeout)
+        if kind == '-':
+            return False, f'Redis 返回错误：{body[:80]}'
+        if kind == '+' and body.strip().upper() == 'PONG':
+            return True, '连接正常（PONG）'
+        return True, f'已连通，响应：{body[:60]}'
+    except asyncio.TimeoutError:
+        return False, '无法连接：等待响应超时'
+    except Exception as exc:  # noqa: BLE001
+        return False, f'无法连接：{_err_text(exc)}'
+    finally:
+        try:
+            writer.close()
+            await asyncio.wait_for(writer.wait_closed(), 2)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def test_upstash(url: str, token: str | None = None) -> tuple[bool, str]:
+    """探测 Redis 存储的连通性，按地址形态分流：
+
+      · `redis://` / `rediss://` → 真发 RESP `PING`（自建 Redis 的验法，见 `_redis_ping`）；
+      · 其余（`https://` 的 Upstash REST）→ POST `/ping` + Bearer Token。
+
+    安全：**REST 分支**的地址经 `_reject_internal_host` 过滤——它是「服务端代发
+    请求并回显响应片段」，不能打到内网或云元数据端点（SSRF）。RESP 分支不套这套
+    判定（自建 Redis 在私网/回环是正常形态，见 `_redis_ping` 的说明），只拒元数据
+    主机名。
+    """
+    if (url or '').strip().lower().startswith(_REDIS_SCHEMES):
+        return await _redis_ping(url)
     base = _upstash_rest_base(url)
     if not base:
         return False, '请先填写 Upstash 地址'

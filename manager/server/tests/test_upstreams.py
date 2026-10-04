@@ -311,6 +311,42 @@ class UpstreamRoutingTest(_TempDbMixin, unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(sent[0][1], 'http://bound.example:7863/v1/models')
 
+    def test_empty_key_same_address_inherits_default_key(self) -> None:
+        """分组只填名称（api_key 留空、地址=默认分组）→ 转发沿用默认上游那把钥匙。
+
+        不沿用的话，绑定这类分组的密钥一调用就吃上游 401 —— 而「只填名称」正是
+        账号页「添加分组」的默认形态，见 upstreamsvc.forward_api_key。
+        """
+        up = upstreamsvc.create_upstream('简称组', 'http://default.example:7863')
+        key = keysvc.create_key('g', upstream_id=up['id'])
+
+        sent: list = []
+        with mock.patch.object(config, 'WB2API_BASE', 'http://default.example:7863'), \
+                mock.patch.object(config, 'upstream_api_key', lambda: 'k-default'), \
+                mock.patch.object(config, 'http_client', lambda *a, **k: self._fake_client(sent)):
+            r = self._chat(key['key'])
+
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(sent[0][1], 'http://default.example:7863/v1/chat/completions')
+        self.assertEqual(sent[0][2].get('Authorization'), 'Bearer k-default',
+                         '留空 + 同址 = 沿用默认上游的钥匙，而不是不带鉴权头')
+
+    def test_empty_key_other_address_sends_no_auth_header(self) -> None:
+        """留空 + 不同址 → 不带鉴权头：支持不鉴权的自建实例，也别把默认钥匙发过去。"""
+        up = upstreamsvc.create_upstream('外部组', 'http://other.example:7863')
+        key = keysvc.create_key('g2', upstream_id=up['id'])
+
+        sent: list = []
+        with mock.patch.object(config, 'WB2API_BASE', 'http://default.example:7863'), \
+                mock.patch.object(config, 'upstream_api_key', lambda: 'k-default'), \
+                mock.patch.object(config, 'http_client', lambda *a, **k: self._fake_client(sent)):
+            r = self._chat(key['key'])
+
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(sent[0][1], 'http://other.example:7863/v1/chat/completions')
+        self.assertNotIn('Authorization', sent[0][2],
+                         '地址不同的分组留空 = 不带鉴权头')
+
 
 if __name__ == '__main__':
     unittest.main()

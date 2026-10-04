@@ -20,6 +20,7 @@ import json
 import time
 
 from .. import config
+from .errtext import err_text
 from . import tencent, wb2api, native_modality
 
 # 成功缓存 5 分钟：模型清单变化很慢，没必要每次进页面都打腾讯
@@ -237,7 +238,7 @@ async def _build(realm: str, force: bool = False) -> dict:
         candidates.sort(key=lambda a: a.get('remain_seconds', 0), reverse=True)
     except Exception as exc:  # noqa: BLE001
         candidates = []
-        errors.append(f'读取本地账号失败: {exc}')
+        errors.append(f'读取本地账号失败: {err_text(exc)}')
     if not candidates:
         errors.append(f'没有可用的{"国际版" if realm == "global" else "国内版"}账号')
 
@@ -246,7 +247,8 @@ async def _build(realm: str, force: bool = False) -> dict:
         if not token:
             continue
         ok, data = await tencent.fetch_models({'access_token': token, 'realm': realm,
-                                               'domain': acct.get('domain', '')})
+                                               'domain': acct.get('domain', ''),
+                                               'proxy': acct.get('proxy', '')})
         if ok and isinstance(data, list) and data:
             return {
                 'models': _decorate(data, realm),
