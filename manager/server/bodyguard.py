@@ -24,6 +24,12 @@ class APIBodyGuard:
         if self.active >= self.concurrency:
             return await reject(503, '管理请求容量已满，请稍后重试')
         self.active += 1
+        slot_held = True
+        def release_slot():
+            nonlocal slot_held
+            if slot_held:
+                self.active -= 1
+                slot_held = False
         try:
             chunks, size = [], 0
             try:
@@ -51,8 +57,13 @@ class APIBodyGuard:
                 if not delivered:
                     delivered = True
                     payload, body = body, b''
+                    # Bound buffered request bodies, not the whole handler lifetime.
+                    # Slow dashboard queries must not occupy the body-read budget.
+                    release_slot()
                     return {'type': 'http.request', 'body': payload, 'more_body': False}
                 return await receive()
+            if not body:
+                release_slot()
             await self.app(scope, replay, send)
         finally:
-            self.active -= 1
+            release_slot()

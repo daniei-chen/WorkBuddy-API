@@ -17,10 +17,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Hash checked Python dependencies
         run: |
-          python3.12 -m venv .venv
-          .venv/bin/pip install --require-hashes -r manager/server/requirements.hashes.txt
+          python3.12 -m venv "$RUNNER_TEMP/workbuddy-ci-venv"
+          "$RUNNER_TEMP/workbuddy-ci-venv/bin/pip" install --require-hashes -r manager/server/requirements.hashes.txt
       - name: No external network, synthetic fixtures only
-        run: sudo -n unshare --net "$PWD/.venv/bin/python" manager/tools/validate.py --isolated --output "$PWD/validation-results"
+        run: sudo -n unshare --net "$RUNNER_TEMP/workbuddy-ci-venv/bin/python" manager/tools/validate.py --isolated --output "$RUNNER_TEMP/workbuddy-validation-results"
   frontend:
     runs-on: ubuntu-24.04
     timeout-minutes: 20

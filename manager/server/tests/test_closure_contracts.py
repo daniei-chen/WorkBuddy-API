@@ -112,6 +112,44 @@ class BodyContracts(unittest.IsolatedAsyncioTestCase):
     async def test_timeout(self):
         self.assertEqual(await self.exercise([b'x'],delay=0.05,timeout=0.01),408)
 
+    async def test_slow_handler_does_not_hold_body_capacity(self):
+        guard = APIBodyGuard(lambda *_: None, concurrency=1)
+        started = asyncio.Event()
+        finish = asyncio.Event()
+        async def slow_app(scope, receive, send):
+            await receive()
+            started.set()
+            await finish.wait()
+            await send({'type':'http.response.start','status':200,'headers':[]})
+            await send({'type':'http.response.body','body':b'ok'})
+        guard.app = slow_app
+        async def request_body():
+            return {'type':'http.request','body':b'{}','more_body':False}
+        async def no_body():
+            return {'type':'http.request','body':b'','more_body':False}
+        async def send(_): pass
+        first = asyncio.create_task(guard(
+            {'type':'http','path':'/api/write','headers':[(b'content-length',b'2')]},
+            request_body,send))
+        await started.wait()
+        second_called = asyncio.Event()
+        async def slow_get(scope, receive, send):
+            await receive()
+            second_called.set()
+            await send({'type':'http.response.start','status':200,'headers':[]})
+            await send({'type':'http.response.body','body':b'ok'})
+        original = guard.app
+        guard.app = slow_get
+        second = asyncio.create_task(guard(
+            {'type':'http','path':'/api/stats/daily','method':'GET','headers':[]},no_body,send))
+        try:
+            await asyncio.wait_for(second_called.wait(),timeout=0.2)
+        finally:
+            finish.set()
+            guard.app = original
+            await asyncio.gather(first,second)
+        self.assertEqual(guard.active,0)
+
 class SchemaContracts(unittest.TestCase):
     def test_reject_unknown_section_field_type(self):
         for value in ({'api_key':'x'},{'server':{'api_key':'x'}},{'pool':{'max_inflite':4}}, {'session_sticky':{'enabled':'false'}},{'pool':{'max_in_flight':True}}):
