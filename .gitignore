@@ -47,6 +47,8 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+!manager/README.en.md
+!manager/CHANGELOG.md
 
 # 本地构建产物
 wb2api-linux

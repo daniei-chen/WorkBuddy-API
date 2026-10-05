@@ -56,5 +56,6 @@ jobs:
       - run: docker run --rm --network none --cpus 2 --memory 2g --pids-limit 256 --cap-drop ALL --security-opt no-new-privileges -v "$PWD:/src:ro" -w /src wb-ci-build go test -count=1 ./...
       - run: docker build -t wb-ci-runtime .
       - run: docker save -o image.tar wb-ci-runtime
+      - run: chmod 644 image.tar
       - name: Runtime OS and Go vulnerability gate
         run: docker run --rm --cpus 2 --memory 2g --cap-drop ALL --security-opt no-new-privileges -v "$PWD/image.tar:/scan/image.tar:ro" aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa image --input /scan/image.tar --scanners vuln --severity HIGH,CRITICAL --exit-code 1
