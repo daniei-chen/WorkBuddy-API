@@ -86,7 +86,7 @@
     "communityTitle": "本项目在 LINUX DO 社区发布与交流",
     "help": "帮助",
     "about": "关于 WorkBuddy Manager",
-    "aboutDesc": "WorkBuddy Manager 是为 workbuddy2api 打造的账号池管理与 OpenAI 兼容反代网关，支持多账号扫码纳管、自动签到、密钥分发、IP 管控与用量统计。",
+    "aboutDesc": "WorkBuddy Manager 是 WorkBuddy-API 项目的账号池管理与 OpenAI 兼容反代网关，支持多账号扫码纳管、自动签到、密钥分发、IP 管控与用量统计。",
     "versionFallback": "（未取到运行版本）",
     "logout": "退出登录",
     "logoutTitle": "确认退出登录？",

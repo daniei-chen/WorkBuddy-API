@@ -86,7 +86,7 @@
     "communityTitle": "本專案在 LINUX DO 社群發布與交流",
     "help": "說明",
     "about": "關於 WorkBuddy Manager",
-    "aboutDesc": "WorkBuddy Manager 是為 workbuddy2api 打造的帳號池管理與 OpenAI 相容反向代理閘道，支援多帳號掃碼納管、自動簽到、金鑰派發、IP 管控與用量統計。",
+    "aboutDesc": "WorkBuddy Manager 是 WorkBuddy-API 專案的帳號池管理與 OpenAI 相容反向代理閘道，支援多帳號掃碼納管、自動簽到、金鑰派發、IP 管控與用量統計。",
     "versionFallback": "（未取得執行版本）",
     "logout": "登出",
     "logoutTitle": "確定要登出嗎？",

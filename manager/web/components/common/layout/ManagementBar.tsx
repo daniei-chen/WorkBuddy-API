@@ -778,14 +778,14 @@ export function ManagementBar() {
                         </div>
                       </Link>
                       <Link
-                        href="https://github.com/Sliverkiss/workbuddy2api"
+                        href="https://github.com/daniei-chen/WorkBuddy-API"
                         target="_blank"
                         rel="noopener noreferrer"
                         className="inline-flex items-center gap-2 rounded-full bg-muted px-3 py-2 transition-colors hover:bg-muted/80"
                       >
                         <div className="flex items-center gap-2">
                           <FolderGit2 className="size-3.5 text-foreground/60" />
-                          <span className="text-xs font-medium text-foreground">workbuddy2api</span>
+                          <span className="text-xs font-medium text-foreground">WorkBuddy-API</span>
                         </div>
                       </Link>
                       <Link

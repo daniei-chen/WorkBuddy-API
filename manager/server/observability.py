@@ -12,7 +12,7 @@ import asyncio
 from starlette.responses import StreamingResponse
 from dataclasses import dataclass
 
-RELEASE_ID = "v1.0.79+closure.20261005.3"
+RELEASE_ID = "v1.0.79+closure.20261005.4"
 log = logging.getLogger("workbuddy.audit")
 
 @dataclass
