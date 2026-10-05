@@ -23,7 +23,9 @@ type Config struct {
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 
-	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
+	Server struct {
+        MaxBodyMB int `json:"max_body_mb"`
+    } `json:"server"` // 请求体字节上限，默认 64 MiB。
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -194,6 +196,7 @@ func Default() *Config {
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
 	}
+	c.Server.MaxBodyMB = 64
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
@@ -263,6 +266,12 @@ func Load(path string) (*Config, error) {
 }
 
 func applyEnv(c *Config) {
+    if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
+        if n, err := strconv.Atoi(v); err == nil { c.Server.MaxBodyMB = n }
+    }
+    if v := os.Getenv("WB2A_MAX_IN_FLIGHT"); v != "" {
+        if n, err := strconv.Atoi(v); err == nil && n >= 0 { c.Pool.MaxInFlight = n }
+    }
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
 		c.Listen = v
 	}
@@ -352,6 +361,8 @@ func applyEnv(c *Config) {
 }
 
 func (c *Config) normalize() error {
+    if c.Server.MaxBodyMB <= 0 { c.Server.MaxBodyMB = 64 }
+    if c.Server.MaxBodyMB > 1024 { return fmt.Errorf("server.max_body_mb exceeds 1024") }
 	var err error
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import logging
+import asyncio
 
 from . import config, db, redpacket, security
 from .iputil import client_ip
@@ -19,6 +20,7 @@ from .routers import (
     settings, stats, system, tokens, upstreams,
 )
 from .services import accountlog, pgsync, renew, tasklog, taskrun
+from .routers import budgets
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,18 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
     db.connect()
+    from . import budget
+    budget.recover()
+    async def budget_heartbeat():
+        while True:
+            await asyncio.sleep(10)
+            try:
+                budget.heartbeat()
+            except Exception:
+                logger.exception('budget owner heartbeat failed')
+    heartbeat_task = asyncio.create_task(budget_heartbeat())
+    from . import operational
+    monitor_task = asyncio.create_task(operational.monitor())
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
     _warn_if_exposed()
     # 给「抽奖码」这一列上线之前建的红包补码（幂等）：没有码就拼不出抽奖链接，
@@ -52,11 +66,25 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        heartbeat_task.cancel()
+        monitor_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+        from . import budgetowner
+        budgetowner.close()
         tasklog.stop_collector()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
         accountlog.stop_collector()
         pgsync.stop_scheduler()
+        from . import pooledhttp
+        await pooledhttp.close()
 
 
 def _warn_if_exposed() -> None:
@@ -88,6 +116,8 @@ app = FastAPI(
     openapi_url='/openapi.json' if config.ENABLE_DOCS else None,
 )
 
+app.include_router(budgets.router)
+
 if config.CORS_ORIGINS:
     # 只允许**明确列出的**来源。绝不要把 WB_CORS_ORIGINS 设成 `*`：
     # 本应用用 Cookie 认证管理端，而 Starlette 在 allow_credentials=True 时
@@ -118,10 +148,8 @@ MAX_API_BODY_BYTES = 16 * 1024 * 1024
 async def limit_api_body(request: Request, call_next):
     """给 `/api/*` 的请求体加上限。
 
-    只看 `Content-Length`：本中间件拦的是「声明了超大长度」这条最容易发起、
-    也最容易自动化的路径（无鉴权即可打 /api/login）。ASGI 在中间件之前不会把
-    body 读进内存，所以先声明后读没有意义；不带该头的分块请求由 uvicorn 自身的
-    缓冲与并发限制兜底。
+    声明长度的快速拒绝；实际分块累计、总读取超时和缓冲容量由
+    APIBodyGuard 在读取 JSON 前统一校验。
     """
     if request.url.path.startswith('/api/'):
         try:
@@ -431,8 +459,14 @@ class StripBasePathMiddleware:
         return (self.prefix + text).encode('latin-1')
 
 
+from .bodyguard import APIBodyGuard
+app.add_middleware(APIBodyGuard)
+
 if config.BASE_PATH:
     # add_middleware 后注册的在外层，所以这行放在文件末尾：请求进来先过它，
     # 后面的限流 / 缓存头 / 路由看到的都是剥离后的路径。
     app.add_middleware(StripBasePathMiddleware, prefix=config.BASE_PATH)
     logger.info('子路径部署：已启用前缀 %s（反代可保留或自行剥离，两者都可用）', config.BASE_PATH)
+
+from .observability import RequestAuditMiddleware
+app.add_middleware(RequestAuditMiddleware)

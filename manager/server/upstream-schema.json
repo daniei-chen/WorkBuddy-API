@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "sources": {
+    "gateway-candidate/cmd/server/config.go": "ba579888164cb253e28c640f35cbf8a9697d41aa27b6240033a3bb657816bcf4",
+    "gateway-candidate/internal/config/schedule.go": "5f4f47551d3e8f2b3161ae9651ece098a70b09f3997a0ba37eaabdb67e1bf12b"
+  },
+  "sections": {
+    "server": {
+      "max_body_mb": "int"
+    },
+    "cooldown": {
+      "soft_rate": "string",
+      "soft_rate_max": "string"
+    },
+    "admin": {
+      "enabled": "bool"
+    },
+    "global": {
+      "enabled": "bool",
+      "chat_base": "string",
+      "billing_base": "string"
+    },
+    "upstream": {
+      "timeout_seconds": "int",
+      "header_timeout_seconds": "int",
+      "idle_timeout_seconds": "int",
+      "attempt_timeout_seconds": "int",
+      "user_agent": "string",
+      "client_version": "string",
+      "cli_version": "string",
+      "device_token": "string",
+      "device_token_file": "string",
+      "client_name": "string",
+      "passthrough_ip": "bool"
+    },
+    "features": {
+      "sanitize_blacklist_fingerprints": "bool"
+    },
+    "prompt": {
+      "mode": "string",
+      "file": "string"
+    },
+    "upstash": {
+      "url": "string",
+      "token": "string",
+      "clear": "bool"
+    },
+    "pool": {
+      "max_in_flight": "int",
+      "max_in_flight_global": "int",
+      "breaker_threshold": "int",
+      "breaker_cooldown": "string",
+      "breaker_cooldown_max": "string",
+      "degrade_threshold": "int",
+      "degrade_cooldown": "string",
+      "degrade_cooldown_max": "string",
+      "slow_degrade": "*bool",
+      "slow_ttfb": "string",
+      "slow_streak": "int",
+      "slow_cooldown": "string",
+      "idle_weight_per_hour": "float64",
+      "idle_weight_max": "float64",
+      "expiring_soon": "string",
+      "cost_explore_interval": "string",
+      "skip_exhausted": "*bool"
+    },
+    "session_sticky": {
+      "enabled": "bool",
+      "ttl": "string",
+      "gc_interval": "string"
+    },
+    "schedule": {
+      "checkin_hours": "[]int",
+      "travel_hours": "[]int",
+      "activity_hours": "[]int",
+      "keepalive_hours": "[]int",
+      "school_hours": "[]int",
+      "cat_hours": "[]int",
+      "checkin_enabled": "bool",
+      "travel_enabled": "bool",
+      "activity_enabled": "bool",
+      "keepalive_enabled": "bool",
+      "school_enabled": "bool",
+      "cat_enabled": "bool",
+      "activity_report_count": "int"
+    }
+  }
+}

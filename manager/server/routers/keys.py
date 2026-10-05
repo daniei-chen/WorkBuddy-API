@@ -179,15 +179,21 @@ def update_key(key_id: int, body: KeyPatch, user: dict = Depends(security.requir
     updated = keysvc.update_key(key_id, patch)
     if not updated:
         raise HTTPException(status_code=404, detail='密钥不存在')
+    security.audit(user,'update_key',str(key_id),'fields='+','.join(sorted(patch)))
     return updated
 
 
 @router.post('/{key_id}/reset-usage')
 def reset_usage(key_id: int, user: dict = Depends(security.require_admin)) -> dict:
+    from .. import budget
+    budget.initialize()
+    if budget.unresolved(key_id):
+        raise HTTPException(status_code=409,detail='该密钥有未结算请求，请先核对用量')
     # 不存在的 id 应报 404，而不是静默成功：否则前端会提示「已重置」，
     # 而实际什么都没发生（密钥可能已被别人删掉，页面上却看着还在）。
     if not keysvc.reset_usage(key_id):
         raise HTTPException(status_code=404, detail='密钥不存在')
+    security.audit(user,'reset_key_usage',str(key_id),'reset token and credit counters')
     return {'ok': True}
 
 

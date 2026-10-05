@@ -481,7 +481,7 @@ def _token_identity(request: Request, token: str) -> dict:
     }
 
 
-def current_user(request: Request) -> dict:
+def _current_user(request: Request) -> dict:
     """解析请求身份。**这是管理端唯一的身份入口**。
 
     两条凭据路径，**会话优先**：
@@ -510,6 +510,12 @@ def current_user(request: Request) -> dict:
     if token:
         return _token_identity(request, token)
     raise session_err or HTTPException(status_code=401, detail='未登录')
+
+
+def current_user(request: Request) -> dict:
+    user = _current_user(request)
+    request.state.audit_actor = user.get('username', 'anonymous')
+    return user
 
 
 def require_admin(user: dict = Depends(current_user)) -> dict:

@@ -1,0 +1,17 @@
+{
+  "upstream": "https://github.com/micromatch/braces/tree/3.0.3",
+  "advisory": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm",
+  "files": {
+    "index.js": "332ea07c7b006361aad12aa994ca75dc1db8e8382b884909e2f38f10b85c88a4",
+    "LICENSE": "35bdd8a44339719441900fb50fbefc5e2dca1ca662cbaed7a687de842c8b70f2",
+    "package.json": "977d9f759ae90bf3b9a83424b1cd93e0e61c5a3191d5075204e84b1a6865bd8c",
+    "README.md": "947b0fc3cc12eaaa070207126213fbdf9ab2bf8cd13dcc6e4007b36b79309866",
+    "lib/compile.js": "cc5ec0b1fc2d4d8b6118a5014739c1e1432bd8eaf73b7d1bf0db9d1ffa457214",
+    "lib/constants.js": "c18ac5adb57308f1ce42a28552da3a31f5d83709743ebd9a636336813a744d4b",
+    "lib/expand.js": "9872e75115a8571cc3552633d7258c8e1bfa002bf37abac8c2e3625cef727f87",
+    "lib/guard.js": "956a893dd7b5b4b1e0151b4326700f559199be2d3919ccc18bccf85db138a40d",
+    "lib/parse.js": "c9ffb7b103f4d528ded2b0ebb287705590910e84cca85def6e9ad2eb4bbe870a",
+    "lib/stringify.js": "d7ddde278027501646a429cdd29af4c8f5b08698a28013b72838fb791c75e99d",
+    "lib/utils.js": "b5a7596aa67730412b3c029ef09e84e6b67b8e445cffd35d1d295549c89066c7"
+  }
+}

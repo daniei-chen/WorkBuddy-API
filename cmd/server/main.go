@@ -64,6 +64,11 @@ func main() {
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
+	if cfg.SessionSticky.Enabled {
+		mirror, mirrorErr := redisstore.NewFileBinds(filepath.Join(filepath.Dir(cfg.StateFile),"session-binds.json"),store)
+		if mirrorErr != nil { log.Fatalf("session mirror initialization failed: %v",mirrorErr) }
+		store = mirror
+	}
 
 	p := pool.New(cfg.StateFile)
 	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（FIX-4:goroutine 泄漏）
@@ -87,6 +92,7 @@ func main() {
 		log.Printf("慢速降权已启用（slow_ttfb=%s slow_streak=%d slow_cooldown=%s）",
 			cfg.SlowTTFBDur, cfg.Pool.SlowStreak, cfg.SlowCooldownDur)
 	}
+	log.Printf("effective config: body_mb=%d account_max_in_flight=%d header_s=%d idle_s=%d", cfg.Server.MaxBodyMB, cfg.Pool.MaxInFlight, cfg.Upstream.HeaderTimeoutSeconds, cfg.Upstream.IdleTimeoutSeconds)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
@@ -102,8 +108,9 @@ func main() {
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
 	redisMode := "noop"
+	if _,ok:=store.(*redisstore.FileBinds);ok{redisMode="local-file"}
 	if _, ok := store.(redisstore.Noop); !ok {
-		redisMode = "upstash"
+		if redisMode != "local-file" {redisMode = "upstash"}
 	}
 	if cfg.SessionSticky.Enabled {
 		sessRouter = session.New(session.Config{
@@ -117,7 +124,7 @@ func main() {
 			// 见 wiring.go）；裸名走 cn（现状零回归）。
 			AvailableForModel: realmAwareAvailableForModel(p),
 		})
-		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+		sessRouter.LoadFromStoreWithExpiry() // Restore persisted remaining TTL once at startup.
 		sessRouter.StartGC()
 		defer sessRouter.StopGC()
 	}
@@ -216,6 +223,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) * 1024 * 1024,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,

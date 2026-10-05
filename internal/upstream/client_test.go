@@ -840,8 +840,8 @@ func TestNewTransportHardening(t *testing.T) {
 		t.Errorf("ResponseHeaderTimeout=%v want 60s", tr.ResponseHeaderTimeout)
 	}
 	// 5. 空闲连接池（既有值，从 90s 收到 30s）。
-	if tr.IdleConnTimeout != 30*time.Second {
-		t.Errorf("IdleConnTimeout=%v want 30s", tr.IdleConnTimeout)
+	if tr.IdleConnTimeout != 15*time.Second {
+		t.Errorf("IdleConnTimeout=%v want 15s", tr.IdleConnTimeout)
 	}
 	if tr.MaxIdleConns != 100 || tr.MaxIdleConnsPerHost != 20 {
 		t.Errorf("pool sizes=(%d, %d) want (100, 20)", tr.MaxIdleConns, tr.MaxIdleConnsPerHost)

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用与部署文档
+    url: https://github.com/ithtelab/workbuddy-manager#readme
+    about: 部署方式、环境变量、接入示例与常见问题，先看这里可以解决大部分疑问
+  - name: 更新日志
+    url: https://github.com/ithtelab/workbuddy-manager/blob/main/CHANGELOG.md
+    about: 查看各版本的新增、修复与变更，以及计划中的功能
+  - name: 上游源码（随发布包分发）
+    url: https://github.com/ithtelab/workbuddy-manager/blob/main/deploy/README.md
+    about: 账号池与令牌刷新由上游 workbuddy2api 负责；源码随本项目的发布包分发，部署方式见部署指南

@@ -335,7 +335,7 @@ def reset_usage(key_id: int) -> bool:
     """
     if not db.query_one('SELECT id FROM api_keys WHERE id = ?', (key_id,)):
         return False
-    db.execute('UPDATE api_keys SET used_tokens = 0, used_credit = 0 WHERE id = ?', (key_id,))
+    db.execute('UPDATE api_keys SET used_tokens = 0, used_credit = 0, used_credit_units = 0 WHERE id = ?', (key_id,))
     return True
 
 
@@ -561,5 +561,8 @@ def touch(key: dict, ip: str, tokens: int = 0, credit: float | None = None) -> N
     if tokens:
         db.execute('UPDATE api_keys SET used_tokens = used_tokens + ? WHERE id = ?', (tokens, key['id']))
     if credit:
-        db.execute('UPDATE api_keys SET used_credit = used_credit + ? WHERE id = ?',
-                   (float(credit), key['id']))
+        from .ledger import units, SCALE
+        db.execute('UPDATE api_keys SET used_credit_units=coalesce(used_credit_units,round(used_credit*1000000))+? WHERE id=?',
+                   (units(credit), key['id']))
+        db.execute('UPDATE api_keys SET used_credit=used_credit_units*1.0/? WHERE id=?',
+                   (SCALE,key['id']))

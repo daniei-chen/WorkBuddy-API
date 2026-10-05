@@ -185,7 +185,10 @@ class UpstreamUpdateGuardTest(unittest.TestCase):
 
     def _start(self, target: str, docker_ok: bool):
         from server.services import updater
-        with mock.patch.object(updater, 'can_control_docker', return_value=docker_ok),                 mock.patch.object(updater, '_lock_active', return_value=True):
+        # Generic upstream installations are separate from the managed-release
+        # guard contract, which is exercised in test_full_upgrade.
+        import tempfile
+        with tempfile.TemporaryDirectory() as generic_root, mock.patch.object(updater.config, 'ROOT', Path(generic_root)), mock.patch.object(updater, 'can_control_docker', return_value=docker_ok), mock.patch.object(updater, '_lock_active', return_value=True):
             return updater.start_update(target)
 
     def test_no_docker_rejects_upstream(self) -> None:

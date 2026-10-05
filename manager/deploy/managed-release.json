@@ -1,0 +1,115 @@
+{
+  "release_id": "v1.0.79+audit.20261004.1",
+  "files": {
+    "server/routers/gateway.py": {
+      "source": "gateway.py",
+      "original_sha256": "ba0d1d6b6eda43c1fd57495648122dbfbd848ce99d26b67f509a2fe4fa252e9d",
+      "candidate_sha256": "8f0a9ed1c0ea372f0fb4153391e5ec237341cbef27ba58ee218e02fd4ade7959"
+    },
+    "server/db.py": {
+      "source": "db.py",
+      "original_sha256": "79855f64df57cbe4a0aec8a2347027b5d4253505fa180caf3e775eaeae1785d2",
+      "candidate_sha256": "4bff74de6bf27b45bf707ebf04d84f3e4a1d89794ce609a9de2f32c0806f6bf5"
+    },
+    "server/main.py": {
+      "source": "main.py",
+      "original_sha256": "e5bf47f4499e6f5c9ff5f9a53a761ed0f1d897bd43cef53289c77cee43c1c4ef",
+      "candidate_sha256": "92a01bce05639e2681003872e70865809f6dac963c1d8bea2aa1b4d7de39547a"
+    },
+    "server/routers/keys.py": {
+      "source": "keys.py",
+      "original_sha256": "ffdac857ae44f3605502f4ae0302e6838d27a2fdaf9db76dd92f67f3c6aeaccd",
+      "candidate_sha256": "2534c9a1a6407571604bbd1f62c14a4d744e9b0433f5bba0563e5c161ed68703"
+    },
+    "server/routers/system.py": {
+      "source": "system.py",
+      "original_sha256": "42fe2fbc4ccdaf35531e7ce67f327c19cf05184f5f818047d32b6e22412ebf10",
+      "candidate_sha256": "9d42629fcc78f441df1f3ad7874006b574655de47b706dbd18f98457fdc28443"
+    },
+    "server/routers/anthropic.py": {
+      "source": "anthropic.py",
+      "original_sha256": "d0dd063d51976c4b9433ba6e0e6e373f2a5a5727bb5a47c9f3c7f9bf3da6d7c3",
+      "candidate_sha256": "a78cab0b8272595506b52fc76f96f1fb9ec376c3963678c5a53d7e8b58840a98"
+    },
+    "server/routers/responses.py": {
+      "source": "responses.py",
+      "original_sha256": "e43e373f75ef543c482f08a1b330b39a7cd5a49a6ab8ac931ea4a268d779b968",
+      "candidate_sha256": "c312ff15fb851b560e090740bdd0110e5d790dd67449b210f280bb2882064613"
+    },
+    "server/observability.py": {
+      "source": "observability.py",
+      "original_sha256": null,
+      "candidate_sha256": "6a10b4775978eb372a20bad07f1ccf0553d21eada4522ab13f2714cdfe7a7d48"
+    },
+    "server/services/updater.py": {
+      "source": "updater.py",
+      "original_sha256": "1e9336f8df6feb94097b3e728587f704e5ad0d38a97de8999a532b05ec0c6603",
+      "candidate_sha256": "1c8aae5949d1a6bd75381264bbf0a233f36475201ba9f78b18bf2ccde7f7724e"
+    },
+    "server/requirements.txt": {
+      "source": "requirements.txt",
+      "original_sha256": "59dc2451fb00b01b5b5a89133949396439f6b0803ca1462ecfd2e63e7ac80b1f",
+      "candidate_sha256": "d375e7290cef27c36879bd3d4b2beb6b8cc1a0f041993ce71a7a159f36075604"
+    },
+    "server/requirements.lock.txt": {
+      "source": "requirements.lock.txt",
+      "original_sha256": null,
+      "candidate_sha256": "d1e9250858c99e8be779bbf64fbe37fad2b2e5047290c59ffd6661dcb6e71b60"
+    },
+    "gateway/internal/server/handler.go": {
+      "source": "handler.go",
+      "original_sha256": "bc243a145cb9235beb41b593c25a85c94b4d68adceb7c2f94f7815db52ead76e",
+      "candidate_sha256": "1e5d6c2bd60e9ca3a88b93a36df2a5668f9eca4be5d087e09850130a1224547a"
+    },
+    "gateway/internal/server/logging.go": {
+      "source": "logging.go",
+      "original_sha256": "32041216016dced6e6474b271491f4edc73ae59920db94f4005fa5ed96ba7bcc",
+      "candidate_sha256": "f045667f6e4862f0bdb7433b873d48e1da680955bb1580ae399cfa7cffdad43f"
+    },
+    "gateway/cmd/server/config.go": {
+      "source": "go-config.go",
+      "original_sha256": "bce56ea11eebc3b3f076c9b786af3b5ac7833c40be7682f79afa0ed9ff7718ae",
+      "candidate_sha256": "ba579888164cb253e28c640f35cbf8a9697d41aa27b6240033a3bb657816bcf4"
+    },
+    "gateway/cmd/server/main.go": {
+      "source": "go-main.go",
+      "original_sha256": "3ec3a137f76048aaae265e1dfa67b46b3d831340a24cf7b8c370f4e396393d0e",
+      "candidate_sha256": "20100fe2b539a276607d5e706beed2244abd34e3f40b542ba4891f7cca4ca0e0"
+    },
+    "gateway/Dockerfile": {
+      "source": "Dockerfile",
+      "original_sha256": "08db627aff683ec83e3fba926b0531a467dbe22bc11e9c237159da50e0f0443d",
+      "candidate_sha256": "eebb0e04263a2e00b684b96467c413640896485c417ec05ba0258fd4afe2c2c4"
+    },
+    "server/tests/test_upgrade_audit.py": {
+      "source": "test_upgrade_audit.py",
+      "original_sha256": null,
+      "candidate_sha256": "04c0f6f7f5f4270c8ff0f6a53b1cd174bade1909fa74a694ea85699c8e3b5bde"
+    },
+    "server/tests/test_gateway_body_limit.py": {
+      "source": "test_gateway_body_limit.py",
+      "original_sha256": "8d803a1d5fa7f40c053042ed13967bd6353c1a4fdfa21caa3a040c702259a8f0",
+      "candidate_sha256": "fd0f542cab837779da9c68f434347c3c17398215ac90816c31c078f583540122"
+    },
+    "server/backup_application.py": {
+      "source": "backup_application.py",
+      "original_sha256": null,
+      "candidate_sha256": "d6c74f49957088507bb77cceded7eb3c1e752f80f554008a0f16a2bdbf243825"
+    },
+    "gateway/internal/upstream/client_test.go": {
+      "source": "client_test.go",
+      "original_sha256": "59216c378840fb9069b4b64b28ae1009d371558a5acb2f7a1eef3632ea4a451f",
+      "candidate_sha256": "dc3b229298e03aaa3805318e335dfb41a1f27ca486ca7c3d00d9948ad0a6cbd0"
+    },
+    "gateway/internal/server/upgrade_body_test.go": {
+      "source": "upgrade_body_test.go",
+      "original_sha256": null,
+      "candidate_sha256": "e0a8f046bf55d4c20e9a4ac1c21640a95059e52eddc525bc012bd780f8608404"
+    },
+    "server/tests/test_gateway_passthrough.py": {
+      "source": "test_gateway_passthrough.py",
+      "original_sha256": "e4c8c85577e552b9d156717749c642a346b16f2724708dd96fab8275709908af",
+      "candidate_sha256": "712ee4ce8874631dcae2d9d4adea2b7c918e61c033e404796a877d6eae81ac89"
+    }
+  }
+}

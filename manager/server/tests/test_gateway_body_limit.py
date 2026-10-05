@@ -80,9 +80,9 @@ class BodyLimitResolution(unittest.TestCase):
         _reset_cache()
         return gateway.max_body_bytes() // 1024 // 1024
 
-    def test_follows_config(self) -> None:
-        self.assertEqual(self._mb({'server': {'max_body_mb': 32}}), 32)
-        self.assertEqual(self._mb({'server': {'max_body_mb': 64}}), 64)
+    def test_follows_config(self):
+        for value in (1,32,64,256):
+            self.assertEqual(self._mb({'server': {'max_body_mb':value}}),gateway.DEFAULT_MAX_BODY_MB)
 
     def test_missing_config_falls_back(self) -> None:
         """读不到配置不能导致拒绝服务，退回本端默认值。"""
@@ -107,14 +107,12 @@ class BodyLimitResolution(unittest.TestCase):
                     {'server': {'max_body_mb': -5}}, {'server': {'max_body_mb': 'x'}}, {}):
             self.assertEqual(self._mb(bad), gateway.DEFAULT_MAX_BODY_MB, repr(bad))
 
-    def test_result_is_cached_then_refreshes(self) -> None:
-        self.assertEqual(self._mb({'server': {'max_body_mb': 32}}), 32)
-        # 改文件但不清缓存 → 仍读旧值
-        self.cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
-        self.assertEqual(gateway.max_body_bytes() // 1024 // 1024, 32, 'TTL 内应命中缓存')
-        # 缓存过期 → 生效新值
-        gateway._body_limit_cache['at'] = 0.0
-        self.assertEqual(gateway.max_body_bytes() // 1024 // 1024, 1)
+    def test_result_is_cached_then_refreshes(self):
+        # Legacy file writes cannot silently enlarge or shrink the Manager-owned limit.
+        self.assertEqual(self._mb({'server': {'max_body_mb':32}}),gateway.DEFAULT_MAX_BODY_MB)
+        self.cfg.write_text(json.dumps({'server': {'max_body_mb':1}}),encoding='utf-8')
+        gateway._body_limit_cache['at']=0.0
+        self.assertEqual(gateway.max_body_bytes()//1024//1024,gateway.DEFAULT_MAX_BODY_MB)
 
 
 class BodyLimitEnforcement(unittest.TestCase):
@@ -128,12 +126,15 @@ class BodyLimitEnforcement(unittest.TestCase):
         # 设为 1 MiB，便于构造超限体
         self.cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
         _reset_cache()
+        self._old_default=gateway.DEFAULT_MAX_BODY_MB
+        gateway.DEFAULT_MAX_BODY_MB=1
         self.big = json.dumps(
             {'model': 'x', 'messages': [{'role': 'user', 'content': 'a' * (2 * 1024 * 1024)}]}
         ).encode()
         self.small = json.dumps({'model': 'x', 'messages': []}).encode()
 
     def tearDown(self) -> None:
+        gateway.DEFAULT_MAX_BODY_MB=self._old_default
         config.UPSTREAM_CONFIG = self._orig
         _reset_cache()
         self._tmp.cleanup()

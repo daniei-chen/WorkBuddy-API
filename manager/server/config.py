@@ -216,7 +216,7 @@ def new_secret() -> str:
     return secrets.token_urlsafe(48)
 
 
-def http_client(timeout, *, connect: float | None = None, proxy: str | None = None):
+def http_client(timeout, *, connect: float | None = None, proxy: str | None = None, identity: str | None = None):
     """统一的 httpx 客户端：默认忽略系统/环境代理，避免内网请求被代理劫持。
 
     需要走代理时显式设置 WB_HTTP_PROXY。
@@ -237,4 +237,5 @@ def http_client(timeout, *, connect: float | None = None, proxy: str | None = No
     selected_proxy = HTTP_PROXY if proxy is None else proxy
     if selected_proxy:
         kwargs['proxy'] = selected_proxy
-    return httpx.AsyncClient(**kwargs)
+    from . import pooledhttp
+    return pooledhttp.client(tmo, selected_proxy, identity)

@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import time
 import uuid
@@ -252,6 +253,10 @@ def _authorize(request: Request, model: str | None, *,
         gateway._log_ip(ip, path, True, ua, gateway._key_reject_code(reason, model is None))
         return None, ip, _err(reason, status, getattr(reason, 'err_type', 'permission_error'))
 
+    state=observability.current.get()
+    if state: state.key_id=int(key["id"])
+    if model is not None and not observability.admit_key(key):
+        return None,ip,_err("密钥并发容量已满",429,"rate_limit_error")
     limited, _count = gateway._rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{gateway.RATE_WINDOW}s 内超过 {gateway.RATE_MAX_PER_MIN} 次）'
@@ -821,6 +826,9 @@ class _StreamTranslator:
             self.cache_read = _as_int(usage.get('prompt_cache_hit_tokens')) or self.cache_read
             self.cache_write = _as_int(usage.get('prompt_cache_write_tokens')) or self.cache_write
 
+        if getattr(self,'_deferred_finish',None):
+            return out
+
         choices = obj.get('choices')
         if not isinstance(choices, list) or not choices:
             return out
@@ -908,7 +916,10 @@ class _StreamTranslator:
 
         finish = choice.get('finish_reason')
         if finish:
-            out += self.finish(str(finish))
+            if getattr(self,'defer_finish',False):
+                self._deferred_finish=str(finish)
+            else:
+                out += self.finish(str(finish))
         return out
 
     def finish(self, finish_reason: str | None = None, *, force: bool = False) -> list[bytes]:
@@ -1013,13 +1024,19 @@ async def messages(request: Request):
         # anthropic 的错误体没有 code 字段（只有 type），故第三参给 type
         return _err(str(exc), 503, 'api_error')
     url = f'{upstream["base_url"]}/v1/chat/completions'
+    budget_error = gateway._prepare_forward(key,payload)
+    if budget_error:
+        return budget_error
     started = time.time()
 
     if not stream:
         try:
-            async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+            async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5, identity=gateway._forwarding_identity(key,upstream)) as client:
                 resp = await client.post(url, json=payload,
                                          headers=gateway._upstream_headers(upstream))
+            state=observability.current.get()
+            if state:
+                state.account=(getattr(resp,'headers',{}) or {}).get('x-wb-account-uid')
             latency = int((time.time() - started) * 1000)
             usage: dict = {}
             try:
@@ -1052,7 +1069,7 @@ async def messages(request: Request):
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     # ── 流式 ────────────────────────────────────────────────
-    client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
+    client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5, identity=gateway._forwarding_identity(key,upstream))
     try:
         req = client.build_request('POST', url, json=payload,
                                    headers=gateway._upstream_headers(upstream))
@@ -1066,117 +1083,84 @@ async def messages(request: Request):
     status_code = resp.status_code
 
     async def gen():
-        usage: dict = {}
-        pending = ''
-        translator = _StreamTranslator(model, thinking=want_thinking)
-        error_text: str | None = None
-        first_token_ms: int | None = None
-        abort = False   # 中途出错需中止转发（缓冲超限 / 上游回 error 帧）
-
+        translator=_StreamTranslator(model, thinking=want_thinking)
+        translator.defer_finish=True
+        audit=observability.StreamAudit(MAX_SSE_BUFFER)
+        error_text=None
+        first_token_ms=None
+        cancelled=False
+        captured=bytearray()
+        state=observability.current.get()
+        if state:
+            state.account=(getattr(resp,'headers',{}) or {}).get('x-wb-account-uid')
         try:
             async for chunk in resp.aiter_bytes():
-                pending += chunk.decode('utf-8', errors='ignore')
+                if state and state.first_byte_ms is None:
+                    state.first_byte_ms=int((time.time()-started)*1000)
 
-                if status_code >= 400:
-                    # 有数据就留一份：早先要等到 4000 字节才取，而常见的上游错误体
-                    # 只有几百字节 → error_text 恒为 None，错误被**静默丢弃**，
-                    # 客户端收到「正常但内容为空」的回答，连重试都不会触发。
-                    if error_text is None and pending.strip():
-                        error_text = pending[:500]
-                    # 上游报错时也可能持续吐数据，缓冲同样要设上限
-                    if len(pending) > MAX_SSE_BUFFER:
-                        break
+                if resp.status_code >= 400:
+                    captured.extend(chunk[:max(0,min(2000,MAX_SSE_BUFFER)-len(captured))])
+                    error_text=bytes(captured).decode('utf-8','replace')[:500] or f'上游 HTTP {resp.status_code}'
+                    audit.error_stage='upstream'
                     continue
-
-                if len(pending) > MAX_SSE_BUFFER:
-                    logger.warning('SSE 缓冲超过 %d 字节仍未见换行，中止转发（上游响应形态异常）',
-                                   MAX_SSE_BUFFER)
-                    error_text = '上游响应异常：数据流缺少分隔'
-                    abort = True
-                    break
-
-                # 逐行解析并翻译。**不能**先把 pending 交给 gateway._scan_sse：
-                # 那个函数会消费掉所有完整行、只返回残缺缓冲，这里就拿不到数据了。
-                # usage 与首字延迟因此在本循环内自行提取。
-                while '\n' in pending:
-                    line, pending = pending.split('\n', 1)
-                    line = line.strip()
-                    if not line.startswith('data:'):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw or raw == '[DONE]':
-                        continue
-                    try:
-                        obj = json.loads(raw)
-                    except ValueError:
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-
-                    # 上游可能**中途**回一个 error 帧（形如 {"error":{...}}，没有
-                    # choices）。整帧丢弃会让客户端只收到 message_start 加一个空
-                    # 回答——必须显式转成 Anthropic 的 error 事件并中止。
-                    err_obj = obj.get('error')
-                    if isinstance(err_obj, dict) and not obj.get('choices'):
-                        msg = err_obj.get('message')
-                        error_text = str(msg if msg else err_obj)[:500]
-                        # 上游在 error 帧里可能带 gateway_hint（并列的可执行建议，
-                        # 上游 StreamHint 变体的产物）。拼在 message 后面一起发给
-                        # 客户端——SSE 的 error 事件只有 message 一个字段位，
-                        # 丢掉它等于让「该怎么办」这句建议消失。
-                        mid_hint = gateway._error_hint(obj)
-                        if mid_hint:
-                            error_text = f'{error_text}（{mid_hint}）'[:500]
-                        abort = True
+                for obj in audit.feed(chunk):
+                    if isinstance(obj.get('error'),dict):
+                        error_text=audit.error
                         break
-
-                    frame_usage = obj.get('usage')
-                    if isinstance(frame_usage, dict):
-                        usage.update(frame_usage)
-
                     for event in translator.feed(obj):
                         yield event
-
-                    if translator.saw_content and first_token_ms is None:
-                        first_token_ms = int((time.time() - started) * 1000)
-
-                if abort:
+                    if audit.saw_useful and first_token_ms is None:
+                        first_token_ms=int((time.time()-started)*1000)
+                if audit.error:
+                    error_text=audit.error
+                if error_text:
                     break
-
-            # 收尾。**顺序要紧**：error 必须发在 message_stop **之前**。
-            # 多数 SDK（含 Anthropic 官方库）把 message_stop 当作流的终止信号，
-            # 读到它就结束迭代、不再读后续事件——先发 stop 后发 error 等于那个
-            # 错误永远不会被客户端看到，客户端仍表现为「成功但空回复」，比报错
-            # 更难排查。
-            #
-            # 两种情况都会走到这里，所以只写一遍：
-            #   · 上游直接报错（status >= 400）—— error_text 是响应体；
-            #   · 状态码 200 但**过程中**出错（缓冲超限 / 上游中途回 error 帧）——
-            #     此时客户端拿到的 stop_reason 是 end_turn，即一个「完整但空/
-            #     残缺」的回答：不重试、不报错，排障时毫无线索；截断点若落在
-            #     input_json_delta 中间，还会拿半截 JSON 去执行工具调用。
-            if error_text:
-                yield _event('error', {
-                    'type': 'error',
-                    'error': {'type': 'api_error', 'message': error_text},
-                })
-            # 仍补一套收尾事件（含 message_start，若流尚未开始）：部分客户端期
-            # 待流以 message_stop 结束，缺了会一直等（挂住）。error 已先发出，
-            # 不会再被吞掉。
-            for event in translator.finish(None, force=True):
-                yield event
+            for obj in audit.finish():
+                if isinstance(obj.get('error'),dict):
+                    error_text=audit.error
+                    break
+                for event in translator.feed(obj):
+                    yield event
+                if audit.saw_useful and first_token_ms is None:
+                    first_token_ms=int((time.time()-started)*1000)
+            if not error_text:
+                error_text=audit.error or (None if audit.completed else '上游流提前结束：未收到可信终止事件')
+        except (asyncio.CancelledError,GeneratorExit):
+            cancelled=True
+            raise
+        except Exception as exc:
+            error_text=f'上游流传输或协议异常：{type(exc).__name__}'
+            audit.error_stage='stream_read'
+            logger.warning('stream failed request_id=%s error=%s',state.request_id if state else None,type(exc).__name__)
         finally:
-            await resp.aclose()
-            await client.aclose()
-            latency = int((time.time() - started) * 1000)
-            gateway._record(
-                key, ip, model, mapped or '', status_code,
-                _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
-                latency, ua, error_text, True,
-                usage=usage, first_token=first_token_ms,
-            )
+            try:
+                if not cancelled:
+                    if error_text:
+                        yield _event('error', {'type':'error','error':{'type':'api_error','message':error_text,'gateway_hint':audit.error_hint}})
+                        for event in translator.finish(None,force=True):
+                            yield event
+                    else:
+                        for event in translator.finish(getattr(translator,'_deferred_finish',None),force=True):
+                            yield event
+                        if getattr(translator,'failed',False):
+                            error_text='上游工具参数不完整'
+                            audit.error=error_text
+                            audit.error_stage='protocol'
+            except (asyncio.CancelledError,GeneratorExit):
+                cancelled=True
+                raise
+            finally:
+                observability.set_stream_state(audit,error_text,cancelled)
+                try:
+                    await observability.close_stream(resp,client)
+                finally:
+                    usage=audit.usage
+                    gateway._record(key,ip,model,mapped or '',resp.status_code,
+                        _as_int(usage.get('prompt_tokens')),_as_int(usage.get('completion_tokens')),
+                        int((time.time()-started)*1000),ua,error_text,True,
+                        usage=usage,first_token=first_token_ms)
 
-    return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')
+    return observability.ManagedStreamingResponse(gen(),cleanup=lambda:observability.close_stream(resp,client), status_code=200, media_type='text/event-stream')
 
 
 @router.post('/v1/messages/count_tokens')
@@ -1241,3 +1225,5 @@ async def count_tokens(request: Request):
     # 每块 4 token 的结构开销：消息/工具边界在真实分词里都要额外占位。
     # 这部分是「宁可高估」的落点之一。
     return JSONResponse({'input_tokens': max(1, total + blocks * 4)})
+
+from .. import observability

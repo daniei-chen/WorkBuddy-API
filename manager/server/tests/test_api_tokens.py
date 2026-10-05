@@ -306,6 +306,10 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
     }
     # 写方法但只要求「已登录」——只读令牌也能调。必须逐个有理由。
     ANY_LOGGED_IN = {
+        # Existing local viewer policy: start a login task and use Playground.
+        # Preserve these explicit exceptions while rejecting undeclared writes.
+        'POST /api/auth/start',
+        'POST /api/playground/chat',
         'POST /api/accounts/refresh-credits',   # 刷新积分快照；force=true 内部再查 admin
         'POST /api/keys/check-models',          # 只比对已缓存模型清单，不发网络
     }

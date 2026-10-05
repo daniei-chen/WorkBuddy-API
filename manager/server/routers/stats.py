@@ -228,7 +228,11 @@ def repair_usage(user: dict = Depends(security.require_admin)) -> dict:
 
     用于修复历史缺陷导致的部分调用未计入统计。
     """
-    return db.backfill_usage_from_logs()
+    try:
+        return db.backfill_usage_from_logs()
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post('/rebuild-usage')
@@ -238,7 +242,11 @@ def rebuild_usage(user: dict = Depends(security.require_admin)) -> dict:
     与 /repair-usage 的区别：repair 只补缺口（增量、幂等），
     本接口是**重建**——会替换 usage_daily 的内容，能删除此前多出来的行。
     """
-    return db.rebuild_usage_from_logs()
+    try:
+        return db.rebuild_usage_from_logs()
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.get('/daily')

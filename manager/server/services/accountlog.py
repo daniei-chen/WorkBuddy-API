@@ -33,6 +33,7 @@ import asyncio
 import datetime
 import logging
 import re
+import json
 
 from .. import db
 from . import wb2api
@@ -46,7 +47,7 @@ _POLL_SECONDS = 15
 
 # 每次采集读多少行。上游一行一个请求，500 行足以覆盖 15 秒内的活动
 # （实测高峰期也就每 15 秒几十条）；读太多只是白白解析。
-_TAIL = 500
+_TAIL = 2000
 
 # 上游的对话请求行。格式见 workbuddy2api `internal/server/logging.go`：
 #   | #%03d | HH:MM:SS | model | stream/nostream | status | 昵称(uid8) | TTFB= | tok= | ... | total= |
@@ -208,10 +209,20 @@ def _collect_once() -> int:
     lines, mtime = wb2api.read_container_logs(_TAIL, timestamps=True, with_mtime=True)
     if not lines:
         return 0
+    # Structured events provide exact request identity. Older table logs retain
+    # their explicitly legacy correlation and never override exact attribution.
+    from .. import ledger
+    exact=0
+    for line in lines:
+        start=line.find('{')
+        if start<0 or len(line)>8192:continue
+        try:value=json.loads(line[start:])
+        except (ValueError,TypeError):continue
+        exact+=int(ledger.attempt(value))
     entries = parse_request_lines_with_mtime(lines, mtime)
     if not entries:
-        return 0
-    return db.attach_request_accounts(entries)
+        return exact
+    return exact+db.attach_request_accounts(entries)
 
 
 async def _loop() -> None:

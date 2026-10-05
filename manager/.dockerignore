@@ -1,0 +1,66 @@
+# 构建上下文排除清单。
+#
+# 上下文里有两类东西要留：
+#
+#   1. **前端源码**（web/ 下的源码与锁文件）—— Dockerfile 的 web-builder 阶段
+#      在**没有** web/out 时要自己构建（git clone 场景，见 issue #38），所以
+#      源码必须在上下文里。
+#   2. **前端的已构建产物**（web/out）—— 发布包与 CI 用它，跳过容器内构建。
+#
+# 所以下面只排除「大且无用」与「绝不能进镜像」的，**不要**用 web/ 这种粗粒度
+# 写法（会连带排除源码与 out）。
+#
+# 不排除的代价：git clone 的用户工作区里通常已有 web/node_modules（本地开发
+# 过），多架构构建会把上下文整个打包送进构建器，那几百 MB 是真浪费 —— 所以
+# node_modules/.next 一定要排（下面已排）。
+
+# 依赖与前端中间产物（体积大且可重建）
+web/node_modules
+web/.next
+web/out/cache
+
+# 运行时数据与凭据（绝不能烘进镜像）
+data
+.env
+.env.local
+*.db
+*.db-wal
+*.db-shm
+users.json
+config.json
+.version
+
+# Python 缓存
+__pycache__
+**/__pycache__
+*.py[cod]
+.venv
+venv
+
+# 版本控制与 CI 自身
+.git
+.gitignore
+.github
+
+# 开发参考仓库与临时目录
+.ref
+.devdata
+dev
+
+# 编辑器 / 系统
+.DS_Store
+.idea
+.vscode
+.zcode
+*.log
+*.tsbuildinfo
+
+# 文档：README 与 CHANGELOG 由 Dockerfile 显式 COPY，其余不必进上下文
+docs
+*.md
+!README.md
+!CHANGELOG.md
+
+# 注意 next-env.d.ts：它**不在**仓库里（被 .gitignore 排除），Next 构建时会
+# 自己生成，所以这里不需要为它写例外（实测：干净的 clone 能正常构建，
+# 产物 out/index.html 正常生成）。

@@ -194,7 +194,7 @@ class NativeUpstreamRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('stop.cmd', message)
 
     def test_windows_rejects_linux_only_one_click_update(self) -> None:
-        with mock.patch.object(updater.os, 'name', 'nt'), \
+        with tempfile.TemporaryDirectory() as generic_root, mock.patch.object(config,'ROOT',Path(generic_root)), mock.patch.object(updater.os, 'name', 'nt'), \
                 mock.patch.object(config, 'WB2API_MODE', 'native'), \
                 mock.patch.object(updater, '_lock_active', return_value=True):
             ok, message = updater.start_update('manager')

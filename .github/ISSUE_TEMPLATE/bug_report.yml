@@ -1,0 +1,96 @@
+name: Bug 反馈
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量填写完整，尤其是**复现步骤**与**错误信息** —— 这两项能极大加快定位速度。
+
+        > 如果是安全问题（凭据泄露、越权访问等），请**不要**在这里公开，改用私密渠道联系维护者。
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: 涉及模块
+      description: 问题出现在哪一部分？
+      options:
+        - 账号管理（扫码 / 签到 / 积分 / 状态）
+        - 反代网关（/v1 调用 / 密钥 / 流式）
+        - 密钥管理
+        - 请求日志 / 用量统计
+        - 安全与 IP 管控
+        - 设置 / 上游配置 / Upstash
+        - 界面样式 / 交互
+        - 部署 / 安装（systemd、反代、Docker）
+        - 其他
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 在「设置 → 关于」可看到，或填写 Release 标签（如 v1.0.0）
+      placeholder: v1.0.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象描述
+      description: 发生了什么？你期望的结果是什么？
+      placeholder: |
+        实际表现：……
+        期望表现：……
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请按顺序列出，越具体越好
+      placeholder: |
+        1. 进入「账号」页
+        2. 点击……
+        3. 看到……
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 错误信息 / 日志
+      description: |
+        后端日志：`journalctl -u workbuddy-web -n 100 --no-pager`
+        上游日志：`docker logs workbuddy2api --tail 100`
+        请不要粘贴 API Key、Token 等敏感内容
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、部署方式、浏览器等
+      value: |
+        - 系统：Ubuntu 24.04
+        - 部署方式：systemd + 1Panel 反向代理
+        - 浏览器：Chrome 131
+        - 上游 workbuddy2api 版本：
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 Issue，确认没有重复
+          required: true
+        - label: 我已移除日志中的密钥、Token、账号等敏感信息
+          required: true

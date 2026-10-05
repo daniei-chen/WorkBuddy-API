@@ -138,3 +138,8 @@ sudo bash deploy/install.sh   # 一键部署：装依赖、注册 systemd 服务
 ## License
 
 [MIT](LICENSE)
+
+
+## Maintained Manager and customized gateway (2026-10-05)
+
+Complete Manager source and frontend are in `manager/`. See `manager/docs/closure-20261005/CLOSEOUT_REPORT.md` for verified changes and remaining acceptance conditions. The 130-file customization contract protects sticky conversations and account priority. `.github/workflows/quality.yml` runs isolated regression and supply-chain gates. Runtime credentials and encrypted recovery use separate storage and branches.

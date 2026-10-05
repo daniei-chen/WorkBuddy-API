@@ -1457,6 +1457,8 @@ def save_upstream_config(patch: dict) -> dict:
 
     配置读不到时直接拒绝，绝不基于空 dict 生成新文件覆盖真实配置。
     """
+    from ..upstreamschema import validate
+    validate(patch)
     path = config.UPSTREAM_CONFIG
     if not path.is_file():
         raise FileNotFoundError(f'未找到上游配置文件 {path}，已取消保存')
@@ -1498,7 +1500,7 @@ def save_upstream_config(patch: dict) -> dict:
             'token': str(current.get('token') or ''),
         }
 
-    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
+    _atomic_write_json(path, cfg)
     # 保存后立即让 realm 的配置缓存失效：否则 global.enabled / 两个 base 的改动
     # 最长要 10 秒后才生效，用户会以为没保存成功
     _realm.invalidate()

@@ -1,0 +1,137 @@
+# WorkBuddy Manager —— Docker Compose 部署
+#
+# 用法：
+#   1) 按需修改下面的环境变量（至少确认上游地址与路径）
+#   2) docker compose up -d --build
+#   3) 浏览器打开 http://<服务器IP>:7864
+#      首次启动若未设 WB_ADMIN_PASSWORD，会随机生成密码并打印到容器日志：
+#      docker compose logs workbuddy-manager | grep -A2 密码
+#
+# 与宿主机安装（deploy/install.sh + systemd）的区别，见 Dockerfile 顶部说明。
+# 简述：容器版**能**在界面上更新上游 —— 镜像内置了 docker CLI 与 compose 插件，
+# 挂上 docker.sock 后即可在容器内重建上游容器（见下方 volumes 的说明）。
+# 不挂 docker.sock 时那几项会降级为「请到宿主机操作」，界面如实提示。
+
+services:
+  workbuddy-manager:
+    build:
+      context: .
+      # 可选：Debian 软件源镜像。
+      #
+      # 官方源（deb.debian.org）走 Fastly CDN，中国大陆访问实测**频繁 502 且极慢**
+      # （约 367 kB/s，常在下载某个 .deb 时中断），构建会在第 2 步 "apt-get update"
+      # 直接失败——表现就是镜像建不出来、容器起不来、页面 ERR_CONNECTION_REFUSED。
+      #
+      # Dockerfile 里已内置一次自动降级（官方源失败自动改阿里云重试），所以多数情况
+      # 不配也能建成功，只是会先白等一轮。想完全避免等待就把下面两行取消注释，
+      # 或临时用命令行覆盖：
+      #   docker compose build --build-arg DEBIAN_MIRROR=mirrors.aliyun.com
+      #
+      # 可选镜像：mirrors.aliyun.com / mirrors.tuna.tsinghua.edu.cn / mirrors.ustc.edu.cn
+      args:
+        DEBIAN_MIRROR: ""
+        # 可选：PyPI 镜像（成因同上——官方源走国际 CDN，国内会抖动/失败）。
+        # 留空 = 官方源，失败时 Dockerfile 会自动降级到清华镜像重试。
+        # 可选镜像：https://pypi.tuna.tsinghua.edu.cn/simple / https://mirrors.aliyun.com/pypi/simple
+        PIP_INDEX_URL: ""
+        # 可选：npm 依赖镜像。**只在需要容器内构建前端时用得上**（即工作区
+        # 没有 web/out 的情况，如 git clone 部署）。成因与上面两个相同——
+        # 官方 registry 国内访问慢且会断。
+        #   docker compose build --build-arg NPM_REGISTRY=https://registry.npmmirror.com
+        NPM_REGISTRY: ""
+        # 可选：镜像里要装 docker CLI（供容器内「重载上游 / 读上游日志 / 一键更新」用），
+        # 它的静态包固定从 download.docker.com 取——国外 CDN，国内实测很慢，
+        # 构建会长时间停在这一步。填国内镜像基址可绕开。
+        # 可选值：https://mirrors.aliyun.com/docker-ce / https://mirrors.tuna.tsinghua.edu.cn/docker-ce
+        DOCKER_CLI_BASE: ""
+        # 可选：compose 插件从 GitHub Releases 下载（官方地址国内会超时）。
+        # 用法是「加速前缀 + 原始 URL」，例如 https://ghfast.top/
+        COMPOSE_URL_PREFIX: ""
+        # 可选：子路径部署前缀（如 /workbuddy-manager）。留空 = 部署在根路径。
+        #
+        # 容器版的前端是**构建期**编译进镜像的，所以前缀必须在 build 时传进来；
+        # 与下面 environment 里的 WB_BASE_PATH 取值必须一致。
+        #   docker compose build --build-arg BASE_PATH=/workbuddy-manager
+        BASE_PATH: ""
+    image: workbuddy-manager:latest
+    container_name: workbuddy-manager
+    # 这个 restart 策略是容器版「一键更新」能生效的前提：
+    # 更新完成后容器内的进程会退出，靠它用新代码重新拉起。
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      # 首启管理员密码；不设则随机生成并打印到日志（推荐首启后立即改）
+      # WB_ADMIN_PASSWORD: "改成你的强密码"
+      # 上游地址：若上游与本品在同一 compose 网络，用服务名；否则填宿主机地址
+      #   - 同网络（推荐）：http://workbuddy2api:7863
+      #   - 用宿主机 Docker 网关：http://host.docker.internal:7863
+      WB2API_BASE: http://host.docker.internal:7863
+      # 可选：子路径部署前缀，必须与上面 build.args.BASE_PATH 完全一致（留空则都不填）。
+      # 服务端用它补回响应里漏掉的站内地址，并在反代保留前缀时把前缀剥掉。
+      # 详见 deploy/README.md 的「子路径部署」。
+      # WB_BASE_PATH: /workbuddy-manager
+      # 反向代理在后面时，真实 IP 取自它覆盖写入的 X-Real-IP
+      WB_TRUST_PROXY: "1"
+      # 生产环境不暴露 /docs 与 /openapi.json
+      WB_ENABLE_DOCS: "0"
+    ports:
+      # **只监听本机**：管理端必须藏在反向代理之后。
+      # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
+      # 管理端持有全部账号凭据，直接暴露到公网是被打穿的常见原因。
+      - "127.0.0.1:7864:7864"
+    volumes:
+      # 数据库、日志、更新状态、上游版本固定标记都在这里。
+      # 必须持久化，否则重建容器会丢失统计与审计记录。
+      #
+      # **权限提示（issue #30）**：bind mount 的目录属主由宿主机决定，镜像内的
+      # chown 不起作用。docker 首次自动创建 ./data 时归 root，而容器以 uid 10001
+      # 运行 —— 结果是启动时报 `sqlite3.OperationalError: unable to open database
+      # file`（那个报错既不说路径也不说原因，很容易误以为是路径配错了）。
+      # 宿主机在 compose 所在目录执行一次即可：
+      #   chown -R 10001:10001 ./data
+      # 若目录在网络文件系统（NFS/SMB）上、改不了属主，改用命名卷：
+      #   volumes:
+      #     - wb-manager-data:/app/data
+      #   # 文件末尾另加：
+      #   volumes:
+      #     wb-manager-data:
+      - ./data:/app/data
+      # 上游**整个仓库目录**。一次挂载覆盖下面三件事（分开挂子路径会互相重叠，
+      # 反而让权限语义变模糊）：
+      #   · 读/写上游 config.json —— 管理端「设置」页保存的目标
+      #   · 读/写 auths/ —— 扫码添加账号会落盘 workbuddy-<uid>.json（见
+      #     tencent.write_auth_file），所以**不能只读**
+      #   · 读上游 docker-compose.yml 做端口收敛；「更新上游」时在容器内
+      #     git fetch/pull 并重建上游容器
+      #
+      # **权限提示（与上游 issue #108 同款问题）**：bind mount 的目录属主由宿主机
+      # 决定，镜像内的 chown 不起作用。若管理端显示「0 个账号」而 auths 里明明有
+      # 文件，或添加账号报权限错误，通常是跨 uid 读写不到——宿主机执行一次：
+      #   chown -R 10001:10001 ../workbuddy2api/auths
+      # （10001 是上游容器内进程的 uid，管理端也用同一 uid，见 Dockerfile）
+      #
+      # 若你**不想**让管理端碰上游仓库（例如上游由别人维护），改成只挂 config.json
+      # 与 auths/ 两条子路径即可：此时「更新上游」会不可用，界面会如实提示。
+      - ../workbuddy2api:/opt/workbuddy2api
+      # docker 控制套接字：挂上后容器内的管理端可以像宿主部署那样操作上游容器
+      # （保存设置后自动重载 / 读上游日志 / 一键更新上游）。
+      #
+      # **安全性说明（值得读）**：挂 docker.sock 等于把宿主 root 权限交给本容器。
+      # 但这**不是新增的风险等级**——宿主部署时本服务本来就是 root 运行
+      # （systemd 单元无 User=、安装脚本要求 root），而 root 进程本来就能
+      # `docker run -v /:/host` 拿到宿主文件系统。两者权限等价。
+      #
+      # 若你的要求是最小权限，把下面这行注释掉即可：此时依赖 docker 的功能会
+      # 自动降级为「请到宿主机执行 docker compose ...」，界面如实提示，不会
+      # 静默失败。
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    extra_hosts:
+      # 让容器能通过 host.docker.internal 访问宿主机上的上游
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7864/api/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

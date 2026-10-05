@@ -27,6 +27,7 @@ type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权
+	MaxBodyBytes int64
 	MaxRotate int    // 单请求最多换号次数，默认 3
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
@@ -474,8 +475,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断防御语义保留在
 	// 读错误路径——移除预拦截后，截断只可能来自客户端自己断流，读 body 出错就地 400，
 	// 不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
+	limit := h.cfg.MaxBodyBytes
+	if limit <= 0 { limit = 64 * 1024 * 1024 }
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "request body exceeds configured limit")
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
@@ -501,6 +510,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.requestID = r.Header.Get("X-Request-ID")
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -521,6 +531,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if stickyKey == "" {
 		stickyKey = session.StickyFallbackKey(body)
 	}
+	stickyKey = tenantSessionKey(r,h.cfg.APIKey,realm,stickyKey)
+	if sessKey != "" { sessKey = tenantSessionKey(r,h.cfg.APIKey,realm,sessKey) }
 	stickyUID := ""
 	if h.cfg.Session != nil && stickyKey != "" {
 		// 传给 ResolveForModel 的是**完整**模型名（peek.Model，含 realm 前缀）。
@@ -540,6 +552,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// sessKey 由调用侧以复合键方式入键（防不同会话同轮文本互撞）。
 	// 必须在下方 prompt.Rewrite / rewriteModel 之前取——改写会动 messages 内容。
 	turnKey := session.TurnKey(body)
+	if turnKey != "" { turnKey = tenantSessionKey(r,h.cfg.APIKey,realm,turnKey) }
 
 	// gateway_hint 判定所需的请求形态（image_url part）：在改写前取（与 turnKey
 	// 同理）。11133「模型不支持图片」指向的前提。
@@ -656,12 +669,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		st.uid = acct.UID
+		auditAttempt(r, i+1, acct.UID, bareModel, realm, "selected", 0)
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acct.Nickname
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
+			auditAttempt(r, i+1, acct.UID, bareModel, realm, "capacity_lost", 503)
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次粘性命中往返（语义与 fail()/粘性命中-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
@@ -678,6 +693,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+				auditAttempt(r, i+1, acct.UID, bareModel, realm, "refresh_failed", 502)
 				lastErr = err
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -695,6 +711,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			acct.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 			if err := acct.SaveAtomic(); err != nil {
+				auditAttempt(r, i+1, acct.UID, bareModel, realm, "refresh_write_failed", 500)
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
 				log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
 			}
@@ -709,6 +726,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 传 r.Context()：客户端断连/请求取消立即中断在途上游调用并释放租约，
 		// 不再让"幽灵请求"占满账号在途名额直到 IdleTimeout。
 		rc, status, respBody, terr := h.cfg.Upstream.ChatStreamContext(r.Context(), acct, body, clientIP, chatMeta)
+		auditAttempt(r, i+1, acct.UID, bareModel, realm, "upstream_headers", status)
 		// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 		// Retry-After 头解析，见 ChatStreamContext 注释）。传输层错误（非 *Error）走
 		// 抖动换号分支；防御分支（terr 为 nil 但 status>=400，如 ErrNone 兜底）回落
@@ -818,6 +836,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
+		w.Header().Set("X-WB-Account-UID", acct.UID)
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
@@ -881,10 +900,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.NoteSpeed(acct.UID, st.ttfb)
 			}
 			rc.Close()
+			auditAttempt(r, i+1, acct.UID, bareModel, realm, "stream_terminal", st.status)
 			return
 		}
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
+		auditAttempt(r, i+1, acct.UID, bareModel, realm, "aggregate_terminal", func() int {if err!=nil{return 502};return 200}())
 		if err != nil {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())

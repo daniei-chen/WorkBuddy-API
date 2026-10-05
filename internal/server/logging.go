@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -42,6 +43,7 @@ type chatStat struct {
 	credit    float64
 	hasCredit bool
 
+	requestID string
 	logged bool
 }
 
@@ -65,6 +67,14 @@ func (s *chatStat) done() {
 	s.logged = true
 	total := time.Since(s.start)
 	logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	if s.requestID != "" {
+		event, _ := json.Marshal(map[string]any{
+			"request_id": s.requestID, "account_uid": s.uid, "model": s.model,
+			"status": s.status, "latency_ms": total.Milliseconds(), "stream": s.mode == "stream",
+			"usage_known": s.hasUsage, "prompt_tokens": s.prompt, "completion_tokens": s.toks,
+		})
+		log.Printf("[request_audit] %s", event)
+	}
 	recordChatMetric(s, total)
 }
 

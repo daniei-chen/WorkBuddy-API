@@ -108,6 +108,13 @@ def list_logs(
     return {'total': total, 'items': items}
 
 
+@router.get('/attempts')
+def attempts(request_id: str, user: dict = Depends(security.current_user)) -> list[dict]:
+    """Exact gateway attempt events; fields contain no prompts or credentials."""
+    if len(request_id)>128:return []
+    return db.query('SELECT * FROM attempt_events WHERE request_id=? ORDER BY attempt,ts,phase',(request_id,))
+
+
 @router.post('/clear')
 def clear_logs(user: dict = Depends(security.require_session_admin)) -> dict:
     db.execute('DELETE FROM request_logs')

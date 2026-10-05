@@ -1,0 +1,366 @@
+# 打 tag 时自动构建前端、打包产物并创建一个**草稿** Release。
+#
+# 用法：推送形如 v1.0.0 的 tag 即可
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# 产物为可直接部署的压缩包（含 server/ 与已构建的 web/out/）。
+#
+# ── 关于签名与发布（重要）────────────────────────────────────
+# 本工作流**不持有签名私钥**，也不代替维护者签名：
+#   * 私钥绝不进 CI —— 恶意 PR 合并后能改 workflow 里的任意步骤，
+#     把密钥放在这里等于直接交给攻击者。
+#   * 签名在维护者本机完成（见步骤末尾的 step summary 与
+#     docs/release-signing.md），.sig 作为 Release 资产上传。
+#   * 用户侧 deploy/update.py 强制验签，未签名的 Release 会被拒绝安装；
+#     本 workflow 在检测到已签名后也**不再覆盖 tar.gz**，避免使签名失效。
+#   * Release 先建为**草稿**：`releases/latest` 跳过草稿，所以「构建完、
+#     还没签名」这段时间用户看不到这个版本（面板的更新按钮也不会出现），
+#     避免了「点了更新被拒：没有可用的签名文件」的窗口期（issue #127/#129）。
+#     维护者签名并核对后执行 `gh release edit <tag> --draft=false` 发布。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 允许手动触发（用于补发某个已有 tag 的产物）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建的 tag（如 v1.0.0）'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  # 推容器镜像到 GHCR 需要显式声明 packages: write —— 只给 contents 会被拒
+  # （实测报错：denied: installation not allowed to Create organization package）。
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 解析版本号
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.vars.outputs.tag }}
+          fetch-depth: 0
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          # 22 起才有 ESM 的 TypeScript type stripping：几处「借 Node 直接跑真实 .ts
+          # 实现」的用例（async-state / display-prefs 等）在 20 上会自我 skip —— 也就是
+          # 那些断言在 CI 里从来没跑过。升到 22 让它们真正执行。
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端静态导出
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:export
+
+      - name: 校验构建产物
+        run: |
+          test -f web/out/index.html || { echo "构建失败：缺少 web/out/index.html"; exit 1; }
+          echo "构建产物大小：$(du -sh web/out | cut -f1)"
+
+      - name: 后端语法与导入自检
+        run: |
+          python3 -m compileall -q server
+          echo "后端语法检查通过"
+
+      - name: 后端单元测试
+        run: |
+          python3 -m pip install --quiet -r server/requirements.txt
+          python3 -m unittest discover -s server/tests -t . -v
+
+      - name: 组装发布目录
+        id: pack
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="workbuddy-manager-${TAG}"
+          rm -rf "$STAGE" && mkdir -p "$STAGE"
+          cp -r server "$STAGE/"
+          mkdir -p "$STAGE/web" && cp -r web/out "$STAGE/web/"
+          cp -r deploy "$STAGE/"
+          # 文档一并打包（安全审查报告、设计说明等），便于离线查阅
+          cp -r docs "$STAGE/" 2>/dev/null || true
+          cp .env.example README.md README.en.md CHANGELOG.md LICENSE "$STAGE/"
+          # 容器部署资产一并打包：用户下载发布包后可直接 docker compose up，
+          # 不必再回仓库取这两个文件（实测漏打包过，Docker 用户拿不到）
+          cp Dockerfile docker-compose.yml "$STAGE/"
+          # 再放一份到 server/：一键更新必然整体替换 server/，而旧版更新器
+          # 不替换根目录文件。放进 server/ 后，任何部署（含从旧版升上来的）
+          # 都拿得到更新日志，避免界面报「未找到更新日志文件」。
+          cp CHANGELOG.md "$STAGE/server/CHANGELOG.md"
+          # ── 上游源码随包分发 ─────────────────────────────────────────
+          # 上游源码不放进本仓库（不是我们的代码），其公开地址也已不可用。
+          # 用户要能装，所以源码从固定的载体 Release（tag upstream-src，
+          # 标为 pre-release 以免影响 releases/latest）取回来塞进包里：
+          #   · 新装：install.sh 见到 upstream/ 直接用（离线可装）
+          #   · 升级：update.py 把它同步进上游目录（保留 config/auths/data）
+          # 取不到**不致命**（网络抖动、载体未建）：记一条醒目日志继续打包，
+          # 用户仍可用 UPSTREAM_SRC 自己指定源码。
+          UPSTREAM_SRC_URL="${UPSTREAM_SRC_URL:-https://github.com/${{ github.repository }}/releases/download/upstream-src/workbuddy2api-src.tar.gz}"
+          mkdir -p "$STAGE/upstream"
+          if curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
+                 "$UPSTREAM_SRC_URL" -o /tmp/upstream-src.tar.gz \
+             && tar -xzf /tmp/upstream-src.tar.gz -C "$STAGE/upstream" --strip-components=1 \
+             && [ -f "$STAGE/upstream/docker-compose.yml" ]; then
+            echo "已内嵌上游源码：$(find "$STAGE/upstream" -type f | wc -l) 个文件"
+          else
+            echo "::warning::取不到上游源码包（$UPSTREAM_SRC_URL）——本次发布包不含 upstream/，新装用户需自备源码（UPSTREAM_SRC）"
+            rmdir "$STAGE/upstream" 2>/dev/null || true
+          fi
+          # 写入版本标记：管理端「系统更新」页与安装流程据此显示当前版本
+          echo "${TAG}" > "$STAGE/.version"
+          # 不含运行时数据与凭据
+          find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          echo "stage=$STAGE" >> $GITHUB_OUTPUT
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          zip -qr "${STAGE}.zip" "$STAGE"
+          ls -lh "${STAGE}.tar.gz" "${STAGE}.zip"
+          echo "打包完成"
+
+      - name: 生成发布说明
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          # 优先取 CHANGELOG 中该版本的段落；取不到则退回提交摘要
+          python3 - "$TAG" > RELEASE_NOTES.md <<'PY'
+          import re, sys, subprocess
+          tag = sys.argv[1]
+          version = tag.lstrip('v')
+          try:
+              text = open('CHANGELOG.md', encoding='utf-8').read()
+          except FileNotFoundError:
+              text = ''
+          # 匹配 "## [1.0.0] - 2026-09-11" 到下一个 "## [" 之间
+          pattern = re.compile(
+              r'^##+\s*\[' + re.escape(version) + r'\].*?$(.*?)(?=^##+\s*\[|\Z)',
+              re.S | re.M,
+          )
+          m = pattern.search(text)
+          if m and m.group(1).strip():
+              # 去掉段落末尾的分隔线（CHANGELOG 里版本之间以 --- 分隔）
+              body = re.sub(r'\n*-{3,}\s*$', '', m.group(1).strip()).strip()
+              print(body)
+          else:
+              print('## 变更\n')
+              log = subprocess.run(
+                  ['git', 'log', '--pretty=format:- %s', '-n', '40', tag],
+                  capture_output=True, text=True,
+              ).stdout.strip()
+              print(log or '详见提交历史。')
+          PY
+          echo "--- 发布说明预览 ---"
+          head -20 RELEASE_NOTES.md
+
+      - name: 检查是否已有签名资产
+        id: sigcheck
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+          if gh release view "$TAG" >/dev/null 2>&1 && \
+             gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx "${STAGE}.tar.gz.sig"; then
+            echo "has_sig=1" >> $GITHUB_OUTPUT
+            echo "Release 已带签名资产 .tar.gz.sig"
+          else
+            echo "has_sig=0" >> $GITHUB_OUTPUT
+            echo "尚未签名（正常：签名由维护者在本机完成，见下方说明）"
+          fi
+
+      - name: 创建 Release 并上传产物
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+          if [ "${{ steps.sigcheck.outputs.has_sig }}" = "1" ]; then
+            # 一旦有签名就绝不再覆盖 tar.gz：重新打包会产生不同的字节流，
+            # 使已上传的 .sig 失效，而用户侧的更新器会因此拒绝安装。
+            echo "Release $TAG 已带 .tar.gz.sig 签名，**不覆盖既有产物**（覆盖会使签名失效）"
+            echo "确需重新发布：先删除 Release（含 .sig），再重跑本流程并重新签名"
+          elif gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在（未签名），改为上传/覆盖产物"
+            gh release upload "$TAG" "${STAGE}.tar.gz" "${STAGE}.zip" --clobber
+          else
+            # **草稿**（issue #127/#129）：没有签名的 Release 不能让用户看到。
+            # `releases/latest`（面板与更新器的版本检查都是它）会跳过草稿，
+            # 所以「CI 先建、维护者后签名」这段窗口里，用户侧只会看到上一个
+            # 已发布的版本 —— 不会出现「点了更新却被拒绝：没有可用的签名文件」。
+            # 签名上传并核对无误后，由维护者发布（见下方提示与发版手册）。
+            gh release create "$TAG" \
+              --draft \
+              --title "$TAG" \
+              --notes-file RELEASE_NOTES.md \
+              "${STAGE}.tar.gz" "${STAGE}.zip"
+          fi
+          echo ""
+          echo "== 发版必做（两步：先签名，再发布）=="
+          echo "  1) 本机对下载下来的产物签名并上传 .sig（命令见 step summary / docs/release-signing.md）"
+          echo "  2) 核对无误后把草稿发布出去：gh release edit $TAG --draft=false"
+          echo "  在此之前 ${TAG} 对用户不可见（版本检查走 releases/latest，跳过草稿）。"
+
+      - name: 校验签名（已上传 .sig 时）
+        if: steps.sigcheck.outputs.has_sig == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          STAGE="${{ steps.pack.outputs.stage }}"
+          gh release download "$TAG" --pattern "${STAGE}.tar.gz" --pattern "${STAGE}.tar.gz.sig" --dir . --clobber
+          if [ ! -f deploy/release-signing-key.pub ]; then
+            echo "::warning::仓库缺少 deploy/release-signing-key.pub，无法比对公钥"
+            exit 0
+          fi
+          if grep -q 'AAAA_REPLACE_ME' deploy/release-signing-key.pub; then
+            echo "::warning::deploy/release-signing-key.pub 仍是占位值，无法比对公钥"
+            exit 0
+          fi
+          printf 'release %s\n' "$(cat deploy/release-signing-key.pub)" > /tmp/allowed_signers
+          ssh-keygen -Y verify -f /tmp/allowed_signers -I release -n file \
+            -s "${STAGE}.tar.gz.sig" < "${STAGE}.tar.gz"
+          echo "✓ 签名与仓库内公钥匹配"
+
+      # ── 构建并发布容器镜像（Docker 部署方案，issue #7）──────────────
+      #
+      # 推送到 GHCR（GitHub 容器仓库），用户可直接：
+      #   docker pull ghcr.io/<owner>/workbuddy-manager:latest
+      # 而不是自己 clone + build（后者要装 Node 构建前端，门槛高）。
+      #
+      # **同时构建 amd64 与 arm64**：原先用 `docker build` 只产出 runner 自己的
+      # 架构（amd64），arm64 机器（Apple Silicon、Oracle/华为等 ARM 云主机）拉下来
+      # 只能靠 QEMU 模拟跑，或者干脆报 `no matching manifest for linux/arm64`。
+      # 两个架构合并成一个 manifest list，用户 `docker pull` 时按自身架构自动选。
+      #
+      # 注意：镜像**不由本项目签名**（签名机制只覆盖 tar.gz 发布包）。
+      # 镜像的完整性依赖 GHCR 的 digest 与 GitHub 的账号安全——这一层
+      # 与发布包签名是两套信任链，README 里已如实说明。
+      - name: 解析镜像名
+        # GHCR 要求仓库名全小写，而 repository_owner 可能含大写。
+        # build-push-action 的 tags 里没法做大小写转换，先在这里算好。
+        if: github.event_name == 'push' || inputs.tag != ''
+        id: image
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/workbuddy-manager"
+          echo "name=${IMAGE,,}" >> $GITHUB_OUTPUT
+
+      # 下面这几步与镜像构建同属「附属产物」链路，一并加 continue-on-error：
+      # 它们任一失败都会让 build-push-action 无法运行，若不加，job 会标红——
+      # 而 Release 其实已经创建成功，与上面的注释所声明的意图相矛盾。
+      - name: 设置 QEMU
+        # 跨架构构建 arm64 层需要它：runner 是 amd64，模拟出 arm64 执行环境
+        continue-on-error: true
+        if: github.event_name == 'push' || inputs.tag != ''
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        continue-on-error: true
+        if: github.event_name == 'push' || inputs.tag != ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        continue-on-error: true
+        if: github.event_name == 'push' || inputs.tag != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送容器镜像（amd64 + arm64）
+        # 镜像只是**附属产物**：发布包与 Release 才是主体。首次实测时此步因缺少
+        # packages: write 权限失败，整个 workflow 被标红——但 Release 其实已成功
+        # 创建，很容易被误读成「发版失败」。加 continue-on-error 后，镜像推不上去
+        # 只影响这一步，发布结果不受牵连。
+        continue-on-error: true
+        if: github.event_name == 'push' || inputs.tag != ''
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # 多平台必须走 buildx 并直接 push：本地镜像库放不下多架构的 manifest list
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # 镜像标签用小写（GHCR 要求），去掉 v 前缀
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ steps.vars.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+          # 关掉 provenance 证明：它会在 manifest list 里塞入 attestation 条目，
+          # 某些旧版 Docker（< 25）拉取时会报 unknown/unknown platform。
+          # 本项目不依赖该证明，关掉换来更干净的索引。
+          provenance: false
+
+      - name: 记录镜像 digest
+        if: steps.build.outcome == 'success'
+        run: |
+          # digest 是内容寻址的，用户可用它核对拉到的镜像与本次构建完全一致。
+          # 多架构构建下镜像不在本地库里，digest 只能取自 build-push-action 的输出。
+          echo "镜像：${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "平台：linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+
+      - name: 部署说明
+        run: |
+          cat <<'EOF' >> $GITHUB_STEP_SUMMARY
+          ## 发布完成（**草稿**，尚未对用户可见）
+
+          资产：
+          - `${{ steps.pack.outputs.stage }}.tar.gz`
+          - `${{ steps.pack.outputs.stage }}.zip`
+
+          > 这次创建的是**草稿** Release：`releases/latest`（面板与更新器的版本
+          > 检查都走它）会跳过草稿，所以在签名并发布之前，用户侧只会看到上一个
+          > 已发布的版本 —— 不会再出现「点了更新却被拒绝：没有可用的签名文件」
+          > 那种窗口期（issue #127/#129）。
+
+          > ⚠️ **本工作流不签名**。私钥不允许进 CI —— 恶意 PR 合并后可以改
+          > workflow 里的任意步骤，密钥放这里等于直接交给攻击者。
+          > 因此签名由维护者在**本机**对最终产物执行，然后再把草稿发布出去：
+
+          ```bash
+          # 1) 在本机（私钥所在机器）签名并上传：
+          gh release download ${{ steps.vars.outputs.tag }} \
+            --pattern '${{ steps.pack.outputs.stage }}.tar.gz'
+          ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file \
+            '${{ steps.pack.outputs.stage }}.tar.gz'
+          gh release upload ${{ steps.vars.outputs.tag }} \
+            '${{ steps.pack.outputs.stage }}.tar.gz.sig'
+
+          # 2) 重新下载核对（sha256 + 验签）后，发布：
+          gh release edit ${{ steps.vars.outputs.tag }} --draft=false
+          ```
+
+          > 一键更新（deploy/update.py）会校验该签名，**没有 .sig 的 Release
+          > 会被所有用户拒绝安装**。所以签名这一步不是可选的；而**发布**是让它
+          > 对用户生效的那一步，漏了它用户永远看不到这个版本。
+
+          部署方式（解压后）：
+          ```bash
+          # 下载后先验签，再安装（手动部署同样建议校验）
+          bash deploy/verify-release.sh ${{ steps.pack.outputs.stage }}.tar.gz
+          tar xzf ${{ steps.pack.outputs.stage }}.tar.gz
+          cd ${{ steps.pack.outputs.stage }}
+          sudo bash deploy/install.sh
+          ```
+
+          或者用容器部署（另见仓库内 docker-compose.yml）：
+          ```bash
+          docker pull ghcr.io/${{ github.repository_owner }}/workbuddy-manager:${{ steps.vars.outputs.version }}
+          ```
+          EOF

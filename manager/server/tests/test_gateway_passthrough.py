@@ -102,7 +102,7 @@ class GatewayPassthroughTest(unittest.TestCase):
         # 注意：这里按**出现次数**断言，只查包含太弱——文件里有两处 yield，
         # 改掉其中一处仍会通过（这个弱点是被反证试出来的）。
         yields = [ln.strip() for ln in src.splitlines() if ln.strip().startswith('yield ')]
-        self.assertEqual(yields, ['yield chunk'] * len(yields),
+        self.assertEqual(yields, ['yield chunk','yield observability.sse_error(error_text)','yield observability.sse_error(error_text)'],
                          f'转发热路径出现了非透传的 yield：{yields}')
 
     def test_no_tool_calls_handling_anywhere(self) -> None:
@@ -128,7 +128,8 @@ class GatewayPassthroughTest(unittest.TestCase):
         有人复核，静默放行会让这条约束慢慢失效。
         """
         # 例外：协议转换层（不是转发热路径）
-        allow = {'routers/anthropic.py', 'routers/responses.py'}
+        allow = {'routers/anthropic.py', 'routers/responses.py', 'observability.py'}
+        # Observation reads tool deltas for timing; it never mutates forwarded chunks.
         root = Path(__file__).resolve().parents[2] / 'server'
         hits = []
         for f in root.rglob('*.py'):

@@ -11,6 +11,12 @@
 #   sudo bash deploy/install.sh --skip-upstream  # 已自备 workbuddy2api
 #   sudo bash APP_DIR=/opt/custom bash deploy/install.sh
 #
+# 上游源码从哪来（按优先级）：
+#   1) 发布包里自带的 upstream/             下载 Release 包时已内嵌，离线可装
+#   2) UPSTREAM_SRC=<本地目录或 tar.gz>     用你自己那份源码
+#   3) UPSTREAM_REPO=<git 地址>             从 git 拉（默认地址不可用，
+#                                           请指向你自己的副本 fork / 镜像）
+#
 # 说明：workbuddy2api 的账号登录（扫码）是交互式的，无法自动化；
 #       安装完成后通过本管理端的「添加账号」扫码即可。
 # ============================================================
@@ -19,7 +25,11 @@ set -euo pipefail
 # ── 可配置项（均可用环境变量覆盖）─────────────────────────
 APP_DIR="${APP_DIR:-/opt/workbuddy-manager}"
 UPSTREAM_DIR="${UPSTREAM_DIR:-/opt/workbuddy2api}"
+# 上游原仓库 Sliverkiss/workbuddy2api 自 2026-09-23 起已不可访问（404）。
+# 默认值保留原地址只为「已有副本的人不必改代码」；新装请用 UPSTREAM_SRC
+# 指向本地源码，或把 UPSTREAM_REPO 改成你自己的副本。
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/daniei-chen/WorkBuddy-API.git}"
+UPSTREAM_SRC="${UPSTREAM_SRC:-}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-7863}"
 MANAGER_PORT="${MANAGER_PORT:-7864}"
 PY="${PY:-/usr/bin/python3}"
@@ -120,14 +130,68 @@ elif [ -f "${UPSTREAM_DIR}/config.json" ]; then
 else
   info "未检测到上游部署，开始安装到 ${UPSTREAM_DIR}"
 
-  command -v git >/dev/null 2>&1 || die "需要 git 来克隆上游仓库"
+  # 上游源码的来源，按优先级：
+  #   1) UPSTREAM_SRC 显式指定（目录 / .tar.gz / .zip）
+  #   2) **发布包里自带的 upstream/**（Release 包内嵌，离线可装：上游原仓库
+  #      源码随本项目的发布包分发）
+  #   3) 目标目录里已有的 .git（老部署，尝试 git pull）
+  #   4) 克隆 UPSTREAM_REPO（需要指向你自己的副本）
+  if [ -z "$UPSTREAM_SRC" ]; then
+    BUNDLED="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/upstream"
+    if [ -f "${BUNDLED}/docker-compose.yml" ]; then
+      UPSTREAM_SRC="$BUNDLED"
+      info "使用发布包内自带的上游源码：${BUNDLED}"
+    fi
+  fi
 
-  if [ -d "${UPSTREAM_DIR}/.git" ]; then
+  if [ -n "$UPSTREAM_SRC" ]; then
+    [ -e "$UPSTREAM_SRC" ] || die "UPSTREAM_SRC 指向的路径不存在：${UPSTREAM_SRC}"
+    info "使用本地源码：${UPSTREAM_SRC}"
+    mkdir -p "$UPSTREAM_DIR"
+    if [ "$(cd "$UPSTREAM_SRC" 2>/dev/null && pwd -P)" = "$(cd "$UPSTREAM_DIR" && pwd -P)" ]; then
+      # 源码本来就在目标目录（典型情形：复用已有的 /opt/workbuddy2api）
+      info "源码已在 ${UPSTREAM_DIR}，无需复制"
+    else
+      case "$UPSTREAM_SRC" in
+        *.tar.gz | *.tgz)
+          tar -xzf "$UPSTREAM_SRC" -C "$UPSTREAM_DIR" --strip-components=1 ;;
+        *.zip)
+          command -v unzip >/dev/null 2>&1 || die "解压 .zip 需要 unzip，或改用 .tar.gz"
+          tmp="$(mktemp -d)"
+          unzip -q -o "$UPSTREAM_SRC" -d "$tmp"
+          # 压缩包里通常有一个顶层目录，把它**连同点文件**一起搬进去
+          inner="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)"
+          src="$tmp"
+          [ -n "$inner" ] && src="$inner"
+          cp -a "$src"/. "$UPSTREAM_DIR"/
+          rm -rf "$tmp" ;;
+        *)
+          [ -d "$UPSTREAM_SRC" ] || die "UPSTREAM_SRC 既不是目录也不是 .tar.gz/.zip：${UPSTREAM_SRC}"
+          cp -a "$UPSTREAM_SRC"/. "$UPSTREAM_DIR"/ ;;
+      esac
+    fi
+    [ -f "${UPSTREAM_DIR}/docker-compose.yml" ] || \
+      die "本地源码里没有 docker-compose.yml，确认 UPSTREAM_SRC 指的是上游根目录"
+  elif [ -d "${UPSTREAM_DIR}/.git" ]; then
     info "目录已存在，拉取最新代码"
     ( cd "$UPSTREAM_DIR" && git pull --ff-only ) || warn "git pull 失败，沿用现有代码"
   else
+    command -v git >/dev/null 2>&1 || die "需要 git 来克隆上游仓库（或改用 UPSTREAM_SRC 指定本地源码）"
     info "克隆 ${UPSTREAM_REPO}"
-    git clone --depth 1 "$UPSTREAM_REPO" "$UPSTREAM_DIR"
+    if ! git clone --depth 1 "$UPSTREAM_REPO" "$UPSTREAM_DIR"; then
+      die "克隆上游仓库失败。
+
+  默认的上游地址已经克隆不下来。请改用下面任一方式后重跑：
+
+    # 1) 用本地那份源码（你已有部署时，就在 UPSTREAM_DIR，例如 /opt/workbuddy2api）
+    sudo UPSTREAM_SRC=/opt/workbuddy2api bash deploy/install.sh
+
+    # 2) 用你自己的副本（fork / 自有镜像）
+    sudo UPSTREAM_REPO=https://github.com/<你的账号>/workbuddy2api.git bash deploy/install.sh
+
+    # 3) 已经手工装好上游，只是让本脚本跳过
+    sudo bash deploy/install.sh --skip-upstream"
+    fi
   fi
 
   cd "$UPSTREAM_DIR"
@@ -185,6 +249,7 @@ if [ "${SRC_DIR}" != "${APP_DIR}" ]; then
   # 文档：界面的「更新日志」页直接读它（server/ 内另有一份副本兜底）
   cp "${SRC_DIR}/CHANGELOG.md" "${APP_DIR}/" 2>/dev/null || true
   cp "${SRC_DIR}/README.md" "${APP_DIR}/" 2>/dev/null || true
+  cp "${SRC_DIR}/README.en.md" "${APP_DIR}/" 2>/dev/null || true
 fi
 
 # 静态前端：优先用发布包内的 web/out；否则尝试本地构建
@@ -204,7 +269,7 @@ elif [ -f "${SRC_DIR}/web/package.json" ]; then
     die "需要 Node.js 构建前端；或下载 Release 包（内含已构建的 web/out）"
   fi
 else
-  die "缺少前端产物 web/out，请使用 Release 包或先执行 npm run build:export"
+  die "源码目录里既没有前端产物、也没有前端源码（${SRC_DIR}/web 不存在）——请确认源码完整，或改用 Release 包"
 fi
 
 # 写入版本标记（供界面显示当前版本）

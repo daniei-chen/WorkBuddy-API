@@ -471,7 +471,10 @@ def _upstream_headers(upstream: dict | None = None) -> dict:
     """
     up = upstream if upstream is not None else upstreamsvc.default_upstream()
     headers = {'Content-Type': 'application/json'}
-    api_key = str(up.get('api_key') or '')
+    # 分组把 api_key 留空、且地址与默认上游相同时沿用默认那把（见
+    # upstreamsvc.forward_api_key）——「添加分组」只填名称就是这个形态，
+    # 不沿用的话绑定这类分组的密钥一调用就吃上游 401。
+    api_key = upstreamsvc.forward_api_key(up)
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
     return headers

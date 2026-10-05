@@ -67,3 +67,27 @@ manager/**/*.log
 
 # 环境变量模板要入库（.env 本体仍然忽略）
 !.env.example
+
+# WorkBuddy private runtime and generated artifacts
+/auths/
+/data/
+/config.json
+/.env
+/.env.*
+/manager/data/
+/manager/.local-config
+/manager/venv/
+/manager/web/node_modules/
+/manager/web/.next/
+/image.tar
+/validation-results/
+*.cms
+*.db
+*.db-wal
+*.db-shm
+*private.pem
+
+/manager/dev/.dash-groups/
+/manager/dev/.shots-*/
+/manager/dev/.palette/
+/manager/dev/.update-clear/

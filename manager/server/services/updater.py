@@ -377,6 +377,8 @@ def _write_initial_status(target: str, pid: int) -> None:
 
 def start_update(target: str) -> tuple[bool, str]:
     """启动更新（后台脱离运行）。返回 (是否已启动, 说明)。"""
+    if (config.ROOT / 'deploy' / 'managed-release.json').exists():
+        return False, '当前为受控维护版本，请使用已验证的发布包升级；网页更新已暂停以保护本地修复。'
     if target not in ('manager', 'upstream', 'both'):
         return False, '参数不合法'
     if os.name == 'nt' and config.WB2API_MODE == 'native':

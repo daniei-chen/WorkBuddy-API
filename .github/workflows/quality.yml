@@ -1,0 +1,60 @@
+name: WorkBuddy quality gates
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  manager:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Hash checked Python dependencies
+        run: |
+          python3.12 -m venv .venv
+          .venv/bin/pip install --require-hashes -r manager/server/requirements.hashes.txt
+      - name: No external network, synthetic fixtures only
+        run: sudo -n unshare --net "$PWD/.venv/bin/python" manager/tools/validate.py --isolated --output "$PWD/validation-results"
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: manager/web
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      NEXT_OUTPUT_EXPORT: '1'
+      SOURCE_DATE_EPOCH: '1791169200'
+      WB_BUILD_ID: '${{ github.sha }}'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: npm ci
+      - run: npm exec eslint -- . --max-warnings 0
+      - run: npm exec tsc -- --noEmit
+      - run: node --test lib/*.test.mjs
+      - run: npm run build
+      - run: npm audit --audit-level=high
+  gateway:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Preserve customized algorithm contract
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib
+          for path,digest in json.load(open('manager/docs/protected-customizations.json')).items():
+              assert hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()==digest,path
+          PY
+      - run: docker build --target build -t wb-ci-build .
+      - run: docker run --rm --network none --cpus 2 --memory 2g --pids-limit 256 --cap-drop ALL --security-opt no-new-privileges -v "$PWD:/src:ro" -w /src wb-ci-build go test -count=1 ./...
+      - run: docker build -t wb-ci-runtime .
+      - run: docker save -o image.tar wb-ci-runtime
+      - name: Runtime OS and Go vulnerability gate
+        run: docker run --rm --cpus 2 --memory 2g --cap-drop ALL --security-opt no-new-privileges -v "$PWD/image.tar:/scan/image.tar:ro" aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa image --input /scan/image.tar --scanners vuln --severity HIGH,CRITICAL --exit-code 1

@@ -1,0 +1,336 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-inter), var(--font-noto-sans-sc), system-ui, sans-serif;
+  --font-mono: var(--font-inter), var(--font-noto-sans-sc), monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.141 0.005 285.823);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.141 0.005 285.823);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.141 0.005 285.823);
+  --primary: oklch(0.21 0.006 285.885);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --muted: oklch(0.967 0.001 286.375);
+  --muted-foreground: oklch(0.552 0.016 285.938);
+  --accent: oklch(0.967 0.001 286.375);
+  --accent-foreground: oklch(0.21 0.006 285.885);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.92 0.004 286.32);
+  --input: oklch(0.92 0.004 286.32);
+  --ring: oklch(0.705 0.015 286.067);
+  --chart-1: oklch(0.646 0.222 41.116);
+  --chart-2: oklch(0.6 0.118 184.704);
+  --chart-3: oklch(0.398 0.07 227.392);
+  --chart-4: oklch(0.828 0.189 84.429);
+  --chart-5: oklch(0.769 0.188 70.08);
+  --sidebar: rgb(249, 250, 251);
+  /* bg-gray-50 */
+  --sidebar-foreground: oklch(0.141 0.005 285.823);
+  --sidebar-primary: oklch(0.21 0.006 285.885);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: rgb(249, 250, 251);
+  /* bg-gray-50 - 与背景相同 */
+  --sidebar-accent-foreground: oklch(0.15 0.01 285.885);
+  --sidebar-border: transparent;
+  /* 移除边框 */
+  --sidebar-ring: oklch(0.705 0.015 286.067);
+}
+
+.dark {
+  --background: oklch(0.141 0.005 285.823);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.21 0.006 285.885);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.21 0.006 285.885);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.92 0.004 286.32);
+  --primary-foreground: oklch(0.21 0.006 285.885);
+  --secondary: oklch(0.274 0.006 286.033);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.274 0.006 286.033);
+  --muted-foreground: oklch(0.705 0.015 286.067);
+  --accent: oklch(0.274 0.006 286.033);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.552 0.016 285.938);
+  --chart-1: oklch(0.488 0.243 264.376);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+  --sidebar: rgb(31, 41, 55);
+  /* bg-gray-800 */
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: rgb(31, 41, 55);
+  /* bg-gray-800 - 与背景相同 */
+  --sidebar-accent-foreground: oklch(0.95 0.01 0);
+  --sidebar-border: transparent;
+  /* 移除边框 */
+  --sidebar-ring: oklch(0.552 0.016 285.938);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/*
+ * 细滚动条：浏览器默认滚动条偏宽、带可见轨道，嵌在卡片里显得突兀。
+ * 用「透明边框 + background-clip」把视觉粗细压到 4px，但保留 10px 的可抓取区域，
+ * 兼顾观感与手感；颜色跟随主题令牌，深浅色都协调。
+ * 悬停时略加深，便于确认「这里能滚」。
+ */
+.scroll-slim {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent) transparent;
+}
+
+.scroll-slim::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.scroll-slim::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scroll-slim::-webkit-scrollbar-thumb {
+  background-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent);
+  border-radius: 9999px;
+  /* 用透明边框缩小可见部分，实际可点击区域仍是 10px */
+  border: 3px solid transparent;
+  background-clip: padding-box;
+}
+
+.scroll-slim::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in oklab, var(--muted-foreground) 55%, transparent);
+}
+
+.scroll-slim::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+button {
+  cursor: pointer;
+}
+
+@keyframes slide {
+  0% {
+    left: -33%;
+  }
+
+  50% {
+    left: 100%;
+  }
+
+  100% {
+    left: -33%;
+  }
+}
+
+/* ── 提示（toast）────────────────────────────────────────
+   通知卡片由 lib/toast.tsx 自定义渲染：motion 弹簧入场、语义色图标、
+   悬停关闭按钮、底部倒计时线。这里只负责两件事：
+
+   1) 中和 sonner 给外层 li 的默认背景/边框/内边距
+      （否则会与自定义卡片叠加，形成难看的「双层边框」）
+   2) 提供底部进度条动画
+
+   非自定义 toast（如 loading）不受影响，仍用 sonner 默认外观。 */
+
+[data-sonner-toast]:has(> [data-wb-toast]) {
+  width: auto;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+@keyframes wb-toast-bar {
+  from {
+    transform: scaleX(1);
+  }
+
+  to {
+    transform: scaleX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-wb-toast] [aria-hidden] {
+    animation: none !important;
+  }
+}
+
+/* 非自定义 toast 的图标着色（loading 等） */
+[data-sonner-toast] [data-icon] {
+  margin-inline-end: 8px;
+}
+
+[data-sonner-toast][data-type="success"] [data-icon] {
+  color: #10b981;
+}
+
+[data-sonner-toast][data-type="error"] [data-icon] {
+  color: #ef4444;
+}
+
+[data-sonner-toast][data-type="warning"] [data-icon] {
+  color: #f59e0b;
+}
+
+[data-sonner-toast][data-type="info"] [data-icon] {
+  color: #3b82f6;
+}
+
+[data-sonner-toast][data-type="loading"] [data-icon] {
+  color: #6b7280;
+}
+
+.dark [data-sonner-toast][data-type="success"] [data-icon] {
+  color: #34d399;
+}
+
+.dark [data-sonner-toast][data-type="error"] [data-icon] {
+  color: #f87171;
+}
+
+.dark [data-sonner-toast][data-type="warning"] [data-icon] {
+  color: #fbbf24;
+}
+
+.dark [data-sonner-toast][data-type="info"] [data-icon] {
+  color: #60a5fa;
+}
+
+.dark [data-sonner-toast][data-type="loading"] [data-icon] {
+  color: #9ca3af;
+}
+
+/* 侧边栏菜单高亮增强样式 */
+[data-slot="sidebar-menu-button"][data-active="true"] {
+  position: relative;
+}
+
+/* 亮色模式下的活跃状态增强 */
+:root [data-slot="sidebar-menu-button"][data-active="true"] {
+  background: rgb(243, 244, 246);
+  /* bg-gray-100 */
+  color: var(--sidebar-primary);
+}
+
+/* 深色模式下的活跃状态增强 */
+.dark [data-slot="sidebar-menu-button"][data-active="true"] {
+  background: rgb(55, 65, 81);
+  /* bg-gray-700 */
+  color: var(--sidebar-primary-foreground);
+}
+
+/*
+ * 按钮内图标的尺寸与清晰度。
+ *
+ * 症状：按钮里的图标又大又「发虚」——灰蒙蒙一圈，与旁边实心的文字反差明显。
+ *
+ * 根因（实测确认，探针见 dev/icon-probe.mjs）：
+ *   1. **尺寸没生效**：按钮上的 `[&_svg:not([class*=\'size-\'])]:size-4` 因转义
+ *      单引号编成了 `svg:not([class*="'size-'"])`，属性值多了两个引号，永远匹配不上，
+ *      图标一直按 lucide 默认的 24px 渲染（按钮才 32px 高）。
+ *   2. **比例失配**：图标按 24px 渲染后，特征尺寸大而描边只有 2px，
+ *      相邻 14px 的中文笔画又密又重，于是图标显得又大又「虚」。
+ *
+ * 处理：**只把尺寸改回设计意图的 16px（1rem）**，描边与渲染方式一律保持 lucide 默认。
+ * 这样按钮图标与**底部工具栏图标参数完全一致**（16px + 描边 2 + 默认平滑渲染）——
+ * 底栏那套是用户认可的清晰度基准。
+ *
+ * ⚠️ 走过的弯路（务必别重蹈）：曾为了让「实心黑 / 中间灰像素比」这个自造指标变好，
+ * 加了 `stroke-width: 3` 与 `shape-rendering: crispEdges`。指标从 1.2 升到 4.6，
+ * 但**观感明显更差**——crispEdges 会关掉弧形描边的抗锯齿，`hand-coins` 这类
+ * 小尺寸曲线图标直接糊成色块、里面的「1」被填死。指标之所以被骗，是因为它奖励
+ * 「灰像素少」，而抗锯齿消失恰好让灰像素归零。
+ *
+ * 结论两条：
+ *   · 小尺寸曲线图标**必须保留抗锯齿**，不要用 crispEdges / 加粗描边去「锐化」；
+ *   · 判断清晰度要看**真机截图**（dev/icon-ab.mjs 在真实页面上并排渲染多组参数），
+ *     不要只看像素统计——统计指标很容易被自己的改动带偏。
+ *
+ *   Tailwind 的 utilities 层排在 components 之后，所以显式写的
+ *   `h-3.5 w-3.5` / `size-5` 会自然覆盖这里的默认值，不需要 `:not()` 守卫。
+ *
+ * 选择器为什么要带 `-trigger`：`<ConfirmDialog trigger={<Button/>}>` 这类组合里，
+ * Radix 的 `asChild` 会把 Button 上的 `data-slot="button"` 覆盖成
+ * `alert-dialog-trigger`（实测如此），只写 `[data-slot='button']` 会漏掉
+ * 「删除账号 / 重启 / 清空日志」这些危险操作按钮。用 `[data-slot$='-trigger']`
+ * 一并覆盖，顺带修好 Select / Tabs 触发器里同样偏大的图标。
+ *
+ * 只作用于按钮与触发器：底栏、图表、插图里的大图标保持原有平滑渲染，避免弧线出现锯齿。
+ */
+@layer components {
+  :is([data-slot='button'], [data-slot$='-trigger']) svg.lucide {
+    width: 1rem;
+    height: 1rem;
+  }
+}

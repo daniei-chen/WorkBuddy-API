@@ -1,0 +1,13 @@
+# Windows 批处理的换行符必须锁成 CRLF。
+#
+# 为什么单独给 .cmd 定这一条：cmd.exe 对 LF-only 批处理在 if 块 / goto / 标签
+# 边界上有边缘解析风险（现代 Windows 上多数形态实测正常，但这是上游 #163 专门
+# 处理的已知风险面，见其提交信息「cmd 对 LF-only 批处理有 if 块/goto 边缘解析
+# 风险」）。我们的 `deploy/windows-native/*.cmd` 就是给用户直接双击运行的，
+# 一旦换行符被检出成 LF，问题会出在**用户机器**上、而不是我们这里。
+#
+# `eol=crlf` 让 git 在所有平台都按 CRLF 检出（仓库里存 LF，检出时转换），
+# 因此 Linux 上跑 CI 打包时 `cp -r deploy` 拿到的也是 CRLF —— 发布包里的脚本
+# 在任何平台解压都是可用的。不加这条的话，Linux 检出会是 LF，用户下到的包
+# 里就是 LF-only 的 .cmd。
+*.cmd text eol=crlf

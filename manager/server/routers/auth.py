@@ -18,6 +18,18 @@ router = APIRouter(prefix='/api', tags=['auth'])
 def healthz() -> dict:
     return {'ok': True, 'service': 'workbuddy-manager'}
 
+@router.get('/readyz')
+def readyz():
+    from .. import operational
+    result=operational.readiness()
+    # Public readiness intentionally returns one bit. Detailed health requires a user.
+    return JSONResponse({'ok':result['ok']},status_code=200 if result['ok'] else 503)
+
+@router.get('/operations/health')
+def operations_health(user:dict=Depends(security.require_admin)):
+    from .. import operational
+    return operational.status()
+
 
 @router.post('/login')
 async def login(request: Request) -> JSONResponse:

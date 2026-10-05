@@ -116,9 +116,10 @@ class UpstreamConfigRoundTrip(unittest.TestCase):
         wb2api.save_upstream_config({'schedule': {'checkin_enabled': False}})
         self.assertIs(read_cfg(self.cfg_path)['schedule']['checkin_enabled'], False)
 
-    def test_unknown_section_ignored(self) -> None:
+    def test_unknown_section_rejected_without_write(self) -> None:
         write_cfg(self.cfg_path, {'api_key': 'secret'})
-        wb2api.save_upstream_config({'api_key': 'hacked'})
+        with self.assertRaises(ValueError):
+            wb2api.save_upstream_config({'api_key': 'hacked'})
         self.assertEqual(read_cfg(self.cfg_path)['api_key'], 'secret')
 
     # ── prompt / server / upstream（新增段）─────────────────

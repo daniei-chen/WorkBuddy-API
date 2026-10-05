@@ -184,16 +184,17 @@ class UsageEndpointTest(unittest.TestCase):
         self.assertEqual(self.client.get('/v1/usage?live_window=abc', headers=h).json()['live']['window_seconds'], 3)
 
     def test_by_model_breakdown(self) -> None:
-        """by_model=1：近 30 天按模型拆分；默认响应不含该字段；30 天外不出现。"""
+        """Preserve local A2 contract: canonical models include every time window."""
         k = self._key()
         self._add_usage(k['id'], _day(0), pt=1000, ct=0, hit=800, miss=200, model='glm-5.3-flash')
         self._add_usage(k['id'], _day(-1), pt=500, ct=0, model='deepseek-v4.1-flash')
         self._add_usage(k['id'], _day(-40), pt=9999, ct=0, model='old-model')
         h = {'Authorization': f"Bearer {k['key']}"}
         d = self.client.get('/v1/usage', headers=h).json()
-        self.assertNotIn('by_model', d)
+        self.assertIsInstance(d['by_model'], dict)
+        self.assertEqual(d['by_model']['glm-5.3-flash']['today']['tokens'], 1000)
         d = self.client.get('/v1/usage?by_model=1', headers=h).json()
-        rows = {r['model']: r for r in d['by_model']}
+        rows = {model: windows['last_30d'] for model, windows in d['by_model'].items()}
         self.assertEqual(rows['glm-5.3-flash']['tokens'], 1000)
         self.assertEqual(rows['glm-5.3-flash']['hit_rate'], 0.8)
         self.assertEqual(rows['deepseek-v4.1-flash']['tokens'], 500)

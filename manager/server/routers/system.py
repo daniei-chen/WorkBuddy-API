@@ -45,6 +45,7 @@ def start_update(body: UpdateIn, user: dict = Depends(security.require_session_a
     ok, message = updater.start_update(body.target)
     if not ok:
         raise HTTPException(status_code=409, detail=message)
+    security.audit(user,'start_update',body.target,message)
     return {'ok': True, 'message': message}
 
 
@@ -55,6 +56,7 @@ def set_upstream_ref(body: UpstreamRefIn, user: dict = Depends(security.require_
         ref = updater.set_upstream_ref(body.ref)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    security.audit(user,'set_upstream_ref',ref,'updated pinned reference')
     return {'ok': True, 'upstream_ref': ref}
 
 
@@ -64,6 +66,7 @@ def clear_update_status(user: dict = Depends(security.require_session_admin)) ->
     ok, message = updater.clear_status()
     if not ok:
         raise HTTPException(status_code=409, detail=message)
+    security.audit(user,'clear_update_status','','cleared update status')
     return {'ok': True, 'message': message}
 
 

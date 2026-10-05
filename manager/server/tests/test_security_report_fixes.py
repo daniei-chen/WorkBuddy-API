@@ -47,6 +47,12 @@ class _FakeRequest:
 class SpoofedForwardHeaderTest(unittest.TestCase):
     """伪造转发头不能绕过 IP 类管控。"""
 
+    def setUp(self) -> None:
+        # Explicit fixture: the isolated runner disables proxy trust globally.
+        patcher = mock.patch.object(config, 'TRUST_PROXY', True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_untrusted_peer_cannot_spoof_x_real_ip(self) -> None:
         """核心回归：对端是公网 IP（服务直接暴露）时，X-Real-IP 不被采信。"""
         req = _FakeRequest('203.0.113.9', {'x-real-ip': '9.9.9.9'})
