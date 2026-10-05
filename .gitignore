@@ -91,3 +91,6 @@ manager/**/*.log
 /manager/dev/.shots-*/
 /manager/dev/.palette/
 /manager/dev/.update-clear/
+# Public sanitized Manager release and audit evidence; required by CI.
+!manager/docs/
+!manager/docs/**

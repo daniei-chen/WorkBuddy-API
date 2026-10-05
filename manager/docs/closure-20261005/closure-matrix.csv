@@ -1,0 +1,23 @@
+id,issue,status,evidence_and_remaining
+F01,Atomic signed deployment and rollback,PARTIAL,Release v1.0.79+closure.20261005.2 is active; readiness and route gates passed. Full cutover fault injection remains.
+F02,Known exposed historical keys,CLOSED (known scope),Prior audit fixes retained. Unreachable historical Git refs remain outside proof.
+F03,Web process root privilege,PARTIAL,"Manager Web process still runs as root. A dedicated service account and systemd sandbox have not been staged and proven against live writable paths."
+F04,Database recovery and RTO,PARTIAL,Verified encrypted daily backup retained; clean-host RTO drill and second offline key escrow remain.
+F05,Maintained repository and CI,PARTIAL,"main verified at a14ee946808d3a76aa0d71cdf9ec54d5b48d2016. Actions run #1 failed because docs/ ignore omitted the contract manifest; a force-tracked follow-up and CI rerun are in progress."
+F06,Stream failure semantics,CLOSED,HTTP and application terminal outcomes preserved; protocol regressions pass.
+F07,SSE/UTF-8/tool output,CLOSED,"Chunked UTF-8, streaming, bounded buffers and terminal cases pass."
+F08,Invalid Unicode inputs,CLOSED,Invalid surrogate rejects; valid Unicode passes isolated tests.
+F09,"Budget ownership, unknown spend, pricing",PARTIAL,Fencing and integer adjustments tested; real price/hard billing cap/multi-host recovery remain.
+F10,Exact account/request attribution,PARTIAL,Exact structured attempt IDs added; verify production collection and retain heuristic provenance for history.
+F11,Financial event replay/history,PARTIAL,Append-only integer event ledger passes; old request IDs missing and 990 counter semantics cannot be backfilled.
+F12,Administrative audit coverage,PARTIAL,"Changes, failure/denial and chained records added; full routes/jobs and independent retention remain."
+F13,Strict upstream config schema,CLOSED (schema boundary),Typed bounds and unknown-field rejection pass; protected settings round-trip.
+F14,Request/resource limits,PARTIAL,Chunked body/time limits and Go container caps pass; Manager memory cap and production peak remain.
+F15,Build/SBOM/vulnerability scan,PARTIAL,"Python wheel hashes, frontend lock, Go sums, deterministic static output, and disclosed stack-guarded braces fork pass. Pinned Trivy scan of final image has 0 high/critical findings and 79 SBOM components. First GitHub run stopped at the missing contract manifest; rerun after force-tracking the manifest. Signed build provenance remains."
+F16,Sticky sessions and migration,PARTIAL,Protected algorithms/process death/20k mirror tested; real multi-instance migration and live warm-state compare remain.
+F17,Prompt transformation contract,PARTIAL,Original algorithms retained and summary instrumented; complete semantic golden cases remain.
+F18,HTTP pool and long-run pressure,CLOSED (pool contract),"801 real TCP fixture requests, reuse, cancellation and FD return-to-baseline pass. Production latency not claimed."
+F19,Routes/static release/UI,PARTIAL,"Revision 7 deployed; readyz and three routes return 200, and static bundle lacks entry motion. Visual/authenticated workflow and duplicate Nginx review remain."
+F20,SLO/readiness/alert delivery,PARTIAL,DB-write readiness and local dedup pass; external target and 30-day SLO evidence absent.
+F21,Auth refresh ownership,PARTIAL,Prior 37-file owner/mode baseline retained; wait for a normal post-release refresh cycle.
+F22,Cost/RBAC/retention contracts,PARTIAL,"Synthetic role checks pass; business pricing, retention and deletion policy need owner decisions."

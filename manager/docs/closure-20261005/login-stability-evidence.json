@@ -1,0 +1,34 @@
+{
+  "candidate_revision": 7,
+  "source_packet_sha256": "ac81dd267d6df66e1619e575597985075a4cf794c855b0f9b85c6054aee2aaf9",
+  "source_files": {
+    "candidate/web/app/(auth)/login/page.tsx": "13f1b0329b600d7a21417fa1fe008551007f6ea31181fec4e5e2c15131cd5ace",
+    "candidate/web/lib/auth-context.tsx": "fb97178821349721ed25487aede2674b53e66f40c3c98fc6f6837b0360651704"
+  },
+  "changes": [
+    "Removed the login card's 350 ms vertical entrance motion.",
+    "Cached identity no longer clears authentication loading before the server /me check completes."
+  ],
+  "verification": {
+    "typescript": "passed",
+    "eslint": "passed",
+    "existing_frontend_node_test_files": 11,
+    "frontend_node_tests": "passed",
+    "npm_audit_vulnerabilities": 0,
+    "fixed_parameter_static_exports": 2,
+    "exported_files": 235,
+    "deterministic": true,
+    "login_chunk_contains_motion_entry_animation": false,
+    "live_authenticated_browser_regression": "not verified: browser automation backends returned EOF; static build and live route checks passed"
+  },
+  "production_model_calls": 0,
+  "deployed": true,
+  "release_id": "v1.0.79+closure.20261005.2",
+  "deployed_at": "2026-10-05 14:32:11 CST",
+  "production_routes": {
+    "readyz": 200,
+    "admin_login": 200,
+    "dashboard": 200,
+    "settings_upstream": 200
+  }
+}

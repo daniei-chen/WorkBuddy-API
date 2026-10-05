@@ -1,0 +1,14 @@
+{
+  "scanner": "aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa",
+  "image": "workbuddy2api-upgrade:20261005.3",
+  "severity_counts": {
+    "CRITICAL": 0,
+    "HIGH": 0,
+    "MEDIUM": 0,
+    "LOW": 0,
+    "UNKNOWN": 0
+  },
+  "high_critical": [],
+  "sbom_components": 79,
+  "production_mounts": false
+}
