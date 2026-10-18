@@ -120,15 +120,17 @@ def validate(total: float, shares: int, kind: str, mode: str,
              ttl_days: int | None, models: list[str] | None = None) -> None:
     """校验创建参数。不合法时抛 RedPacketError（路由层翻成 400）。
 
-    模型范围的规则**两类相反**，这不是疏漏：
+    模型范围的规则（#131 起）：
 
       · **token 红包必须限定模型**。token 是「量」，与模型强相关——同一段
         上下文在不同模型下的 token 数、输出长度、上下文窗口都不同，不限定
         范围的话「10 万 token 红包」的含义是浮动的，收的人也不知道自己
         能拿它干什么。
-      · **积分红包必须不限定**。积分是「钱」，按上游返回的真实扣费算，
-        任何模型都能用；再叠一层模型限制只会让人算不清「这红包到底值多少」
-        （想控成本就少发点积分）。所以传了模型反而拦下来，把语义钉死。
+      · **积分红包可选**。不填 = 不限制（按真实扣费计，任何模型都能用，这
+        也是它原本的行为）；填了 = 只放行这些模型 —— 用来把一份额度限定到
+        某个模型上（issue #131：「只想把一部分额度分享给别人用某一个模型」）。
+        做成可选的理由：不填的人算额度时不会多一层变量，要控范围的人也不必
+        绕开红包另发密钥。
     """
     if kind not in KINDS:
         raise RedPacketError(f'额度类别只能是 {" 或 ".join(KINDS)}')
@@ -136,13 +138,8 @@ def validate(total: float, shares: int, kind: str, mode: str,
         raise RedPacketError(f'分配方式只能是 {" 或 ".join(MODES)}')
 
     names = [str(m).strip() for m in (models or []) if str(m).strip()]
-    if kind == KIND_TOKEN:
-        if not names:
-            raise RedPacketError('Token 红包必须限定模型范围（token 数与模型强相关）')
-    else:
-        if names:
-            raise RedPacketError('积分红包不限制模型：按真实扣费计，任何模型都能用；'
-                                 '想控成本请调小总额')
+    if kind == KIND_TOKEN and not names:
+        raise RedPacketError('Token 红包必须限定模型范围（token 数与模型强相关）')
 
     unit = MIN_UNIT[kind]
     if not isinstance(shares, int) or isinstance(shares, bool) or shares < 1:
@@ -186,14 +183,15 @@ def create_packet(name: str, kind: str, total: float, shares: int,
     code = secrets.token_urlsafe(16)
     # 归一化后再存：与密钥侧的白名单是**同一份**数据（都从用户输入来），
     # 两边规则不同的话，红包说限了 A、密钥实际限了 B，排查时会怀疑人生。
-    model_list = [str(m).strip() for m in (models or []) if str(m).strip()] \
-        if kind == KIND_TOKEN else []
+    # 两类都接受（token 必填、积分可选，见 validate）；积分不填就是空 = 不限制。
+    model_list = [str(m).strip() for m in (models or []) if str(m).strip()]
 
     # 与 create_key 共用同一段 INSERT（见 keysvc.create_key 的 `_conn` 参数），
     # 不把 SQL 抄第二遍——两份 SQL 漂移过一次就够了（count_tokens 的鉴权）。
-    conn = db.connect()
     created: list[dict] = []
     with db._lock:
+        # 连接在锁内取：PG 恢复会在锁内关闭并重开共享连接。
+        conn = db.connect()
         try:
             conn.execute('BEGIN')
             packet_id = conn.execute(
@@ -207,7 +205,7 @@ def create_packet(name: str, kind: str, total: float, shares: int,
                 made = keysvc.create_key(
                     name=f'{title}-{i}',
                     expires_at=expires_at,
-                    models=model_list,      # 积分红包这里是 []（= 不限制）
+                    models=model_list,      # 积分红包不填时为 []（= 不限制）
                     quota=amount if kind == KIND_TOKEN else 0,
                     quota_credit=amount if kind == KIND_CREDIT else 0,
                     _conn=conn,          # ← 在同一个事务里，由本函数统一提交
@@ -448,8 +446,9 @@ def draw(code: str, ip: str) -> dict:
     两个并发请求会各自查到「没领过」、各自挑一份：同一个人抽到两份，而且其中
     一份原本该属于别人（先被标记走了）。
     """
-    conn = db.connect()
     with db._lock:
+        # 连接在锁内取：PG 恢复会在锁内关闭并重开共享连接。
+        conn = db.connect()
         try:
             conn.execute('BEGIN')
             p = conn.execute('SELECT * FROM red_packets WHERE code = ?',

@@ -25,7 +25,8 @@ from server.routers import gateway  # noqa: E402
 
 
 def _reset_cache() -> None:
-    gateway._body_limit_cache.update({'at': 0.0, 'bytes': 0})
+    gateway._body_limit_cache.update({'at': 0.0, 'bytes': 0, 'source': ''})
+    gateway._BODY_LIMIT_SOURCE['value'] = ''
 
 
 def _request(body: bytes, headers: dict | None = None) -> Request:
@@ -81,8 +82,13 @@ class BodyLimitResolution(unittest.TestCase):
         return gateway.max_body_bytes() // 1024 // 1024
 
     def test_follows_config(self):
-        for value in (1,32,64,256):
-            self.assertEqual(self._mb({'server': {'max_body_mb':value}}),gateway.DEFAULT_MAX_BODY_MB)
+        """采信上游 config.json 的 server.max_body_mb（本机 2api 写的是 1024MB）。
+
+        上限仍然由**网关**这一跳执行（本端要缓冲完整 body），只是取值跟上上游走；
+        这样用户调大上游上限时，网关不会变成隐性瓶颈。
+        """
+        for value in (1, 32, 64, 256):
+            self.assertEqual(self._mb({'server': {'max_body_mb': value}}), value)
 
     def test_missing_config_falls_back(self) -> None:
         """读不到配置不能导致拒绝服务，退回本端默认值。"""
@@ -108,11 +114,23 @@ class BodyLimitResolution(unittest.TestCase):
             self.assertEqual(self._mb(bad), gateway.DEFAULT_MAX_BODY_MB, repr(bad))
 
     def test_result_is_cached_then_refreshes(self):
-        # Legacy file writes cannot silently enlarge or shrink the Manager-owned limit.
-        self.assertEqual(self._mb({'server': {'max_body_mb':32}}),gateway.DEFAULT_MAX_BODY_MB)
-        self.cfg.write_text(json.dumps({'server': {'max_body_mb':1}}),encoding='utf-8')
-        gateway._body_limit_cache['at']=0.0
-        self.assertEqual(gateway.max_body_bytes()//1024//1024,gateway.DEFAULT_MAX_BODY_MB)
+        # 10 秒缓存：期间不重复读配置，过期后跟随新值
+        self.assertEqual(self._mb({'server': {'max_body_mb': 32}}), 32)
+        self.cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
+        self.assertEqual(gateway.max_body_bytes() // 1024 // 1024, 32, '缓存期内不该变')
+        gateway._body_limit_cache['at'] = 0.0
+        self.assertEqual(gateway.max_body_bytes() // 1024 // 1024, 1, '过期后应跟随配置')
+
+    def test_ceiling_caps_absurd_config(self) -> None:
+        """配置写错（比如 99999）不能把进程内存一次性交出去——网关硬顶兜底。"""
+        orig = gateway.BODY_CEILING_MB
+        gateway.BODY_CEILING_MB = 128
+        try:
+            self.assertEqual(self._mb({'server': {'max_body_mb': 99999}}), 128)
+            self.assertEqual(gateway._BODY_LIMIT_SOURCE['value'], 'upstream+ceiling')
+        finally:
+            gateway.BODY_CEILING_MB = orig
+            _reset_cache()
 
 
 class BodyLimitEnforcement(unittest.TestCase):
@@ -174,6 +192,51 @@ class BodyLimitEnforcement(unittest.TestCase):
         _, err = self._read(raw, {'content-length': str(len(raw))})
         self.assertIsNotNone(err)
         self.assertEqual(err.status_code, 400)
+
+    def test_upstream_key_wins_and_message_points_at_it(self) -> None:
+        """上限来自上游 config.json 时，413 文案必须指上游那个键。
+
+        issue #180 的实际形状：用户的上游是旧版、`server.max_body_mb` 还在，
+        面板优先听它；旧文案却一律写「由环境变量决定」，用户改环境变量毫无效果。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / 'config.json'
+            cfg.write_text(json.dumps({'server': {'max_body_mb': 1}}), encoding='utf-8')
+            orig = config.UPSTREAM_CONFIG
+            config.UPSTREAM_CONFIG = cfg
+            _reset_cache()
+            try:
+                self.assertEqual(gateway.max_body_bytes() // 1024 // 1024, 1)
+                self.assertEqual(gateway._BODY_LIMIT_SOURCE['value'], 'upstream')
+                _, err = self._read(self.big, {})
+                msg = json.loads(err.body)['error']['message']
+                self.assertIn('server.max_body_mb', msg, '要指出上游那个键')
+                self.assertIn('WB_GATEWAY_MAX_BODY_MB', msg, '也要给出删键后的替代做法')
+            finally:
+                config.UPSTREAM_CONFIG = orig
+                _reset_cache()
+
+    def test_message_says_default_when_nothing_is_configured(self) -> None:
+        """既没有上游那个键、也没设环境变量时，说清「这是默认上限、可以调大」。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = pathlib.Path(tmp) / 'config.json'
+            cfg.write_text(json.dumps({}), encoding='utf-8')
+            orig = config.UPSTREAM_CONFIG
+            orig_default = gateway.DEFAULT_MAX_BODY_MB
+            config.UPSTREAM_CONFIG = cfg
+            gateway.DEFAULT_MAX_BODY_MB = 1          # 与 self.big（2 MB）配对，便于构造超限
+            _reset_cache()
+            try:
+                gateway.max_body_bytes()
+                self.assertEqual(gateway._BODY_LIMIT_SOURCE['value'], '', '没设过就应是默认值')
+                _, err = self._read(self.big, {})
+                msg = json.loads(err.body)['error']['message']
+                self.assertIn('默认上限', msg)
+                self.assertIn('WB_GATEWAY_MAX_BODY_MB', msg)
+            finally:
+                config.UPSTREAM_CONFIG = orig
+                gateway.DEFAULT_MAX_BODY_MB = orig_default
+                _reset_cache()
 
     def test_error_message_has_guidance(self) -> None:
         """报错要说清怎么改，而不是只丢一个 413。

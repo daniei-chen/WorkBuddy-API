@@ -123,6 +123,20 @@ class DsnTest(unittest.TestCase):
         self.assertIn('sslmode=require',
                       pgsync.build_dsn({**base, 'sslmode': 'require'}))
 
+    def test_sslmode_must_be_a_libpq_mode(self) -> None:
+        """非法 sslmode 要在拼连接串时就给出可选值。
+
+        否则 libpq 只回一句 "invalid sslmode value: yes"，用户不知道
+        合法值是什么；而且这条错误是在备份任务线程里才出现的。
+        """
+        base = self._cfg(host='h', dbname='d', user='u', password='p')
+        with self.assertRaises(ValueError) as ctx:
+            pgsync.build_dsn({**base, 'sslmode': 'yes'})
+        self.assertIn('verify-full', str(ctx.exception))
+        # 大小写与首尾空格归一
+        self.assertIn('sslmode=verify-full',
+                      pgsync.build_dsn({**base, 'sslmode': ' VerIfy-Full '}))
+
     def test_empty_host_rejected(self) -> None:
         with self.assertRaises(ValueError):
             pgsync.build_dsn(self._cfg(host='   '))
@@ -165,6 +179,12 @@ class ConfigTest(_Case):
         self.assertEqual(pgsync.get_config()['interval_minutes'], 0)
         pgsync.save_config({'interval_minutes': '15'})
         self.assertEqual(pgsync.get_config()['interval_minutes'], 15)
+
+    def test_invalid_sslmode_rejected_on_save(self) -> None:
+        with self.assertRaises(ValueError):
+            pgsync.save_config({'sslmode': 'yes'})
+        # 被拒的保存不能改动已存配置
+        self.assertEqual(pgsync.get_config()['sslmode'], 'prefer')
 
     def test_merge_form_for_test_connection(self) -> None:
         """「先测后存」：表单里的新值要生效，掩码的密码要沿用已存的。"""
@@ -487,6 +507,12 @@ class RouterTest(unittest.TestCase):
         self.c.post('/api/settings/pg-sync', json={'password': pgsync._MASK, 'port': 5433})
         self.assertEqual(pgsync.get_config()['password'], 'pw')
         self.assertEqual(pgsync.get_config()['port'], 5433)
+
+    def test_invalid_sslmode_returns_400(self) -> None:
+        self._login()
+        r = self.c.post('/api/settings/pg-sync', json={'sslmode': 'yes'})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn('verify-full', r.text)
 
     def test_export_rejected_without_host(self) -> None:
         self._login()

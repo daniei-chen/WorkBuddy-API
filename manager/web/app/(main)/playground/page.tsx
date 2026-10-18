@@ -341,7 +341,7 @@ export default function PlaygroundPage() {
                       {t('playground.startDesc')}
                     </p>
                     {currentModel && (
-                      <p className="text-[10px] text-muted-foreground/70">
+                      <p className="text-[11px] text-muted-foreground">
                         {t('playground.currentModel')}{' '}
                         <span className="font-mono">{currentModel.id}</span>
                         {currentModel.efforts.length > 0 &&
@@ -405,7 +405,7 @@ export default function PlaygroundPage() {
                               </span>
                             )}
                             {!!m.tokens && (
-                              <span className="text-[10px] tabular-nums text-muted-foreground/70">
+                              <span className="text-[11px] tabular-nums text-muted-foreground">
                                 {m.tokens} tokens
                               </span>
                             )}

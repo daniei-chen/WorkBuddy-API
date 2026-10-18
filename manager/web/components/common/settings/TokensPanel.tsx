@@ -6,6 +6,7 @@ import {errText, tokenApi} from '@/lib/api';
 import {useAuth} from '@/lib/auth-context';
 import {useI18n} from '@/lib/i18n/provider';
 import {notify} from '@/lib/toast';
+import {fmtDateTime} from '@/lib/format';
 import type {ApiToken, CreatedApiToken} from '@/lib/types';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {EmptyState} from '@/components/common/layout/EmptyState';
@@ -98,7 +99,7 @@ export function TokensPanel() {
               value={form.scope}
               onValueChange={(v) => setForm({...form, scope: v as 'readonly' | 'admin'})}
             >
-              <SelectTrigger className="bg-background">
+              <SelectTrigger className="bg-background" aria-label={t('settings.tokensScope')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -113,7 +114,7 @@ export function TokensPanel() {
               value={form.expires}
               onValueChange={(v) => setForm({...form, expires: v as 'never' | '30' | '90' | '365'})}
             >
-              <SelectTrigger className="bg-background">
+              <SelectTrigger className="bg-background" aria-label={t('settings.tokensExpires')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -237,12 +238,12 @@ export function TokensPanel() {
                 </TableCell>
                 <TableCell className="text-xs text-muted-foreground">
                   {tk.expires_at
-                    ? new Date(tk.expires_at * 1000).toLocaleString()
+                    ? fmtDateTime(tk.expires_at)
                     : t('settings.tokensExpiresNever')}
                 </TableCell>
                 <TableCell className="text-xs text-muted-foreground">
                   {tk.last_used_at
-                    ? `${new Date(tk.last_used_at * 1000).toLocaleString()}${
+                    ? `${fmtDateTime(tk.last_used_at)}${
                         tk.last_used_ip ? ` · ${tk.last_used_ip}` : ''
                       }`
                     : t('settings.tokensNeverUsed')}

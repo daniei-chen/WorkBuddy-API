@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .. import config, db, keysvc, security, upstreamsvc
-from ..services import keyexport, keyimport, modelcatalog
+from ..services import keyexport, keyimport, modelcatalog, modelmap
 from ..iputil import client_ip
 
 router = APIRouter(prefix='/api/keys', tags=['keys'])
@@ -129,7 +129,8 @@ def check_models(body: WhitelistCheckIn,
         return {'checked': False, 'unknown': [],
                 'reason': '暂时读不到模型清单（去「模型」页刷新一次再回来）'}
 
-    aliases = list((db.get_setting('model_map', {}) or {}).keys())
+    # 只认真实别名：兜底那条（`*`）不是模型名，不该被当成"用户写的白名单项是对的"。
+    aliases = modelmap.aliases(db.get_setting('model_map', {}) or {})
     unknown = keysvc.unknown_whitelist_entries(names, known_by_realm, aliases)
     return {'checked': True, 'unknown': unknown}
 

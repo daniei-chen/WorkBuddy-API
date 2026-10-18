@@ -86,14 +86,11 @@ def record_balance(uid: str, nickname: str, credits: int | float | None) -> int 
 
     snap = _load_snapshot()
     prev_raw = snap.get(uid)
-    snap[uid] = value
+    prev = _snapshot_value(prev_raw)
+    snap[uid] = {'credits': value, 'at': int(time.time())}
     _save_snapshot(snap)
 
-    if prev_raw is None:
-        return None
-    try:
-        prev = int(prev_raw)
-    except (TypeError, ValueError):
+    if prev is None:
         return None
 
     delta = value - prev
@@ -157,3 +154,42 @@ def invalidate(uid: str | None = None) -> None:
         _cache.pop(uid, None)
     else:
         _cache.clear()
+
+def _snapshot_value(raw: object) -> int | None:
+    """快照条目的数值。新形态是 {'credits': n, 'at': ts}；升级前存的是纯数字。"""
+    if isinstance(raw, dict):
+        raw = raw.get('credits')
+    try:
+        return int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _snapshot_time(raw: object) -> int | None:
+    """快照条目的登记时刻（旧形态没有，返回 None）。"""
+    if isinstance(raw, dict):
+        try:
+            return int(raw.get('at'))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def snapshot_entries() -> dict:
+    """已登记的积分快照（**只读本地记录，不触发任何上游查询**）。
+
+    给管理端的只读查询用：面板平时已经在记录余额（`record_balance`），这里只是把
+    那份记录连同**登记时刻**一起交出来。数字可能是几分钟/几小时前的，调用方要如实
+    标注为「已登记」而不是实时余额 —— 这也是它不查上游的原因：既省一次账单请求，
+    也不会因为别人刷新页面就给上游加压。
+    """
+    snap = _load_snapshot()
+    rows: list[dict] = []
+    for uid, raw in snap.items():
+        value = _snapshot_value(raw)
+        if value is None:
+            continue
+        rows.append({'uid': str(uid), 'credits': value, 'registered_at': _snapshot_time(raw)})
+    rows.sort(key=lambda r: r['uid'])
+    newest = max((r['registered_at'] or 0 for r in rows), default=0)
+    return {'snapshot_at': newest, 'count': len(rows), 'accounts': rows}

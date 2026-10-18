@@ -199,7 +199,7 @@ export function UpstreamFormDialog({
                     placeholder="http://127.0.0.1:7863"
                     maxLength={500}
                   />
-                  <p className="text-[10px] leading-4 text-muted-foreground">
+                  <p className="text-[11px] leading-4 text-muted-foreground">
                     {t('upstreams.fieldUrlHint')}
                   </p>
                 </div>
@@ -226,7 +226,7 @@ export function UpstreamFormDialog({
                     placeholder={t('upstreams.fieldDirPlaceholder')}
                     maxLength={500}
                   />
-                  <p className="text-[10px] leading-4 text-muted-foreground">
+                  <p className="text-[11px] leading-4 text-muted-foreground">
                     {t('upstreams.fieldDirHint')}
                   </p>
                 </div>
@@ -238,7 +238,7 @@ export function UpstreamFormDialog({
                     placeholder={t('upstreams.fieldContainerPlaceholder')}
                     maxLength={64}
                   />
-                  <p className="text-[10px] leading-4 text-muted-foreground">
+                  <p className="text-[11px] leading-4 text-muted-foreground">
                     {t('upstreams.fieldContainerHint')}
                   </p>
                 </div>
@@ -253,7 +253,7 @@ export function UpstreamFormDialog({
                 </div>
                 <div className="flex items-center justify-between">
                   <Label className="text-[11px] text-muted-foreground">{t('upstreams.fieldEnabled')}</Label>
-                  <Switch checked={form.enabled} onCheckedChange={(v) => setForm({...form, enabled: v})} />
+                  <Switch checked={form.enabled} onCheckedChange={(v) => setForm({...form, enabled: v})} aria-label={t('upstreams.fieldEnabled')} />
                 </div>
               </>
             )}

@@ -104,6 +104,8 @@ export const NAV_COMMANDS: readonly NavSeed[] = [
    keywords: 'settings config 设置 配置'},
   {href: '/settings/upstream', labelKey: 'settings.tabUpstream', groupKey: 'nav.settings',
    keywords: 'upstream upstash 上游 配置'},
+  {href: '/settings/proxy', labelKey: 'settings.tabProxy', groupKey: 'nav.settings',
+   keywords: 'proxy route socks5 egress 代理 线路 出口'},
   {href: '/settings/models', labelKey: 'settings.tabModels', groupKey: 'nav.settings',
    keywords: 'model map alias 模型 映射 别名'},
   {href: '/settings/users', labelKey: 'settings.tabUsers', groupKey: 'nav.settings',

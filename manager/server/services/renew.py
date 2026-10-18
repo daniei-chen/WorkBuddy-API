@@ -47,12 +47,12 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import time
-
 from pathlib import Path
 
-from .. import config, db, upstreamsvc
+from .. import db, upstreamsvc
 from . import tencent, wb2api
 from .errtext import err_text
 
@@ -117,8 +117,15 @@ def _iter_accounts():
             yield d, acct
 
 
-async def renew_once(now: int | None = None) -> dict:
-    """巡检一遍所有账号，返回统计（`{checked, renewed, failed, skipped}`）。
+async def refresh_all(force: bool = False, now: int | None = None) -> dict:
+    """巡检一遍所有账号并续期，返回统计（`{checked, renewed, failed, skipped}`）。
+
+    `force=False`（默认）：只处理进入续期窗口（剩余 < `_RENEW_BEFORE_SECONDS`）
+    的账号——自动续期的主路径。
+
+    `force=True`：**无条件**刷新所有账号，与剩余寿命无关。供「令牌刷新计划」
+    及其「立即执行一次」用——对应「每 N 天全量刷一次」的诉求，也覆盖那些距
+    过期还早、但用户就是想定期换一遍令牌的场景。
 
     逐个串行：账号数是个位数到几十，且腾讯那边对高频请求有风控——并发刷新
     得不偿失（上游保活也是串行）。分组（多账号池）登记的目录一并巡检。
@@ -131,7 +138,7 @@ async def renew_once(now: int | None = None) -> dict:
         if acct.get('disabled_by_panel'):
             stats['skipped'] += 1
             continue
-        if not _needs_renew(int(acct.get('expires_at') or 0), now):
+        if not force and not _needs_renew(int(acct.get('expires_at') or 0), now):
             continue
         stats['checked'] += 1
         name = acct['file']
@@ -167,6 +174,131 @@ async def renew_once(now: int | None = None) -> dict:
         logger.info('token 已续期: %s（%s）', label, message)
         _record(acct, 1, f'token 自动续期成功（{message}）')
     return stats
+
+
+async def renew_once(now: int | None = None) -> dict:
+    """按剩余寿命巡检一遍（保留原入口，等价于 `refresh_all(force=False)`）。"""
+    return await refresh_all(force=False, now=now)
+
+
+# ── 令牌刷新计划：「每 N 天全量刷一次」────────────────────────
+#
+# 与上面的「按剩余寿命续期」并列的第二条路径：用户显式要求「每 5 天把全部账号
+# 刷一遍」，不看剩多少天。配置存 db 的 settings 表（与「定时领奖」同一套），
+# 因为它是**本端**的调度意图，不该写进上游 config.json（那是上游自己的排程）。
+_PLAN_KEY = 'token_refresh_plan'
+_PLAN_DEFAULTS = {'enabled': False, 'interval_days': 5, 'hour': 3, 'last_run': 0}
+
+
+def _normalise_plan(raw: object) -> dict:
+    """把库里的值收敛成合法计划：字段缺失/被手改成非法值时逐项兜底。"""
+    plan = dict(_PLAN_DEFAULTS)
+    if isinstance(raw, dict):
+        plan.update({k: raw[k] for k in _PLAN_DEFAULTS if k in raw})
+    # 脏值一律**关掉**，不做 `bool(...)` 强转：把 'yes' / 1 之类的非布尔值
+    # 当开启，会在用户不知情时开始定时打腾讯接口。宁可默认关，让它显式打开。
+    if not isinstance(plan['enabled'], bool):
+        plan['enabled'] = False
+    for key, lo, hi, default in (('interval_days', 1, 365, 5), ('hour', 0, 23, 3)):
+        val = plan.get(key)
+        if isinstance(val, bool) or not isinstance(val, int) or not lo <= val <= hi:
+            plan[key] = default
+    last = plan.get('last_run')
+    plan['last_run'] = int(last) if (isinstance(last, (int, float))
+                                     and not isinstance(last, bool) and last > 0) else 0
+    return plan
+
+
+def get_plan() -> dict:
+    """当前计划（含 `last_run`，可能为 0 = 从未跑过）。"""
+    return _normalise_plan(db.get_setting(_PLAN_KEY))
+
+
+def set_plan(enabled: object, interval_days: object, hour: object) -> dict:
+    """保存计划；校验失败抛 `ValueError` / `TypeError`（路由转 400）。
+
+    参数声明为 `object` 而不是 `bool`/`int`：值与类型都由本函数在运行时校验
+    （输入来自 HTTP JSON，类型本就不受信），调用方不必先强转。
+
+    `last_run` **保持不变**：改间隔不该把「上次跑过」这件事抹掉，否则调完设置
+    会被判成逾期、立刻又触发一轮全量刷新。
+    """
+    if not isinstance(enabled, bool):
+        raise TypeError('enabled 必须是布尔值')
+    if isinstance(interval_days, bool) or not isinstance(interval_days, int):
+        raise TypeError('interval_days 必须是整数')
+    if not 1 <= interval_days <= 365:
+        raise ValueError('interval_days 必须是 1-365 的整数')
+    if isinstance(hour, bool) or not isinstance(hour, int):
+        raise TypeError('hour 必须是整数')
+    if not 0 <= hour <= 23:
+        raise ValueError('hour 必须是 0-23 的整点')
+    plan = get_plan()
+    plan.update({'enabled': enabled, 'interval_days': interval_days, 'hour': hour})
+    db.set_setting(_PLAN_KEY, plan)
+    return plan
+
+
+def plan_is_due(plan: dict | None = None, now: int | None = None) -> bool:
+    """是否到点该跑全量刷新。
+
+    两条同时成立：①距上次执行已满 `interval_days` 天；②当前整点等于 `hour`。
+    按整点对齐而不是精确到秒——巡检本就是一小时一跳，要求秒级对齐只会永远
+    命中不了。
+
+    从未跑过（`last_run=0`）时不算「逾期」，只等下一个配置整点：避免刚打开
+    开关就立刻打一轮腾讯（用户可能只是想先配好、到点再跑）。
+    """
+    plan = get_plan() if plan is None else _normalise_plan(plan)
+    if not plan['enabled']:
+        return False
+    now = int(time.time()) if now is None else now
+    if time.localtime(now).tm_hour != plan['hour']:
+        return False
+    last = plan['last_run']
+    if last <= 0:
+        return True
+    return now - last >= plan['interval_days'] * 86400
+
+
+def plan_next_run(plan: dict | None = None, now: int | None = None) -> int | None:
+    """下一次执行时刻（epoch 秒）；未启用返回 None。
+
+    供界面显示「下次执行」——用户据此确认计划真的排上了，而不是只能信任开关。
+    """
+    plan = get_plan() if plan is None else _normalise_plan(plan)
+    if not plan['enabled']:
+        return None
+    now = int(time.time()) if now is None else now
+    last = plan['last_run']
+    base = max(now, last + plan['interval_days'] * 86400) if last > 0 else now
+    day = datetime.date(*time.localtime(base)[:3])
+    for i in range(400):
+        cand = int(datetime.datetime.combine(
+            day + datetime.timedelta(days=i),
+            datetime.time(hour=plan['hour']),
+        ).timestamp())
+        if cand >= base:
+            return cand
+    return None
+
+
+def mark_plan_ran(now: int | None = None) -> dict:
+    """记录计划刚跑过（重置计时）。返回更新后的计划。"""
+    plan = get_plan()
+    plan['last_run'] = int(time.time()) if now is None else int(now)
+    db.set_setting(_PLAN_KEY, plan)
+    return plan
+
+
+def _record_plan(stats: dict) -> None:
+    """把计划执行结果落一条任务记录（kind=keepalive，与续期同类别，用户看得见）。"""
+    _record(
+        {'uid': '', 'nickname': 'token-refresh-plan', 'file': 'token-refresh-plan'},
+        1 if stats.get('renewed') and not stats.get('failed') else 0,
+        f"计划任务全量刷新：成功 {stats.get('renewed', 0)}，失败 {stats.get('failed', 0)}，"
+        f"跳过 {stats.get('skipped', 0)}",
+    )
 
 
 def _note_failure(name: str, message: str) -> None:
@@ -215,6 +347,21 @@ async def _loop() -> None:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning('token 续期巡检异常: %s', exc)
+        # 令牌刷新计划：到点就无条件全量刷一轮（与上面的寿命巡检独立，
+        # 一段出错不该拖住另一段）。
+        try:
+            plan = get_plan()
+            if plan_is_due(plan):
+                logger.info('令牌刷新计划触发（每 %d 天，%02d 点档）',
+                            plan['interval_days'], plan['hour'])
+                pstats = await refresh_all(force=True)
+                mark_plan_ran()
+                _record_plan(pstats)
+                logger.info('令牌刷新计划完成：%s', pstats)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning('令牌刷新计划异常: %s', exc)
         await asyncio.sleep(_CHECK_INTERVAL_SECONDS)
 
 

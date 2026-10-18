@@ -46,10 +46,32 @@ import time
 from pathlib import Path
 
 TOP = 'workbuddy2api'
-EXCLUDE_DIRS = {'.git', '__pycache__', 'node_modules'}
-EXCLUDE_SUFFIX = {'.pyc', '.pyo'}
-# 打进去会出问题的东西：用户的运行时数据与凭据不该随源码分发。
-EXCLUDE_NAMES = {'config.json', 'auths', 'data'}
+# 打包进公开 Release 的东西必须**只含源码**：部署树的 .env、数据库、日志、Python
+# 虚拟环境里全是凭据与运行时垃圾（2026-10-18 审计：旧清单只排除了 config.json /
+# auths / data，`.env`、`*.db`、`logs/` 会被原样打进公开资产）。
+EXCLUDE_DIRS = {'.git', '__pycache__', 'node_modules', '.venv', '.runtime',
+                'logs', 'tmp', 'data', 'auths'}
+EXCLUDE_SUFFIX = {'.pyc', '.pyo', '.log', '.db', '.db-wal', '.db-shm',
+                  '.sqlite', '.sqlite3'}
+EXCLUDE_NAMES = {'config.json', 'auths', 'data', 'users.json',
+                 'update-status.json', 'version-check.json', 'upstream-ref.txt'}
+
+
+def _lf_text(raw: bytes) -> bytes:
+    """文本内容 CRLF → LF；二进制原样返回（issue #202）。
+
+    判据：**不含 NUL 且能按 UTF-8 解码**的当文本，其余（图片、压缩包等）一个字节都
+    不动。猜错方向的代价不对称 —— 把一个二进制改坏比留一处行尾问题严重得多。
+    与 `deploy/update.py::_normalize_eol` 同一口径（那边是同步时的兜底；这边治源头，
+    让下出去的资产本身就是干净的）。
+    """
+    if b'\x00' in raw:
+        return raw
+    try:
+        raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return raw
+    return raw.replace(b'\r\n', b'\n')
 
 
 def _iter_files(root: Path) -> list[Path]:
@@ -63,8 +85,9 @@ def _iter_files(root: Path) -> list[Path]:
         if p.suffix in EXCLUDE_SUFFIX:
             continue
         # 只排除**顶层**的运行时文件/目录：源码树里若有 scripts/config.json 之类的
-        # 示例文件，那是要保留的。
-        if len(rel.parts) == 1 and rel.parts[0] in EXCLUDE_NAMES:
+        # 示例文件，那是要保留的。`.env*` 一律排除（含 .env.local 这类备份）。
+        if len(rel.parts) == 1 and (rel.parts[0] in EXCLUDE_NAMES
+                                    or rel.parts[0].startswith('.env')):
             continue
         out.append(p)
     return out
@@ -133,8 +156,15 @@ LICENSE 与版权声明。
                 info.uid = info.gid = 0
                 info.uname = info.gname = ''
                 info.mode = 0o755 if (f.stat().st_mode & 0o111) else 0o644
-                with f.open('rb') as fh:
-                    tf.addfile(info, fh)
+                # 行尾归一（issue #202）：源码目录可能是在 Windows 上检出的（git 的
+                # `core.autocrlf` 会把文本文件写成 CRLF），而打包是字节拷贝 —— 包内
+                # 那份 CRLF 会让容器里的脚本首行变成 `#!/usr/bin/env bash\r`，解释器
+                # 路径对不上，一键登录 / 签到 / 积分这些依赖脚本的功能整体失效。
+                # 归一放在**打包这一步**、而不是指望源码目录干净：谁的工作区干净
+                # 不该决定发出去的资产长什么样。判据见 `_lf_text`。
+                data = _lf_text(f.read_bytes())
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
         size = out_path.stat().st_size
         digest = hashlib.sha256(out_path.read_bytes()).hexdigest()[:16]
         print(f'已打出 {out_path}（{len(files)} 个文件，{size / 1024:.0f} KB，sha256:{digest}…）')

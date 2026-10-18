@@ -988,6 +988,9 @@ async def messages(request: Request):
     # max_tokens 在 Anthropic 协议里是**必填项**，缺失即 400（与 OpenAI 不同）
     if body.get('max_tokens') is None:
         return _err('缺少必填字段 max_tokens')
+    # 越界的 max_tokens 会被上游包装成 503（见 gateway.clamp_max_tokens 的说明）。
+    # 在必填性校验之后压回上限，转换层就能拿到已收敛的值。
+    gateway.clamp_max_tokens(body)
 
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（见该函数说明）
     # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）

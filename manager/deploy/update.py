@@ -19,15 +19,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import http.client
 import os
 import re
 import shutil
 import signal
+import site
 import stat
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
 import time
@@ -114,8 +117,15 @@ def _probe_opener() -> urllib.request.OpenerDirector:
 # 取值顺序：WB_UPDATE_PROXY（更新专用）> WB_HTTP_PROXY（面板的出口代理，
 # 用户已经为它配过代理时不必再配一遍）> 环境变量里的 http_proxy / https_proxy
 # （urllib 的默认行为）。本机地址由 no_proxy 自动放行。
-UPDATE_PROXY = (os.environ.get('WB_UPDATE_PROXY')
-                or os.environ.get('WB_HTTP_PROXY') or '').strip()
+_RAW_PROXY = (os.environ.get('WB_UPDATE_PROXY')
+              or os.environ.get('WB_HTTP_PROXY') or '').strip()
+# 面板能吃 socks5（装了 socksio），但更新器用的是 urllib —— 它只认 http/https，
+# 把手给 socks5:// 只会得到一条看不懂的报错（而下载失败的报错本来就容易误判）。
+# 所以非 http 的取法一律忽略，并在 main() 里记一条日志说明怎么配。
+PROXY_UNSUPPORTED = ('' if not _RAW_PROXY
+                     or _RAW_PROXY.lower().startswith(('http://', 'https://'))
+                     else _RAW_PROXY)
+UPDATE_PROXY = '' if PROXY_UNSUPPORTED else _RAW_PROXY
 if UPDATE_PROXY:
     # 本机与内网不走代理：更新器要读本地状态文件，代理配置不该把内网也带偏。
     os.environ.setdefault('no_proxy', '127.0.0.1,localhost')
@@ -132,6 +142,29 @@ def _opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers)
 
 
+def redact_proxy(url: str) -> str:
+    """把代理地址里的用户名/密码换成 ***。
+
+    为什么必须做：下载失败时的提示会原样拼进 `UPDATE_PROXY`，而它是
+    `http://user:password@host` 形态 —— 这条提示会写进 update-status.json，管理端
+    任何登录用户都能读（状态接口不是管理员专用）。凭据只在部署者的 .env 里，
+    不该因为一次下载失败就泄露给只读账号。
+    """
+    if not url:
+        return ''
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    if not (parts.username or parts.password):
+        return url
+    host = parts.hostname or ''
+    if parts.port:
+        host = f'{host}:{parts.port}'
+    return urllib.parse.urlunsplit(
+        (parts.scheme, f'***@{host}', parts.path, parts.query, parts.fragment))
+
+
 def _download_hint(exc: BaseException) -> str:
     """下载失败的**可操作**提示：区分「网络到不了 GitHub」与其它原因。"""
     text = str(exc)
@@ -143,13 +176,13 @@ def _download_hint(exc: BaseException) -> str:
     if not looks_like_network:
         return ''
     if UPDATE_PROXY:
-        return (f'（已配置代理 {UPDATE_PROXY}，仍连不上 —— 检查代理地址是否可从本机访问、'
-                f'以及它是否放行 github.com）')
+        return (f'（已配置代理 {redact_proxy(UPDATE_PROXY)}，仍连不上 —— 检查代理地址是否'
+                f'可从本机访问、以及它是否放行 github.com）')
     if urllib.request.getproxies():
         return '（当前使用的是环境变量里的代理；若代理不可用，可用 WB_UPDATE_PROXY 指定一个）'
     return ('（当前网络似乎无法直连 GitHub。容器/内网环境请在 .env 里设置 '
             'WB_UPDATE_PROXY=http://<宿主IP>:<端口> 后重试，例如 http://172.17.0.1:7890）')
-UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/daniei-chen/WorkBuddy-API.git'
+UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/Sliverkiss/workbuddy2api.git'
 SERVICE_NAME = os.environ.get('WB_SERVICE_NAME') or 'workbuddy-web'
 DATA_DIR = Path(os.environ.get('WB_DATA_DIR') or INSTALL_DIR / 'data')
 STATUS_FILE = Path(os.environ.get('WB_UPDATE_STATUS') or DATA_DIR / 'update-status.json')
@@ -167,27 +200,22 @@ UPSTREAM_REF_FILE = Path(os.environ.get('WB_UPSTREAM_REF_FILE') or DATA_DIR / 'u
 
 STEP_TIMEOUT = int(os.environ.get('WB_UPDATE_STEP_TIMEOUT') or 900)
 
-# ── 发布包签名校验 ───────────────────────────────────────
-# 为什么必须有：一键更新会把 Release 产物以 **root** 直接落盘并重启服务。
-# 而「能发 Release」的门槛比想象中低——能合并 PR 的协作者、或被钓鱼的维护者
-# 账号都能发版。于是「合并恶意 PR → 发版 → 用户点更新」是一条完整链路，
-# 一次得手就是**所有部署同时沦陷**（SolarWinds / event-stream 的形态）。
+# 离线升级包（面板「上传更新包」用；issue #153）：指向本机的一份发布包 tar.gz。
+# 走这条路时**不查 GitHub**：版本号从包里的 .version 读；完整性核对复用
+# verify_download（用户在面板里填了发布页 sha256 的话，这里就一并核对）。
+OFFLINE_PACKAGE = (os.environ.get('WB_UPDATE_PACKAGE') or '').strip()
+OFFLINE_PACKAGE_SHA256 = (os.environ.get('WB_UPDATE_PACKAGE_SHA256') or '').strip().lower()
+
+# ── 发布包完整性校验 ─────────────────────────────────────
+# 更新器从项目的 GitHub Release 拉包（HTTPS），并核对**发布页给的 sha256 摘要**
+# 与文件大小 —— 也就是绝大多数开源项目让用户做的那个手工校验，这里自动做了。
+# 能挡住的是「下载被截断 / 传输途中被替换」，这也是实测里真会发生的两类问题
+# （CDN 与代理链路会截断，截断的 tar.gz 往往解压到一半才报错、报错位置还看不出原因）。
 #
-# 签名把「能改代码」与「能发布可信产物」变成两件事：私钥离线保管、不进仓库
-# 也不进 CI（进了 CI 的话，恶意 PR 可以改 workflow 把密钥偷走，签名就白做了）。
-# 攻击者即使拿到合并权限发了版，**签不出名，所有用户的更新会中止**。
-#
-# 用 OpenSSH 自带的 ssh-keygen（8.0+，服务器上必有），不引入新依赖。
-# 公钥**内嵌在代码里**而不是读文件：文件可能被一并替换，那信任锚就没了。
-# 对应私钥 ~/.ssh/workbuddy-release 仅存在于维护者本机（绝不进仓库、不进 CI）。
-RELEASE_PUBKEY = os.environ.get('WB_RELEASE_PUBKEY') or (
-    'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHEGhxZQjEEK/RbtgcRLuuWji0fVB4E2dVKMnhtLlCkx '
-    'workbuddy release signing'
-)
-# 签名者身份（allowed_signers 的第一列），仅作标识，不参与信任判断
-RELEASE_SIGNER_ID = os.environ.get('WB_RELEASE_SIGNER') or 'release'
-# 置 1 可跳过验签，供更换密钥等紧急情况使用；会在日志里显式告警
-SKIP_SIGNATURE = os.environ.get('WB_SKIP_SIGNATURE') == '1'
+# 历史上这里还有一层「维护者离线私钥签名」（OpenSSH 签名 + 代码内嵌公钥），
+# 2026-10-14 起取消：它换来的是「GitHub 账号被拿下也拦得住」，代价是每次发版
+# 维护者都得在带私钥的机器上手工签一遍 —— 权衡后按主流做法只保留摘要校验。
+# 取舍与边界见 docs/release-signing.md。
 
 
 # ── 状态写入 ─────────────────────────────────────────────
@@ -236,14 +264,14 @@ class Reporter:
         self.state['target_version'] = str(tag or '').strip().lstrip('vV')
         self.flush()
 
-    def set_signature(self, status: str, detail: str = '') -> None:
-        """记录签名校验结果，供界面显示「已验签 / 未验签」。
+    def set_integrity(self, status: str, digest: str = '') -> None:
+        """记录发布包完整性校验结果，供界面显示。
 
-        status: verified（验签通过）/ skipped（走了绕过开关）/ none（未执行）
-        界面据此给出安心的绿色标记或醒目告警 —— 这是「本次更新是否经过
-        完整性验证」唯一的用户可见信号，不能只留在日志里。
+        status: digest（sha256 与发布页一致）/ none（回退路径拿不到发布页摘要，
+        只打印了本地摘要供人工比对）。界面据此给一行说明 —— 「这次装的东西
+        有没有被核对过」不该只留在日志里。
         """
-        self.state['signature'] = {'status': status, 'detail': detail}
+        self.state['integrity'] = {'status': status, 'digest': digest}
         self.flush()
 
     def flush(self) -> None:
@@ -288,13 +316,38 @@ def run(cmd: list[str], cwd: Path | None = None, rep: Reporter | None = None,
     return proc.returncode, out
 
 
-def http_json(url: str, timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers={
+def _github_headers() -> dict:
+    """GitHub API 请求头；设了 WB_GITHUB_TOKEN / GITHUB_TOKEN 则认证。
+
+    未认证限额只有 60 次/小时/IP，共享出口（TUN/系统代理）极易被同出口的
+    其他用户打满，表现为偶发 HTTP 403；认证后为 5000 次/小时。
+    """
+    headers = {
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'workbuddy-manager-updater',
-    })
-    with _opener().open(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode('utf-8'))
+    }
+    token = (os.environ.get('WB_GITHUB_TOKEN')
+             or os.environ.get('GITHUB_TOKEN') or '').strip()
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+    return headers
+
+
+def http_json(url: str, timeout: int = 20) -> dict:
+    req = urllib.request.Request(url, headers=_github_headers())
+    try:
+        with _opener().open(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as exc:
+        # 把 GitHub 的可读原因带出来（如 "API rate limit exceeded for x.x.x.x"），
+        # 否则调用方只能打出 "HTTP 403"，无从判断是该等配额重置还是换网络
+        detail = ''
+        try:
+            detail = exc.read().decode('utf-8', errors='replace').strip()[:200]
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f'HTTP {exc.code} {exc.reason} {detail}'.strip()) from exc
+
 
 
 def download(url: str, dest: Path, rep: Reporter) -> None:
@@ -337,129 +390,56 @@ def download(url: str, dest: Path, rep: Reporter) -> None:
         raise RuntimeError('下载内容异常偏小，可能是错误页面')
 
 
-def check_signature(archive: Path, sig_path: Path, rep: Reporter) -> None:
-    """用内置公钥校验 `archive` 的签名文件 `sig_path`；不通过即抛错。
+def _sha256_of(path: Path) -> str:
+    """分块算 sha256（发布包十几 MB，分块读更省内存，也便于以后复用）。"""
+    digest = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    拆成独立函数是刻意的：「验签」是这条信任链的核心，必须是一个**只依赖
-    两个文件 + 内置公钥**的纯函数，便于测试直接调用（不必去 mock 网络层——
-    曾经因为 mock 标准库导致测试之间互相污染，那种脆弱性本身也是风险）。
+
+def verify_download(archive: Path, info: dict, rep: Reporter) -> None:
+    """核对下载到的发布包：文件大小 + sha256 摘要（发布页/API 给的），不符即中止。
+
+    为什么保留这两项（而不是「下载完直接装」）：
+
+      · **大小** —— 实测里最常出的事故是**下载被截断**（CDN / 代理 / TUN 链路），
+        截断的 tar.gz 往往解压到一半才报错，报错位置与真实原因毫无关系；
+      · **摘要** —— 防的是「传输途中被换掉」，而且它就是发布页上给用户的同一个
+        哈希：想人工复核的人拿它就能对得上。
+
+    摘要在 API 路径能拿到（GitHub Releases API 给每个资产带 `digest`）；回退路径
+    （只有 302 重定向）拿不到，那时打印本地 sha256 供人工比对，并**如实记成
+    未比对** —— 不假装校验过。
     """
-    if SKIP_SIGNATURE:
-        rep.log('⚠️ 已通过 WB_SKIP_SIGNATURE 跳过签名校验——'
-                '只有在更换签名密钥等紧急情况下才应这样做，本次更新未经验证', 'warn')
-        rep.set_signature('skipped', '已手动跳过（WB_SKIP_SIGNATURE=1）')
+    size = archive.stat().st_size
+    expected_size = info.get('pkg_size')
+    if isinstance(expected_size, int) and expected_size > 0 and size != expected_size:
+        raise RuntimeError(
+            f'发布包大小不符，已拒绝安装：下载到 {size} 字节，发布页是 {expected_size} 字节。\n'
+            '  通常是下载被中断（网络或代理不稳）—— 再点一次更新即可。'
+        )
+
+    digest = _sha256_of(archive)
+    expected = str(info.get('pkg_digest') or '')
+    if expected.startswith('sha256:'):
+        want = expected.split(':', 1)[1].strip().lower()
+        if digest != want:
+            raise RuntimeError(
+                '❌ 发布包 sha256 与发布页不一致，已拒绝安装。\n'
+                f'  发布页：{want}\n'
+                f'  下载到：{digest}\n'
+                '  多为下载不完整（重试一次）；若始终不一致，'
+                '请到项目 Releases 页面自行核对后再决定是否手动安装。'
+            )
+        rep.log(f'✓ 发布包校验通过（sha256 {digest}，与发布页一致）')
+        rep.set_integrity('digest', digest)
         return
 
-    if 'AAAA_REPLACE_ME' in RELEASE_PUBKEY:
-        raise RuntimeError(
-            '发布包签名公钥未配置（仍是占位值），已拒绝自动更新。\n'
-            '  这是故意的：没有可信公钥时，任何"从 GitHub 下载的包"都可能是'
-            '被篡改的产物。\n'
-            '  请把维护者提供的公钥写入 deploy/update.py 的 RELEASE_PUBKEY，'
-            '或设 WB_RELEASE_PUBKEY 环境变量；'
-            '确需临时跳过可设 WB_SKIP_SIGNATURE=1（不推荐）。'
-        )
-
-    if not sig_path.is_file():
-        raise RuntimeError(
-            '该 Release 尚未附带签名文件，已拒绝安装。\n'
-            '  新版本发布后需要维护者在自己的机器上签名再上传（一般几分钟到几十分钟）；'
-            '稍后重试即可，不需要改任何配置。'
-        )
-
-    # ssh-keygen 要求 allowed_signers 格式（纯 .pub 文件不接受）
-    signers = archive.parent / 'allowed_signers'
-    signers.write_text(f'{RELEASE_SIGNER_ID} {RELEASE_PUBKEY.strip()}\n', encoding='utf-8')
-
-    rep.log('校验发布包签名…')
-    cmd = ['ssh-keygen', '-Y', 'verify',
-           '-f', str(signers),
-           '-I', RELEASE_SIGNER_ID,
-           '-n', 'file',
-           '-s', str(sig_path)]
-    try:
-        with open(archive, 'rb') as fh:
-            proc = subprocess.run(cmd, stdin=fh, capture_output=True, timeout=60)
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            '系统缺少 ssh-keygen，无法校验发布包签名（OpenSSH 8.0+ 自带）。'
-            '请安装 openssh-client 后重试。'
-        ) from exc
-    out = ((proc.stdout or b'') + (proc.stderr or b'')).decode('utf-8', errors='replace').strip()
-    if proc.returncode != 0 or 'Good' not in out:
-        # 区分「验签不通过」与「工具太老不会验」：两者都拒绝（fail-closed），
-        # 但成因不同——旧版 ssh-keygen 会把用法错误也报成失败，若不点明，
-        # 使用者会以为包被篡改，白白排查半天。
-        if 'invalid option' in out.lower() or 'unknown option' in out.lower():
-            raise RuntimeError(
-                '❌ 系统 ssh-keygen 过旧，不支持 -Y 验签（需要 OpenSSH 8.0+）。\n'
-                f'  ssh-keygen: {out[:300]}\n'
-                '  请升级 openssh-client（Debian/Ubuntu：apt install --only-upgrade openssh-client）。'
-            )
-        raise RuntimeError(
-            '❌ 发布包签名校验失败，已拒绝安装（可能是发布流程被篡改或产物被替换）。\n'
-            f'  ssh-keygen: {out[:300]}\n'
-            '  如果你的部署确实需要跳过，可临时设 WB_SKIP_SIGNATURE=1，'
-            '但那等于放弃这道防线，请先确认包来源。'
-        )
-    rep.log(f'✓ 签名校验通过（{out[:80]}）')
-    rep.set_signature('verified', out[:120])
-
-
-def download_signature(sig_url: str, archive: Path, rep: Reporter) -> Path:
-    """下载签名文件到包旁边，返回其路径。失败时抛错（不返回"空签名"）。
-
-    两种失败要分开说（用户报过 #127/#129）：把**网络超时**说成「该 Release 没有
-    可用的签名文件」，会把人引到「发布流程是不是被改坏了」上去，而真正该做的是
-    稍后重试。所以：
-
-      · 404 → Release 里确实没有 `.sig`（维护者签名前的窗口期就是这种）→ 明说
-        「尚未附带签名文件，稍后重试」，不要暗示发布流程被改动；
-      · 其它（超时/连接失败）→ 明说「下载失败（网络问题）」并**重试三次**——
-        GitHub 资产 CDN 偶发超时很常见（维护者本机也遇到过整包下到一半卡住）。
-    """
-    sig_path = archive.with_suffix(archive.suffix + '.sig')
-    if not sig_url:
-        return sig_path  # 让 check_signature 报「缺少签名文件」并给出清晰指引
-    rep.log('下载签名文件…')
-    last: Exception | None = None
-    for attempt in range(1, 4):
-        try:
-            req = urllib.request.Request(sig_url,
-                                         headers={'User-Agent': 'workbuddy-manager-updater'})
-            with _opener().open(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
-                shutil.copyfileobj(resp, fh)
-            return sig_path
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                sig_path.unlink(missing_ok=True)
-                raise RuntimeError(
-                    '该 Release 尚未附带签名文件，已拒绝安装。\n'
-                    '  新版本发布后需要维护者在自己的机器上签名再上传（一般几分钟到几十分钟）；'
-                    '稍后重试即可，不需要改任何配置。'
-                ) from exc
-            last = exc
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-        sig_path.unlink(missing_ok=True)      # 半截文件不能留给后面的验签
-        if attempt < 3:
-            rep.log(f'签名文件下载失败（{last}），第 {attempt}/3 次，稍后重试…', 'warn')
-            time.sleep(3 * attempt)
-    raise RuntimeError(
-        f'下载签名文件失败（网络问题，不是发布流程的问题）：{last}\n'
-        '  已重试 3 次。稍后再试；若一直失败，请检查这台服务器到 GitHub 的网络或代理设置。'
-    ) from last
-
-
-def verify_release_signature(archive: Path, sig_url: str, rep: Reporter) -> None:
-    """校验发布包的签名；不通过就抛错中止（绝不继续安装）。
-
-    这是「包本身可信吗」的唯一防线——路径校验（_safe_extract）只能保证
-    「包里的路径不逃逸」，防不了「包整体就是恶意的」。两者缺一不可。
-    签名覆盖整个 tar.gz，因此包内容被改一个字节都会验签失败。
-    """
-    sig_path = download_signature(sig_url, archive, rep)
-    check_signature(archive, sig_path, rep)
+    rep.log(f'发布包 sha256：{digest}')
+    rep.log('本次未比对发布页摘要（当前走的是回退路径），只校验了下载是否完整', 'warn')
+    rep.set_integrity('none', digest)
 
 
 # ── 上游更新 ─────────────────────────────────────────────
@@ -525,6 +505,30 @@ def _compose_looks_customized(rep: Reporter) -> bool:
         return False
 
 
+def _normalize_eol(raw: bytes) -> bytes:
+    """文本内容的 CRLF → LF；二进制原样返回（issue #202）。
+
+    为什么必须在这一步归一：随包分发的上游源码是在 Windows 上打的包，**包内就带
+    CRLF**（实测 293/298 个文件）。同步是字节拷贝，于是宿主源码树、进而网关镜像里的
+    脚本首行变成 `#!/usr/bin/env bash\\r` —— 解释器路径对不上，一键登录 / 签到 / 积分
+    这些依赖脚本的功能整体失效。
+
+    判据与报告方本地兜底一致：**能按 UTF-8 解码且不含 NUL** 的当文本，其余（图片、
+    压缩包等）一个字节都不动。猜错方向的代价是把二进制改坏，比行尾问题严重得多，
+    所以宁可漏归一一个奇怪的文本，也不碰任何可能非文本的东西。
+
+    顺带解决第二件事：内容只差行尾的文件此前会被算成「有改动」→ 白等一次网关重建
+    （报告方实测：不归一 295 个文件全算改动，归一后只报 7 改写 + 2 新增）。
+    """
+    if b'\x00' in raw:
+        return raw
+    try:
+        raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return raw
+    return raw.replace(b'\r\n', b'\n')
+
+
 def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
     """把发布包内自带的上游源码同步进 `UPSTREAM_DIR`（保留用户数据与定制）。
 
@@ -533,7 +537,8 @@ def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
 
     上游仓库的公开地址已不可用，源码随面板的 Release 包分发（包内 `upstream/`）。
     在这里同步而不是在 `update_upstream` 里另下载一份，是因为**包是验过签的**：
-    上游代码由此也落在签名信任链里；而 `update_upstream` 的 git 拉取没有这层保证。
+    上游代码由此与面板走同一条下载与校验路径；而 `update_upstream` 的 git 拉取
+    没有这层保证（也正因为上游仓库已不可访问，包里这份才是可靠来源）。
 
     三条克制：
       · 只处理**非 git** 的上游目录 —— git 部署有自己的通道（拉远端），那份源码
@@ -578,15 +583,24 @@ def _sync_bundled_upstream(src: Path, rep: Reporter) -> int:
             continue
         dst = UPSTREAM_DIR / rel
         try:
+            incoming = _normalize_eol(f.read_bytes())
             if dst.is_file():
-                if dst.read_bytes() == f.read_bytes():
+                if dst.read_bytes() == incoming:
                     continue
+                # 注意：**内容一致、只差行尾**时也要重写（changed 照计）——已经带 CRLF
+                # 更新过的机器，本地脚本是坏的（容器里执行不了），只比原始字节会两边
+                # 都是 CRLF、被判成「没变」，于是永远修不回来。归一遍之后，下次更新
+                # 就真的「没变」了。
                 changed += 1
             else:
                 added += 1
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(f, dst)
-            shutil.copymode(f, dst)
+            # 先写临时文件再原子替换：中途断电/被杀不会留下半个 .go 文件（网关构建
+            # 会因此直接失败），也不会让容器读到半截脚本。
+            tmp = dst.with_name(dst.name + '.wbtmp')
+            tmp.write_bytes(incoming)
+            shutil.copymode(f, tmp)
+            os.replace(tmp, dst)
         except OSError as exc:
             rep.log(f'  同步 {rel} 失败：{exc}', 'warn')
 
@@ -622,68 +636,25 @@ def _fetch_failed_hint(out: str, pinned: str = '') -> str:
             + (f'：{out.strip()[:200]}' if out.strip() else ''))
 
 
-def restore_local_dockerfile(rep: Reporter) -> None:
-    """把上游覆盖掉的本地 Dockerfile 定制装回去。
-
-    为什么需要：本机无法直连 proxy.golang.org，Dockerfile 里的
-    GOPROXY=goproxy.cn 与清华 apk 源是构建可用的前提。上游仓库没有这些
-    定制，而每次更新都会先 `git checkout -- .` 丢弃本地改动——不装回来，
-    下一次「更新上游」就会因为拉不到 Go 模块而构建失败（2026-09-16 实际
-    发生过一次）。定制来源：仓库内 .local-config/Dockerfile（手工维护）。
-
-    注意：不要给这两个文件设 skip-worktree / assume-unchanged 标记——
-    那会让 `git reset --hard` 报 "Entry ... not uptodate" 并阻断更新
-    （2026-09-16 的另一处故障根因，已清除）。
-    """
-    local = UPSTREAM_DIR / '.local-config' / 'Dockerfile'
-    work = UPSTREAM_DIR / 'Dockerfile'
-    if not local.is_file():
-        rep.log('未找到 .local-config/Dockerfile，跳过本地 Dockerfile 定制恢复', 'warn')
-        return
-    try:
-        want = local.read_text(encoding='utf-8')
-        cur = work.read_text(encoding='utf-8') if work.is_file() else ''
-    except OSError as exc:
-        rep.log(f'本地 Dockerfile 定制恢复失败：{exc}', 'warn')
-        return
-    if cur == want:
-        rep.log('Dockerfile 本地定制已是目标状态')
-        return
-    work.write_text(want, encoding='utf-8')
-    rep.log('已恢复 Dockerfile 本地定制（GOPROXY / apk 镜像源）')
-
-
-def apply_source_patches(rep: Reporter) -> None:
-    """重施 Go 源码本地补丁（新会话轮转 / 额度耗尽跳过 等）。
-
-    为什么需要：`git checkout -- .` 与 reset 会丢弃所有本地改动，补丁必须
-    在构建前装回去。补丁文件维护在 UPSTREAM_DIR/local-patches/patches/，
-    由 apply-patches.sh 逐条应用（幂等：已应用的自动跳过）。
-
-    fail-closed：补丁失败（上游改了同区域代码导致冲突）→ 中止更新并保留
-    旧容器继续服务。不做"打不上就算了"的降级——静默少了本地能力比更新
-    失败更危险（行为与预期不符且难以发现）。
-    """
-    script = UPSTREAM_DIR / 'local-patches' / 'apply-patches.sh'
-    if not script.is_file():
-        rep.log('未找到 local-patches/apply-patches.sh，跳过源码补丁重施', 'warn')
-        return
-    rc, out = run(['bash', str(script)], rep=rep, check=False)
-    if rc != 0:
-        rep.log('源码补丁重施失败（上游可能改了同区域代码）', 'error')
-        rep.log('  处理指引：对照 UPSTREAM_DIR/local-patches/backup/ 修订补丁，'
-                '或临时把冲突补丁移出 patches/ 后重试。', 'error')
-        raise RuntimeError('本地源码补丁无法应用，更新已中止（旧容器继续服务）')
-    rep.log('本地源码补丁已就绪')
-
-
-
 def update_upstream(rep: Reporter) -> None:
     rep.step('更新上游 workbuddy2api')
 
     if not (UPSTREAM_DIR / '.git').is_dir():
-        rep.log(f'{UPSTREAM_DIR} 是随包分发的上游（不是 git 仓库）：'
-                '代码随管理端一起更新，本次不单独更新上游')
+        # 随包分发的上游：源码就在发布包里（原仓库已不可用），所以这条路径**也要取包**
+        # —— 与 update_manager 共用同一次下载与解压，`--target both` 不会下两遍。
+        #
+        # 早先这里直接 return，于是「全部更新」在管理端已是最新时什么都不做：包里带着
+        # 更新的上游源码，却同步不进去（管理端那条路径在版本相同时先短路返回了）。
+        new_root, _info = _release_root(rep)
+        changed = _sync_bundled_upstream(new_root / 'upstream', rep)
+        if changed:
+            # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），同步会盖掉
+            # 端口收敛，所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
+            enforce_local_bind(rep)
+            rep.log('上游源码有变化，重建容器使其生效…')
+            rebuild_upstream(rep)
+        else:
+            rep.log('上游源码与包内一致，无需重建')
         return
 
     which = shutil.which('git')
@@ -783,9 +754,6 @@ def update_upstream(rep: Reporter) -> None:
             rep.log(f'恢复 docker-compose.yml 失败：{exc}', 'warn')
             rep.log('  你的定制仍保存在本次更新的备份 patch 里，可手动恢复', 'warn')
 
-    # Retain the deployed mirror and customization hooks.
-    restore_local_dockerfile(rep)
-    apply_source_patches(rep)
     # 4) 恢复安全基线
     enforce_local_bind(rep)
 
@@ -808,6 +776,14 @@ def rebuild_upstream(rep: Reporter) -> None:
       · 常规的上游更新（上面那段 git 流程之后）；
       · 面板更新时同步了包内自带的上游源码之后（源码变了必须重建才生效）。
     """
+    # 先确认真的能操作 docker，再谈重建。失败时**跳过上游而不是抛错**：
+    # 上游的问题不该把管理端也拖死 —— `--target both` 里管理端是用户唯一能操作的面板，
+    # 而 socket 权限这种事用户在面板里改不了，抛错只会让整个更新白跑。
+    unusable = _docker_unusable_hint()
+    if unusable:
+        rep.log(f'跳过上游重建：{unusable}', 'error')
+        return
+
     missing = _missing_copy_sources()
     if missing:
         rep.log('构建预检未通过：Dockerfile 引用了不存在的文件', 'error')
@@ -863,8 +839,8 @@ def _clear_version_cache(rep: Reporter) -> None:
         pass
 
 
-# 安全关键文件：它们承载验签逻辑与信任锚，改了必须人工审查
-_TRUST_ANCHOR_FILES = ('update.py', 'release-signing-key.pub')
+# 安全关键文件：更新逻辑本身，改了值得人工看一眼
+_REVIEW_FILES = ('update.py',)
 
 
 def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
@@ -876,9 +852,10 @@ def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
     处理方式完全不同：
 
       1. 只新增了工具脚本（如 check-upstream.sh）→ **无需任何操作**
-      2. 修改了非信任锚文件（如 systemd 单元）→ 看一眼即可，想要新功能就覆盖
-      3. 修改了信任锚（update.py / 公钥）→ **必须人工比对**，确认是官方改动
-         而非被替换，再覆盖；这是整条供应链防护的最后一关
+      2. 修改了普通脚本 / systemd 单元 → 看一眼即可，想要新功能就覆盖
+      3. 修改了 update.py（更新器自己）→ 建议比对一眼：它决定「装进来的东西
+         装到哪、怎么重启」。这类改动本来就该由维护者看懂，出问题也是更新器
+         这类文件最先暴露
 
     ## 还要说清「不同步的代价」（issue #55）
 
@@ -888,15 +865,14 @@ def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
     更新器。所以这里必须给出**代价**与**一条可执行的命令**，而不是只留下
     「需人工确认」四个字。
     """
-    anchors = [f for f in modified if Path(f).name in _TRUST_ANCHOR_FILES]
-    others = [f for f in modified if Path(f).name not in _TRUST_ANCHOR_FILES]
+    anchors = [f for f in modified if Path(f).name in _REVIEW_FILES]
+    others = [f for f in modified if Path(f).name not in _REVIEW_FILES]
 
     if anchors:
-        rep.log('   ⚠️ 其中包含**验签相关文件**：' + '、'.join(anchors), 'warn')
-        rep.log('      这类文件决定「更新包是否可信」，改动必须人工确认后才覆盖，'
-                '否则供应链防护可能被绕过。', 'warn')
+        rep.log('   ⚠️ 其中包含更新器自身：' + '、'.join(anchors), 'warn')
+        rep.log('      它决定「文件装到哪、服务怎么重启」，建议比对一眼再覆盖。', 'warn')
     elif others:
-        rep.log('   这些是普通脚本/配置（不含验签逻辑），看过差异后按需覆盖即可。')
+        rep.log('   这些是普通脚本/配置（不含更新逻辑），看过差异后按需覆盖即可。')
     elif added:
         rep.log('   仅新增文件、未改动现有内容 —— 不影响本次更新，可以不处理。')
 
@@ -919,8 +895,9 @@ def _explain_deploy_risk(rep: Reporter, modified: list[str], added: list[str],
 def _deploy_sync_enabled() -> bool:
     """更新管理端时，`deploy/` 是否随包更新。**默认更新**，`WB_SYNC_DEPLOY=0` 关闭。
 
-    见 `update_manager` 里那段说明：包在解压前已验签，覆盖 deploy/ 与覆盖 server/
-    同一性质；而**不**更新的代价是更新器永远是旧的（它本身就在 deploy/ 里）。
+    见 `update_manager` 里那段说明：包在解压前已核对大小与 sha256 摘要，覆盖 deploy/
+    与覆盖 server/ 是同一性质（同一份下载来的内容）；而**不**更新的代价是更新器
+    永远是旧的（它本身就在 deploy/ 里）。
     """
     return os.environ.get('WB_SYNC_DEPLOY', '').strip() != '0'
 
@@ -929,9 +906,9 @@ def _sync_deploy(new_deploy: Path, install_dir: Path, backup: Path,
                  rep: Reporter) -> tuple[list[str], list[str]]:
     """把包内的 deploy/ 覆盖到安装目录（仅在与本地不同时动手），返回 (新增, 修改)。
 
-    调用前提：包**已经通过验签**（`verify_release_signature` 在解压之前执行）。
-    因此这里的覆盖与替换 server/ 是同一性质的 —— 都是维护者签过名的内容，
-    不会降级信任链。仍然先备份，便于回退。
+    调用前提：包**已经通过大小与 sha256 校验**（`verify_download` 在解压之前执行）。
+    因此这里的覆盖与替换 server/ 是同一性质的 —— 都是同一份下载来的内容。
+    仍然先备份，便于回退。
 
     抽成独立函数是为了可测：它决定「更新器自己能不能被更新」，而这段逻辑
     过去只存在于 `update_manager` 内联代码里，改错了没有测试会红。
@@ -1032,6 +1009,49 @@ def _missing_copy_sources() -> list[str]:
     return missing
 
 
+# 容器里拿不到 docker.sock 权限时该怎么做。抽成常量是因为两处都要用
+# （重建前的预检、构建失败后的诊断）—— 措辞必须一致，否则用户会以为是两个问题。
+_DOCKER_SOCKET_RECIPE = (
+    '容器访问不了宿主 docker（/var/run/docker.sock 权限不足）。\n'
+    "  1) 宿主取 GID：stat -c '%g' /var/run/docker.sock\n"
+    '  2) 写进 .env：DOCKER_GID=<上面那个 GID>（compose 已用 group_add 引用它）\n'
+    '  3) 重建管理端容器：docker compose up -d workbuddy-manager\n'
+    '  若你的 compose 里还没有 group_add，就在 workbuddy-manager 服务下加一行：\n'
+    '      group_add: ["${DOCKER_GID}"]\n'
+    '  （不需要在容器内更新上游的话，把 compose 里挂 docker.sock 那一行注释掉即可，'
+    '相关功能会如实降级。）'
+)
+
+
+def _docker_unusable_hint() -> str:
+    """docker 用不了时返回可照做的提示，能用则返回空串。
+
+    为什么要预检：socket 权限不足时 `docker compose up` 只会给一句
+    「permission denied while trying to connect to the Docker daemon socket」，
+    而容器里没有 root 可变 —— 用户拿着这句话无从下手。
+
+    判据是**实际能不能跑通 `docker info`**（与界面层的
+    `server/services/updater.py:can_control_docker` 同一口径），不是"在不在容器里"。
+    """
+    try:
+        proc = subprocess.run(['docker', 'info'], capture_output=True, timeout=8)
+    except Exception:  # noqa: BLE001
+        return _docker_unusable_text()
+    if proc.returncode != 0:
+        return _docker_unusable_text()
+    return ''
+
+
+def _docker_unusable_text() -> str:
+    """区分两种"用不了"：容器里是 socket 权限，宿主上是没装/连不上。"""
+    if in_container():
+        return _DOCKER_SOCKET_RECIPE
+    return ('本机 docker 不可用（没装 docker，或当前用户连不上 daemon）。\n'
+            '  自查：docker info\n'
+            '  宿主机部署请安装 docker 并确认当前用户在 docker 组；'
+            '容器部署请确认挂了 docker.sock 且配了 group_add。')
+
+
 def _diagnose_build_failure(out: str) -> str:
     """把 docker 构建失败的长日志归纳成一句人话。"""
     low = (out or '').lower()
@@ -1042,6 +1062,10 @@ def _diagnose_build_failure(out: str) -> str:
         return '磁盘空间不足，请清理后重试'
     if any(k in low for k in ('dial tcp', 'i/o timeout', 'temporary failure', 'connection refused')):
         return '网络问题（拉取基础镜像或依赖失败），稍后重试'
+    # socket 连不上要单独判：它的修法是给容器补组，而不是"换 root 执行"
+    # （容器里根本没有 root 可变，那句提示会把人带偏）。
+    if 'docker.sock' in low or 'docker daemon' in low:
+        return _DOCKER_SOCKET_RECIPE
     if 'permission denied' in low:
         return '权限不足，请确认以 root 或具备 docker 权限的用户执行'
     return ''
@@ -1183,175 +1207,430 @@ def wait_upstream_ready(rep: Reporter) -> bool:
 
 
 # ── 管理端更新 ───────────────────────────────────────────
-def update_manager(rep: Reporter) -> None:
-    rep.step('更新管理端')
-
-    # 1) 取最新 Release
-    try:
-        rel = http_json(f'https://api.github.com/repos/{MANAGER_REPO}/releases/latest')
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f'获取 Release 失败：HTTP {exc.code}') from exc
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f'无法访问 GitHub API：{exc}') from exc
-
-    tag = rel.get('tag_name') or ''
-    rep.log(f'最新版本：{tag or "(未知)"}')
-    rep.set_target_version(tag)
-
-    current = read_local_version()
-    if current and tag and current == tag.lstrip('v'):
-        rep.log(f'当前已是最新版本（{tag}）')
-        return
-
+def fetch_release_via_api() -> dict:
+    """经 GitHub API 取最新 Release（认证后 5000 次/小时，未认证 60 次/小时/IP）。"""
+    rel = http_json(f'https://api.github.com/repos/{MANAGER_REPO}/releases/latest')
     assets = rel.get('assets') or []
     pkg = next((a for a in assets if str(a.get('name', '')).endswith('.tar.gz')), None)
     if not pkg:
         raise RuntimeError('该 Release 未提供 .tar.gz 产物')
-    sig = next((a for a in assets
-                if str(a.get('name', '')).endswith('.tar.gz.sig')), None)
+    return {
+        'tag': rel.get('tag_name') or '',
+        'pkg_url': pkg['browser_download_url'],
+        'pkg_name': Path(str(pkg.get('name') or 'pkg.tar.gz')).name,
+        # 下载后据此核对（见 verify_download）：GitHub 给每个资产带 size 与
+        # sha256 摘要（形如 `sha256:…`，老响应里可能没有 → 那时只能比对大小）。
+        'pkg_size': pkg.get('size'),
+        'pkg_digest': pkg.get('digest'),
+    }
 
-    # 2) 下载并解压到临时目录
-    with tempfile.TemporaryDirectory(prefix='wbm-update-') as tmpdir:
-        tmp = Path(tmpdir)
-        # 只用文件名部分：pkg['name'] 来自网络响应，虽然 GitHub 不允许名字含
-        # 路径分隔符，但"用远端数据拼本地路径"与早前的路径穿越是同一类错误，
-        # 这里按同名原则做净化（Path(...).name 会丢掉任何目录成分）
-        archive = tmp / Path(str(pkg.get('name') or 'pkg.tar.gz')).name
-        download(pkg['browser_download_url'], archive, rep)
 
-        # 验签必须在下解压之前：先确认「这个包是你签的」，再谈包里的内容
-        verify_release_signature(
-            archive,
-            str(sig.get('browser_download_url') or '') if sig else '',
-            rep,
-        )
+def fetch_release_via_redirect(latest_url: str | None = None,
+                               repo: str | None = None) -> dict:
+    """不走 GitHub API 的回退：releases/latest 的 302 重定向拿最新 tag。
 
-        rep.log('解压…')
+    API 未认证限额只有 60 次/小时/IP，共享出口（TUN/系统代理）极易被同出口
+    用户打满，表现为偶发 HTTP 403；而 github.com 的网页端与
+    releases/download 资产下载不受该配额限制。资产名按发布惯例
+    workbuddy-manager-<tag>.tar.gz 构造（历届 Release 均如此）。
+    """
+    repo = repo or MANAGER_REPO
+    req = urllib.request.Request(
+        latest_url or f'https://github.com/{repo}/releases/latest',
+        headers={'User-Agent': 'workbuddy-manager-updater'})
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        opener.open(req, timeout=30)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            raise RuntimeError(f'releases/latest 回退探测失败：HTTP {exc.code}') from exc
+        loc = exc.headers.get('Location') or ''
+        tag = urllib.parse.unquote(loc.split('/tag/', 1)[-1].split('?')[0].split('#')[0])
+        if not tag or '/' in tag:
+            raise RuntimeError(f'releases/latest 重定向未含有效 tag：{loc}') from exc
+    else:
+        raise RuntimeError('releases/latest 未按预期重定向（网络异常或路径变更）')
+
+    base = f'https://github.com/{repo}/releases/download/{tag}'
+    pkg_name = f'workbuddy-manager-{tag}.tar.gz'
+    # 这条路径拿不到资产的 sha256（只有重定向里的 tag），下载后只校验完整性、
+    # 并把本地摘要打进日志供人工比对 —— 见 verify_download。
+    return {
+        'tag': tag,
+        'pkg_url': f'{base}/{pkg_name}',
+        'pkg_name': pkg_name,
+        'pkg_size': None,
+        'pkg_digest': '',
+    }
+
+
+def _system_site_writable() -> bool:
+    """系统 site-packages 能不能直接写。
+
+    判据是**真实可写性**，不是 uid：容器部署里进程是 uid 10001，而镜像里的依赖
+    是 root 装的、目录归 root —— 这时只能装到用户站点。宿主部署（root 或 venv）
+    则是可写的，不该平白引入 --user 去改变既有安装位置。
+    """
+    try:
+        purelib = sysconfig.get_path('purelib')
+    except Exception:  # noqa: BLE001
+        return False
+    if not purelib:
+        return False
+    p = Path(purelib)
+    # 目录本身与父目录都要能写：pip 要新建 dist-info，也可能要新建目录
+    return os.access(p, os.W_OK) and os.access(p.parent, os.W_OK)
+
+
+# 只在 pip 的**输出**里出现这些字样时才认为"可写性判定可能误判了"
+_PERMISSION_HINTS = ('permission denied', 'read-only', 'eacces')
+
+
+def install_requirements(req: Path, rep: Reporter) -> None:
+    """安装 Python 依赖，失败则抛错。
+
+    - 与 install.sh 一致：先带 `--break-system-packages`（PEP 668 的系统 Python
+      不带它会拒装），不认这个参数的旧 pip 会失败，再不带它重试一次。
+    - 系统 site-packages 不可写时（容器以非 root 运行）改用 `--user`：落到
+      `PYTHONUSERBASE`（镜像里钉成 /app/.local，见 Dockerfile）。用户站点排在
+      全站 site-packages **之前**，所以能压住旧版本；而 `--user` 不在 PEP 668 的
+      豁免名单里，所以两个参数要一起给。
+
+    为什么必须支持"装到别处"：容器形态下唯一能装依赖的就是这条路径，装不上就等于
+    这个部署**永远升不上去**（issue #157 的另一半——#160 只做到"失败要响"）。
+    """
+    py = sys.executable
+    use_user = not _system_site_writable()
+    target = ['--user'] if use_user else []
+    rep.log('检查 / 安装 Python 依赖…')
+    if use_user:
+        rep.log(f'系统 site-packages 不可写，依赖改装到用户站点（{site.getusersitepackages()}）')
+
+    attempts = [target + ['--break-system-packages'], target]
+    code, out = 0, ''
+    for extra in attempts:
+        code, out = run([py, '-m', 'pip', 'install', '-q', *extra, '-r', str(req)],
+                        rep=rep, check=False)
+        if code == 0:
+            return
+
+    # 可写性判定可能误判（ACL、只读挂载…）：只在输出看起来是权限问题时补一次 --user，
+    # 免得给真正的网络/解析失败也套上 --user 掩盖原因。
+    if not use_user and any(h in (out or '').lower() for h in _PERMISSION_HINTS):
+        code, _ = run([py, '-m', 'pip', 'install', '-q', '--user',
+                       '--break-system-packages', '-r', str(req)], rep=rep, check=False)
+        if code == 0:
+            return
+
+    raise RuntimeError(f'Python 依赖安装失败（exit {code}），已中止更新，当前版本保持不变')
+
+
+# ── 发布包的一次性取用 ────────────────────────────────────────────
+# 上游源码只存在于发布包内（原仓库已不可用），所以**更新上游也得取一次包**。
+# `--target both` 时两条路径用的是同一个包 —— 缓存住：别查两遍版本、别下两遍、
+# 也别解压两遍。更新器是单线程的，用模块级状态即可。
+_release_info_cache: dict | None = None
+_release_cache: tuple[Path, dict] | None = None
+_release_tmp: tempfile.TemporaryDirectory | None = None
+
+
+def read_package_version(archive: Path) -> str:
+    """从发布包里读出 `.version`（只解那一个成员，不展开整包）。
+
+    两条路径都用到它：离线升级包要靠它拿版本号（不查 GitHub），面板上传时也用
+    它回显「包内版本」。读 64 字节足够（里面就是 `v1.0.86` 这种短串）。
+    """
+    try:
         with tarfile.open(archive, 'r:gz') as tf:
-            _safe_extract(tf, tmp)
-        roots = [p for p in tmp.iterdir() if p.is_dir()]
-        if len(roots) != 1:
-            raise RuntimeError('压缩包结构异常（应含单一顶层目录）')
-        new_root = roots[0]
+            for member in tf:
+                name = member.name.replace('\\', '/')
+                if name.count('/') == 1 and name.endswith('/.version'):
+                    fh = tf.extractfile(member)
+                    return fh.read(64).decode('utf-8', 'replace').strip() if fh else ''
+    except (OSError, tarfile.TarError) as exc:
+        raise RuntimeError(
+            f'升级包读不了（{exc}）—— 确认它是发布页面下载的 .tar.gz，且下载完整') from exc
+    return ''
 
-        new_server = new_root / 'server'
-        new_web_out = new_root / 'web' / 'out'
-        if not (new_server / 'main.py').is_file():
-            raise RuntimeError('新包缺少 server/main.py，中止更新')
-        if not (new_web_out / 'index.html').is_file():
-            raise RuntimeError('新包缺少 web/out/index.html，中止更新')
 
-        # 3) 备份当前代码后替换
-        ts = time.strftime('%Y%m%d-%H%M%S')
-        backup = INSTALL_DIR / f'backup-{ts}'
-        backup.mkdir(parents=True, exist_ok=True)
-        rep.log(f'备份当前版本到 {backup}')
-        shutil.copytree(INSTALL_DIR / 'server', backup / 'server', dirs_exist_ok=True)
-        if (INSTALL_DIR / 'web' / 'out').is_dir():
-            shutil.copytree(INSTALL_DIR / 'web' / 'out', backup / 'web-out', dirs_exist_ok=True)
+def offline_package_info(rep: Reporter) -> dict:
+    """离线升级包的元信息（不联网）。
 
-        rep.log('替换 server/')
-        shutil.rmtree(INSTALL_DIR / 'server', ignore_errors=True)
-        shutil.copytree(new_server, INSTALL_DIR / 'server')
-        # 清掉旧字节码，避免加载到过期模块
-        for pc in (INSTALL_DIR / 'server').rglob('__pycache__'):
-            shutil.rmtree(pc, ignore_errors=True)
+    版本号取自包内 `.version` 而不是文件名：文件名谁都能改，而 `.version` 是
+    打包时写进去的（面板侧也按同一份读，两边口径一致）。
+    """
+    archive = Path(OFFLINE_PACKAGE)
+    if not archive.is_file():
+        raise RuntimeError(f'找不到离线升级包：{archive}')
+    size = archive.stat().st_size
+    if size < 100_000:
+        raise RuntimeError('离线升级包过小，不像是完整的发布包（下载可能中断了）')
+    version = read_package_version(archive)
+    if not version:
+        raise RuntimeError('离线升级包里没有 .version —— 不是本项目的发布包，已中止')
+    rep.log(f'使用离线升级包：{archive.name}（{size / 1024 / 1024:.1f} MB，包内版本 {version}）')
+    if not OFFLINE_PACKAGE_SHA256:
+        rep.log('未提供发布页 sha256：本次只校验包能不能解开、内容结构对不对，'
+                '包本身的可信度取决于你从哪拿到它', 'warn')
+    return {
+        'tag': version,
+        'pkg_url': '',
+        'pkg_name': archive.name,
+        'pkg_size': None,          # 没有独立的「期望大小」（文件就在本机）
+        'pkg_digest': f'sha256:{OFFLINE_PACKAGE_SHA256}' if OFFLINE_PACKAGE_SHA256 else '',
+        'local_package': str(archive),
+    }
 
-        rep.log('替换 web/out/')
-        target_web = INSTALL_DIR / 'web' / 'out'
-        if target_web.is_dir():
-            shutil.rmtree(target_web, ignore_errors=True)
-        shutil.copytree(new_web_out, target_web)
 
-        # deploy/ 里的脚本**默认随包更新**（`WB_SYNC_DEPLOY=0` 可关掉）。
-        #
-        # 为什么默认更新（issue #55）：发布包在**解压之前**就已经验签，所以包内的
-        # deploy/ 与 server/ 属于同一批「维护者签过名的内容」——覆盖它与覆盖
-        # server/ 是同一性质，不会降级信任链（验签用的是**本地**这一份的公钥，
-        # 只有验签通过之后才会走到这里）。
-        #
-        # 反过来不更新的代价很实在：**更新器本身就在 deploy/ 里**。不换它意味着
-        # 以后每次都还用旧逻辑，它修过的问题永远到不了用户机器上——#28 修过的
-        # compose 探测就是这样丢的，#55 又报了一次同一个毛病。
-        #
-        # 保留关闭开关，是给少数确实手工维护 deploy/ 的部署留退路（例如自己改过
-        # systemd 单元、或另有分发流程）。
-        #
-        # 提示仍要**分清轻重**：早先无论什么差异都只说「已跳过同步」，于是
-        # 「新增了一个无害的检查脚本」与「验签逻辑被改」看起来一模一样，管理员
-        # 无从判断该紧张还是该忽略（实测：有用户为此专门来问）。现在逐文件标注
-        # 新增/修改，并把安全关键文件单独点出来。
-        new_deploy = new_root / 'deploy'
-        if new_deploy.is_dir():
-            here = Path(__file__).resolve()
-            # 先算差异（用于提示），再决定是否同步
-            added: list[str] = []
-            modified: list[str] = []
-            for src in sorted(new_deploy.rglob('*')):
-                if not src.is_file():
-                    continue
-                rel = src.relative_to(new_deploy)
-                dst = INSTALL_DIR / 'deploy' / rel
-                try:
-                    if not dst.is_file():
-                        added.append(str(rel))
-                    elif dst.read_bytes() != src.read_bytes():
-                        modified.append(str(rel))
-                except OSError:
+def _fetch_release_info(rep: Reporter) -> dict:
+    """取最新 Release 的元信息（**不下载**）。同一进程内只查一次。
+
+    API 优先（认证后 5000 次/小时；未认证仅 60 次/小时/IP，共享出口极易被同出口
+    用户打满而 403）；失败时回退到 releases/latest 的 302 重定向（不走 API、无配额）。
+
+    指定了离线升级包（`WB_UPDATE_PACKAGE`）时不联网：内网机器上这条路本来就是
+    为了「完全拿不到 GitHub」才存在的。
+    """
+    global _release_info_cache
+    if _release_info_cache is not None:
+        return _release_info_cache
+
+    if OFFLINE_PACKAGE:
+        _release_info_cache = offline_package_info(rep)
+        return _release_info_cache
+
+    info: dict | None = None
+    api_error = ''
+    try:
+        info = fetch_release_via_api()
+    except Exception as exc:  # noqa: BLE001
+        api_error = f'{type(exc).__name__}: {exc}'
+        rep.log(f'GitHub API 不可用（{api_error}），回退到 releases/latest 重定向…', 'warn')
+    if info is None:
+        try:
+            info = fetch_release_via_redirect()
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f'获取 Release 失败：API {api_error}；回退路径也失败：{exc}') from exc
+
+    _release_info_cache = info
+    return info
+
+
+def _release_root(rep: Reporter, info: dict | None = None) -> tuple[Path, dict]:
+    """下载 + 校验 + 解压最新发布包，返回 `(顶层目录, info)`。进程内只做一次。
+
+    校验必须在下解压之前：先确认「这个包下全了、没被换过」，再谈包里的内容。
+    解压目录的生命周期到本次更新结束（`main()` 的 finally 回收）—— 因为
+    `update_upstream` 与 `update_manager` 要共用这一份。
+    """
+    global _release_cache, _release_tmp
+    if _release_cache is not None:
+        return _release_cache
+    if info is None:
+        info = _fetch_release_info(rep)
+
+    # pkg_name 已在 fetch_release_via_api / fetch_release_via_redirect 里按同名原则
+    # 净化（Path(...).name 丢掉任何目录成分）：下载地址来自网络响应，"用远端数据拼
+    # 本地路径"与早前的路径穿越是同一类错误。
+    _release_tmp = tempfile.TemporaryDirectory(prefix='wbm-update-')
+    tmp = Path(_release_tmp.name)
+    archive = tmp / info['pkg_name']
+    local = str(info.get('local_package') or '')
+    if local:
+        # 离线升级包：文件就在本机，复制一份到临时目录只是让后续步骤共用同一条
+        # 路径（解压、清理都在 tmp 里，不动用户上传的那份原件）。
+        shutil.copyfile(local, archive)
+        rep.log('离线升级包已就位（跳过下载）')
+    else:
+        download(info['pkg_url'], archive, rep)
+    verify_download(archive, info, rep)
+
+    rep.log('解压…')
+    with tarfile.open(archive, 'r:gz') as tf:
+        _safe_extract(tf, tmp)
+    roots = [p for p in tmp.iterdir() if p.is_dir()]
+    if len(roots) != 1:
+        raise RuntimeError('压缩包结构异常（应含单一顶层目录）')
+
+    _release_cache = (roots[0], info)
+    return _release_cache
+
+
+def _cleanup_release_cache() -> None:
+    """回收解压出来的临时目录（`main()` 的 finally 里调）。"""
+    global _release_info_cache, _release_cache, _release_tmp
+    _release_info_cache = None
+    _release_cache = None
+    if _release_tmp is not None:
+        try:
+            _release_tmp.cleanup()
+        except Exception:  # noqa: BLE001
+            pass
+        _release_tmp = None
+
+
+def swap_dir(incoming: Path, target: Path) -> None:
+    """用 incoming 目录**原子替换** target（同目录 staging + os.replace）。
+
+    为什么不能 rmtree + copytree：复制中途失败（磁盘满、权限、被杀）会留下不完整的
+    server/，服务再也起不来，而备份不会自动恢复。这里先把新内容完整复制到
+    `target.new`，成功后再交换；交换失败会把旧目录换回去。
+
+    注意：覆盖粒度是**整个目录**，所以调用方给的 incoming 必须是完整的一份
+    （发布包解压出来的那份），不能是增量。
+    """
+    target = Path(target)
+    old = target.with_name(target.name + '.old')
+    staging = target.with_name(target.name + '.new')
+    # 清理上次中断留下的残留（它们已不可信）
+    for stale in (old, staging):
+        shutil.rmtree(stale, ignore_errors=True)
+    shutil.copytree(incoming, staging)
+    had_old = target.exists()
+    if had_old:
+        os.replace(target, old)
+    try:
+        os.replace(staging, target)
+    except Exception:
+        if had_old and old.exists():
+            os.replace(old, target)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def update_manager(rep: Reporter) -> None:
+    rep.step('更新管理端')
+
+    # 1) 取最新 Release 的元信息（不下载）。API 优先、失败回退 302 —— 见
+    #    _fetch_release_info；上游那条路径也走它，所以回退只修一处。
+    info = _fetch_release_info(rep)
+    tag = info['tag']
+    rep.log(('升级包版本：' if info.get('local_package') else '最新版本：') + f'{tag or "(未知)"}')
+    rep.set_target_version(tag)
+
+    current = read_local_version()
+    if not info.get('local_package') and current and tag and current == tag.lstrip('v'):
+        rep.log(f'当前已是最新版本（{tag}）')
+        return
+    if info.get('local_package'):
+        # 离线包是用户**显式指定**的：即使版本号与当前相同也继续装（重装/修复
+        # 正是它最常见的用法之一），所以这里不套用上面的「已是最新就跳过」。
+        rep.log('离线升级包：按你指定的包安装，不比较版本新旧')
+
+    pkg_name = info['pkg_name']
+    pkg_url = info['pkg_url']
+
+    # 2) 取包（下载 + 校验大小/摘要 + 解压）。与 update_upstream 共用同一次：
+    #    `--target both` 时只下一次、只解压一次（上游源码也在包里）。
+    new_root, info = _release_root(rep, info)
+
+    new_server = new_root / 'server'
+    new_web_out = new_root / 'web' / 'out'
+    if not (new_server / 'main.py').is_file():
+        raise RuntimeError('新包缺少 server/main.py，中止更新')
+    if not (new_web_out / 'index.html').is_file():
+        raise RuntimeError('新包缺少 web/out/index.html，中止更新')
+
+    # 依赖必须在**替换代码之前**装：装失败就中止，安装目录一个字节都不动，
+    # 旧版本继续运行。早先是换完代码再 `check=False` 装依赖，pip 失败也照样
+    # 标记成功并重启，新代码缺依赖起不来（issue #157）。
+    new_req = new_server / 'requirements.txt'
+    if new_req.is_file():
+        install_requirements(new_req, rep)
+
+    # 3) 备份当前代码后替换
+    ts = time.strftime('%Y%m%d-%H%M%S')
+    backup = INSTALL_DIR / f'backup-{ts}'
+    backup.mkdir(parents=True, exist_ok=True)
+    rep.log(f'备份当前版本到 {backup}')
+    shutil.copytree(INSTALL_DIR / 'server', backup / 'server', dirs_exist_ok=True)
+    if (INSTALL_DIR / 'web' / 'out').is_dir():
+        shutil.copytree(INSTALL_DIR / 'web' / 'out', backup / 'web-out', dirs_exist_ok=True)
+
+    rep.log('替换 server/')
+    swap_dir(new_server, INSTALL_DIR / 'server')
+    # 清掉旧字节码，避免加载到过期模块
+    for pc in (INSTALL_DIR / 'server').rglob('__pycache__'):
+        shutil.rmtree(pc, ignore_errors=True)
+
+    rep.log('替换 web/out/')
+    target_web = INSTALL_DIR / 'web' / 'out'
+    target_web.parent.mkdir(parents=True, exist_ok=True)
+    swap_dir(new_web_out, target_web)
+
+    # deploy/ 里的脚本**默认随包更新**（`WB_SYNC_DEPLOY=0` 可关掉）。
+    #
+    # 为什么默认更新（issue #55）：包在**解压之前**已经核对过大小与摘要，包内的
+    # deploy/ 与 server/ 属于同一份下载来的内容 —— 覆盖它与覆盖 server/ 是
+    # 同一性质。
+    #
+    # 反过来不更新的代价很实在：**更新器本身就在 deploy/ 里**。不换它意味着
+    # 以后每次都还用旧逻辑，它修过的问题永远到不了用户机器上——#28 修过的
+    # compose 探测就是这样丢的，#55 又报了一次同一个毛病。
+    #
+    # 保留关闭开关，是给少数确实手工维护 deploy/ 的部署留退路（例如自己改过
+    # systemd 单元、或另有分发流程）。
+    #
+    # 提示仍要**分清轻重**：早先无论什么差异都只说「已跳过同步」，于是
+    # 「新增了一个无害的检查脚本」与「更新器被改」看起来一模一样，管理员
+    # 无从判断该紧张还是该忽略（实测：有用户为此专门来问）。现在逐文件标注
+    # 新增/修改，并把安全关键文件单独点出来。
+    new_deploy = new_root / 'deploy'
+    if new_deploy.is_dir():
+        here = Path(__file__).resolve()
+        # 先算差异（用于提示），再决定是否同步
+        added: list[str] = []
+        modified: list[str] = []
+        for src in sorted(new_deploy.rglob('*')):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(new_deploy)
+            dst = INSTALL_DIR / 'deploy' / rel
+            try:
+                if not dst.is_file():
+                    added.append(str(rel))
+                elif dst.read_bytes() != src.read_bytes():
                     modified.append(str(rel))
-            if not (added or modified):
-                rep.log('deploy/ 与包内一致，无需同步')
-            elif _deploy_sync_enabled():
-                try:
-                    _sync_deploy(new_deploy, INSTALL_DIR, backup, rep)
-                except OSError as exc:
-                    rep.log(f'deploy/ 同步失败（继续完成本次更新）：{exc}', 'warn')
-            else:
-                rep.log('⚠️ 新包内的 deploy/ 与本地不同，已按 WB_SYNC_DEPLOY=0 '
-                        '跳过同步', 'warn')
-                if modified:
-                    rep.log('   修改（未覆盖）：' + '、'.join(modified[:8])
-                            + ('…' if len(modified) > 8 else ''), 'warn')
-                if added:
-                    rep.log('   新增（未覆盖）：' + '、'.join(added[:8])
-                            + ('…' if len(added) > 8 else ''), 'warn')
-                _explain_deploy_risk(rep, modified, added, here, backup)
+            except OSError:
+                modified.append(str(rel))
+        if not (added or modified):
+            rep.log('deploy/ 与包内一致，无需同步')
+        elif _deploy_sync_enabled():
+            try:
+                _sync_deploy(new_deploy, INSTALL_DIR, backup, rep)
+            except OSError as exc:
+                rep.log(f'deploy/ 同步失败（继续完成本次更新）：{exc}', 'warn')
+        else:
+            rep.log('⚠️ 新包内的 deploy/ 与本地不同，已按 WB_SYNC_DEPLOY=0 '
+                    '跳过同步', 'warn')
+            if modified:
+                rep.log('   修改（未覆盖）：' + '、'.join(modified[:8])
+                        + ('…' if len(modified) > 8 else ''), 'warn')
+            if added:
+                rep.log('   新增（未覆盖）：' + '、'.join(added[:8])
+                        + ('…' if len(added) > 8 else ''), 'warn')
+            _explain_deploy_risk(rep, modified, added, here, backup)
 
-        # 版本标记：界面「当前版本」与更新提醒都以它为准，必须一并替换，
-        # 否则更新后仍显示旧版本，并一直提示「发现新版本可用」
-        new_marker = new_root / '.version'
-        if new_marker.is_file():
-            shutil.copyfile(new_marker, INSTALL_DIR / '.version')
-            rep.log(f'更新版本标记：{new_marker.read_text(encoding="utf-8").strip()}')
+    # 版本标记：界面「当前版本」与更新提醒都以它为准，必须一并替换，
+    # 否则更新后仍显示旧版本，并一直提示「发现新版本可用」
+    new_marker = new_root / '.version'
+    if new_marker.is_file():
+        shutil.copyfile(new_marker, INSTALL_DIR / '.version')
+        rep.log(f'更新版本标记：{new_marker.read_text(encoding="utf-8").strip()}')
 
-        # 文档同步：界面「更新日志」直接读 CHANGELOG.md，若不同步会一直停在旧版内容
-        for name in ('CHANGELOG.md', 'README.md', 'README.en.md'):
-            src = new_root / name
-            if src.is_file():
-                shutil.copyfile(src, INSTALL_DIR / name)
-                rep.log(f'同步 {name}')
-
-        # ── 上游源码随包更新 ─────────────────────────────────────────
-        # 上游仓库的公开地址已不可用，源码随本项目的发布包分发（包内 upstream/）。放在这里
-        # 而不是 update_upstream 里另下一份，是因为**本包是验过签的**：上游代码
-        # 由此落在签名信任链内；另下一份则没有这层保证。
-        # 只有真的改动了才重建容器——上游源码在两版之间多数没变，白重建一次要等
-        # 好几分钟，还会把上游短暂停掉。
-        changed = _sync_bundled_upstream(new_root / 'upstream', rep)
-        if changed:
-            # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），而端口收敛
-            # 是在 update_upstream 里做的——那一步在本函数之前。同步会把它盖掉，
-            # 所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
-            enforce_local_bind(rep)
-            rep.log('上游源码有变化，重建容器使其生效…')
-            rebuild_upstream(rep)
-
-    # 4) 依赖有变化则重装
-    req = INSTALL_DIR / 'server' / 'requirements.txt'
-    if req.is_file():
-        py = sys.executable
-        rep.log('检查 / 安装 Python 依赖…')
-        run([py, '-m', 'pip', 'install', '-q', '-r', str(req)], rep=rep, check=False)
+    # 文档同步：界面「更新日志」直接读 CHANGELOG.md，若不同步会一直停在旧版内容
+    for name in ('CHANGELOG.md', 'README.md', 'README.en.md'):
+        src = new_root / name
+        if src.is_file():
+            shutil.copyfile(src, INSTALL_DIR / name)
+            rep.log(f'同步 {name}')
 
     rep.log(f'管理端已更新到 {tag}，重启服务以生效')
 
@@ -1520,6 +1799,9 @@ def _safe_extract(tf: tarfile.TarFile, dest: Path) -> None:
 
 # ── 入口 ─────────────────────────────────────────────────
 def main() -> int:
+    # 本地定制：受控维护版本（签名清单托管）不允许用本更新器自助升级 ——
+    # 包内 server/web 与 deploy/managed-release.json 清单对不上会让 ExecStartPre
+    # 直接拒绝启动。升级请走签名发布流程（tools/sign_release.py + 切换 releases/current）。
     if (INSTALL_DIR / 'deploy' / 'managed-release.json').exists():
         print('Managed release: use the verified deployment controller.')
         return 1
@@ -1529,6 +1811,12 @@ def main() -> int:
 
     rep = Reporter(args.target)
     rep.log(f'开始更新（target={args.target}，安装目录={INSTALL_DIR}）')
+    if PROXY_UNSUPPORTED:
+        # 只报协议名，不回显地址（里面通常带用户名与密码）
+        scheme = PROXY_UNSUPPORTED.split('://', 1)[0]
+        rep.log(f'已忽略下载代理（{scheme}）：更新器只认 http/https。'
+                f'需要更新也走代理时，单独设 WB_UPDATE_PROXY=http://…；'
+                f'面板自身的代理不受影响。', 'warn')
 
     ok = True
     try:
@@ -1552,6 +1840,8 @@ def main() -> int:
         # 幂等跳过；其余情形（含中断）在此补写 ok=false，绝不留悬空状态。
         if rep.state.get('running'):
             rep.finish(ok)
+        # 解压出来的发布包活到本次更新结束（两条路径共用），在这里回收
+        _cleanup_release_cache()
 
     rep.log('更新完成' if ok else '更新未完成，请检查上方日志')
     rep.finish(ok)

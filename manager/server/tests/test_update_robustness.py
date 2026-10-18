@@ -343,3 +343,80 @@ class BundledUpstreamSyncTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BundledUpstreamLineEndingsTest(unittest.TestCase):
+    """随包上游的行尾归一（issue #202）。
+
+    历史：包内源码是**在 Windows 上打的包**，资产里本身就带 CRLF（实测 293/298 个
+    文件）。同步是字节拷贝 → 宿主源码树里 `login.sh` 首行成了
+    `#!/usr/bin/env bash\r`，容器里解释器路径对不上，一键登录 / 签到 / 积分这些
+    依赖脚本的功能整体失效（报告方 10-06 就踩到，只能在自己那份更新器里兜底）。
+
+    这里钉四件事：
+      1. 包内 CRLF → 落地是 LF（脚本能执行）；
+      2. **已经带 CRLF 的旧树要能自愈**（只比字节会把两边都是 CRLF 判成「没变」，
+         于是那些机器永远修不回来）；
+      3. 二进制一个字节都不动（猜错的代价不对称）；
+      4. 只差行尾的文件不再算「有改动」（否则每次更新都白等一次网关重建）。
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self._tmp.name)
+        self.target = root / 'upstream-target'
+        self.bundle = root / 'bundle'
+        self._orig = worker.UPSTREAM_DIR
+        worker.UPSTREAM_DIR = self.target
+        for d in (self.target, self.bundle):
+            d.mkdir(parents=True, exist_ok=True)
+            (d / 'docker-compose.yml').write_bytes(b'services: {}\n')
+
+    def tearDown(self) -> None:
+        worker.UPSTREAM_DIR = self._orig
+        self._tmp.cleanup()
+
+    def _rep(self):
+        class R:
+            def __init__(self):
+                self.logs = []
+
+            def log(self, msg, level='info'):
+                self.logs.append(str(msg))
+
+        return R()
+
+    def test_crlf_package_lands_as_lf(self) -> None:
+        """包内带 CRLF（历史资产就是这样）→ 落地必须是 LF，否则脚本执行不了。"""
+        (self.bundle / 'login.sh').write_bytes(
+            b'#!/usr/bin/env bash\r\n# login.sh\r\necho hi\r\n')
+        worker._sync_bundled_upstream(self.bundle, self._rep())
+        raw = (self.target / 'login.sh').read_bytes()
+        self.assertNotIn(b'\r', raw, '首行 shebang 后带 \r 会让容器里的解释器路径对不上')
+        self.assertEqual(raw, b'#!/usr/bin/env bash\n# login.sh\necho hi\n')
+
+    def test_existing_crlf_tree_is_healed(self) -> None:
+        """本机已经是 CRLF（被历史版本写坏的）→ 即使内容与包内一致也要就地修好。"""
+        content_lf = b'#!/usr/bin/env bash\necho hi\n'
+        (self.bundle / 'login.sh').write_bytes(content_lf)
+        (self.target / 'login.sh').write_bytes(content_lf.replace(b'\n', b'\r\n'))
+        n = worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertGreater(n, 0, '只差行尾也算改动 —— 否则那些机器永远修不回来')
+        self.assertEqual((self.target / 'login.sh').read_bytes(), content_lf)
+
+    def test_second_run_reports_no_change(self) -> None:
+        """修好之后再跑一次：内容一致（且都是 LF）→ 返回 0，不白等一次网关重建。"""
+        (self.bundle / 'login.sh').write_bytes(b'#!/usr/bin/env bash\necho hi\r\n')
+        (self.target / 'login.sh').write_bytes(b'#!/usr/bin/env bash\necho hi\r\n')
+        first = worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertGreater(first, 0, '第一次要把本机那份归一')
+        second = worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertEqual(second, 0, '归一之后应判「没变」')
+
+    def test_binary_bytes_untouched(self) -> None:
+        """二进制（含 NUL）一个字节都不动：把数据改坏比留一处行尾问题严重得多。"""
+        blob = b'\x89PNG\r\n\x1a\n\x00\x00\x00\r\nEND'
+        (self.bundle / 'logo.png').write_bytes(blob)
+        worker._sync_bundled_upstream(self.bundle, self._rep())
+        self.assertEqual((self.target / 'logo.png').read_bytes(), blob)

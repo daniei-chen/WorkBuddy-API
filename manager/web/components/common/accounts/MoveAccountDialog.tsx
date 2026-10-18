@@ -101,7 +101,7 @@ export function MoveAccountDialog({
                 {t('accounts.moveTargetLabel')}
               </Label>
               <Select value={target} onValueChange={setTarget}>
-                <SelectTrigger>
+                <SelectTrigger aria-label={t('accounts.moveTargetLabel')}>
                   <SelectValue placeholder={t('accounts.movePick')} />
                 </SelectTrigger>
                 <SelectContent>

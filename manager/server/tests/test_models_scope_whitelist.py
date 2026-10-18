@@ -384,6 +384,11 @@ class CachedIdsTest(unittest.TestCase):
 class HintFrontendWiringTest(unittest.TestCase):
     """前端要真的显示这个提示，且「查不了」不能显示成「全部正确」。"""
 
+    def _component(self) -> str:
+        return (Path(__file__).resolve().parents[2]
+                / 'web/components/common/keys/ModelWhitelistInput.tsx'
+                ).read_text(encoding='utf-8')
+
     def _page(self) -> str:
         return (Path(__file__).resolve().parents[2]
                 / 'web/app/(main)/keys/page.tsx').read_text(encoding='utf-8')
@@ -405,11 +410,23 @@ class HintFrontendWiringTest(unittest.TestCase):
                       'checked=false 时没退回 null')
 
     def test_editing_invalidates_previous_result(self) -> None:
-        """改了内容要作废上次结论，否则显示的是**过期**的「都对」。"""
+        """改了内容要作废上次结论，否则显示的是**过期**的「都对」。
+
+        #141 之后白名单换成组件（`ModelWhitelistInput`：可勾选的清单 + 手输），
+        但这条不变量没变：凡是把用户改动写回 `form.models` 的地方，都要顺手把上次
+        校验结果清掉。
+        """
         src = self._page()
-        seg = src[src.index('onChange={(e) => {'):]
-        seg = seg[:seg.index('onBlur')]
+        start = src.index('<ModelWhitelistInput')
+        seg = src[start:src.index('onBlur', start)]
         self.assertIn('setUnknownModels(null)', seg, '改了白名单却留着上次的校验结果')
+        self.assertIn('models: next', seg, '组件回传的值没写回 form.models')
+        # 打字过程中也要作废：输入框里的草稿要失焦才提交，只清 onChange 的话
+        # 「改到一半」这一段里提示还是上一版的值（浏览器验收实测踩到，见
+        # dev/verify_whitelist_hint.py 的第 3 步）。
+        self.assertIn('onEdit=', seg, '打字时不作废旧结论')
+        comp = self._component()
+        self.assertIn('onEdit?.()', comp, '组件没有把「正在编辑」告诉父组件')
 
     def test_all_locales_define_the_key(self) -> None:
         import json

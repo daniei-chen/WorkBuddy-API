@@ -100,6 +100,17 @@ class NavigationPathsTest(unittest.TestCase):
                 with self.subTest(file=rel, expr=expr[:40]):
                     if 'BASE_PATH' in expr:
                         continue
+                    # 模板字面量形态：`${loginPath}?expired=1` —— 取里面**引用到的
+                    # 标识符**逐个判定。附加的只是固定查询串（`?expired=1`），
+                    # 不引入新的跳转目标，所以这里只要求被引用的变量带前缀。
+                    if expr.startswith('`'):
+                        names = re.findall(r'\$\{([A-Za-z_$][\w$]*)\}', expr)
+                        self.assertTrue(names, f'看不懂的模板跳转表达式：{expr}')
+                        for name in names:
+                            self.assertRegex(
+                                src, name + r'\s*=\s*[^;\n]*BASE_PATH',
+                                f'整页跳转用的 {name} 没带部署前缀 —— 子路径下会跳到域名根')
+                        continue
                     var = re.match(r'([A-Za-z_$][\w$]*)', expr)
                     self.assertIsNotNone(var, f'看不懂的跳转表达式：{expr}')
                     name = var.group(1)

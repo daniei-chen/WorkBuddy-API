@@ -139,7 +139,12 @@ export function AddAccountDialog({
       setProxy(data.default || '');
       setRoutesReady(true);
     }).catch((error) => {
-      if (active) setRouteError(errText(error));
+      if (!active) return;
+      setRouteError(errText(error));
+      // 线路表只是一个可选出口：拉取失败不该把「加账号」卡死，否则二维码
+      // 永远不出现、弹窗看起来像在无限加载。退回直连继续扫码，错误仍留在上方。
+      setProxy('');
+      setRoutesReady(true);
     });
     return () => { active = false; };
   }, [open]);
@@ -294,7 +299,7 @@ export function AddAccountDialog({
             <div className="w-full space-y-1.5">
               <div className="text-[11px] font-medium">{t('addAccount.regionLabel')}</div>
               <Select value={region} onValueChange={setRegion}>
-                <SelectTrigger className="h-9 w-full rounded-full text-xs">
+                <SelectTrigger className="h-9 w-full rounded-full text-xs" aria-label={t('addAccount.regionLabel')}>
                   <SelectValue placeholder={t('addAccount.regionPlaceholder')} />
                 </SelectTrigger>
                 <SelectContent>
@@ -306,7 +311,7 @@ export function AddAccountDialog({
                 </SelectContent>
               </Select>
               {!region && (
-                <p className="text-[10px] leading-4 text-muted-foreground">
+                <p className="text-[11px] leading-4 text-muted-foreground">
                   {t('addAccount.regionHint')}
                 </p>
               )}

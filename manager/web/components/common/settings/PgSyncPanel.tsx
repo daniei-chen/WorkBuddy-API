@@ -296,6 +296,7 @@ export function PgSyncPanel() {
               <p className="text-xs text-muted-foreground">{t('pgSync.autoEnableDesc')}</p>
             </div>
             <Switch
+              aria-label={t('pgSync.autoEnable')}
               checked={form.enabled}
               disabled={!isAdmin}
               onCheckedChange={(v) => patch({enabled: v})}
@@ -320,6 +321,7 @@ export function PgSyncPanel() {
               <p className="text-xs text-muted-foreground">{t('pgSync.keepBackupDesc')}</p>
             </div>
             <Switch
+              aria-label={t('pgSync.keepBackup')}
               checked={form.keep_local_backup}
               disabled={!isAdmin}
               onCheckedChange={(v) => patch({keep_local_backup: v})}

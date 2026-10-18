@@ -22,6 +22,10 @@ def list_logs(
     realm: str | None = None,
     user: dict = Depends(security.current_user),
 ) -> dict:
+    # 分页参数钳制（审计 2026-10-18）：`page` 无上限时，超大整数会在 SQLite
+    # 绑定期溢出抛 500；`size` 无上限则可以一次拉走整张表（内存与响应体都不受控）。
+    page = max(1, min(int(page), 100_000))
+    size = max(1, min(int(size), 500))
     where: list[str] = []
     args: list[object] = []
 

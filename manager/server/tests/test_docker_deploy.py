@@ -54,7 +54,7 @@ class _Rep:
     def set_target_version(self, tag: str) -> None:
         self.state['target_version'] = tag
 
-    def set_signature(self, status: str, detail: str = '') -> None:
+    def set_integrity(self, status: str, digest: str = '') -> None:
         self.state['signature'] = {'status': status, 'detail': detail}
 
     def finish(self, ok: bool) -> None:
@@ -320,11 +320,17 @@ class ComposeCommandTest(unittest.TestCase):
                               '两个都没有时应返回 None，由调用方给出可执行的修法')
 
     def test_missing_compose_raises_actionable_error(self) -> None:
-        """都没有时要报「怎么修」，而不是让用户对着 No such file 发呆。"""
+        """都没有时要报「怎么修」，而不是让用户对着 No such file 发呆。
+
+        `_docker_unusable_hint` 一起放过：本机没装 docker（或 daemon 没起）时，
+        重建会先判定「docker 不可用」并**跳过**上游（那是另一条路径，有专门用例），
+        这条测的是「compose 命令缺失 → 给出可执行的修法」。
+        """
         m = self.mod
         with mock.patch.object(m, '_has_compose_v2', return_value=False), \
              mock.patch.object(m, '_has_compose_v1', return_value=False), \
              mock.patch.object(m, '_read_upstream_ref', return_value=''), \
+             mock.patch.object(m, '_docker_unusable_hint', return_value=''), \
              mock.patch.object(m, '_compose_looks_customized', return_value=False), \
              mock.patch.object(m, '_missing_copy_sources', return_value=[]):
             (m.UPSTREAM_DIR / '.git').mkdir(parents=True, exist_ok=True)
@@ -684,6 +690,112 @@ class DockerAssetsTest(unittest.TestCase):
         vols = [str(v) for v in (dc['services']['workbuddy-manager'].get('volumes') or [])]
         self.assertTrue(any('docker.sock' in v for v in vols),
                         '未挂 docker.sock —— 容器版将无法重载/更新上游')
+
+    def test_env_file_actually_reaches_both_deployments(self) -> None:
+        """`.env` 里的可选项（出口代理等）必须真能到达进程。
+
+        事实核查过：Windows 原生由 uvicorn 的 --env-file 读 .env；而 compose 只透传
+        environment: 列表、systemd 只认 Environment= 行 —— 两处都**不读** .env，
+        于是「写进 .env」在容器与 systemd 部署里静默失效（配了代理却像没配）。
+        这里钉住接线：compose 要把这几个变量取过来，systemd 单元要读那个文件。
+        """
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        env = dc['services']['workbuddy-manager']['environment']
+        for key in ('WB_HTTP_PROXY', 'WB_UPDATE_PROXY', 'WB_DEFAULT_ACCOUNT_PROXY'):
+            with self.subTest(key=key):
+                self.assertIn(key, env, f'compose 没把 {key} 透传进来 —— 写进 .env 也没用')
+                self.assertIn('${' + key, str(env[key]),
+                              f'{key} 没从 .env 取值（compose 用 ${{VAR:-}} 取）')
+        unit = (_ROOT / 'deploy' / 'workbuddy-web.service').read_text(encoding='utf-8')
+        self.assertIn('EnvironmentFile=-/opt/workbuddy-manager/.env', unit,
+                      'systemd 单元没读 .env —— 那里面配的代理/线路不会生效')
+
+    def test_dockerfile_deps_go_to_writable_user_site(self) -> None:
+        """容器内更新要把新依赖装到**可写**的位置（issue #157 的另一半）。
+
+        镜像里依赖是 root 装的，site-packages 归 root；而进程是 uid 10001。
+        更新器改用 `pip install --user` 后，落点由 PYTHONUSERBASE 决定 ——
+        它必须在镜像里钉死并落在被 chown 给 10001 的 /app 下，否则要么装不进去，
+        要么装进去了、重启后的新进程却不在 sys.path 上找它。
+        """
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertIn('PYTHONUSERBASE=/app/.local', df,
+                      '未钉死 PYTHONUSERBASE —— --user 的落点会随 HOME 漂移')
+        # 目录必须先建出来：site.py 只在目录**存在**时才把它加进 sys.path
+        # （不存在就不加，重启后的进程找不到刚装的包）。
+        self.assertRegex(df, r'mkdir -p[^\n]*/app/\.local',
+                         '/app/.local 没在 useradd 那步建出来 —— 装完也不进 sys.path')
+        # 且要被 chown -R 10001:10001 /app 覆盖，否则 uid 10001 写不进去
+        self.assertRegex(df, r'chown -R 10001:10001\s+/app\b',
+                         'chown 未覆盖 /app —— /app/.local 归属不对，装不进去')
+
+
+class DockerSocketPreflightTest(unittest.TestCase):
+    """容器里用不了 docker.sock 时，必须给出**可照做**的修法。
+
+    挂上 /var/run/docker.sock 只是必要条件：socket 在宿主上通常归 root:docker
+    （gid 998/999），而容器里的进程是 uid 10001 —— 不在那个组里就是 EACCES。
+    默认 compose 里一个 group_add 都没有，所以这条路径在真机上必失败，
+    而原来只会得到一句「权限不足，请确认以 root 或具备 docker 权限的用户执行」，
+    容器里没有 root 可变，用户无从下手。
+    """
+
+    def test_compose_group_add_uses_env_gid(self) -> None:
+        """compose 要能用宿主**真实的** docker 组 GID 给容器补组。"""
+        import yaml
+        dc = yaml.safe_load((_ROOT / 'docker-compose.yml').read_text(encoding='utf-8'))
+        svc = dc['services']['workbuddy-manager']
+        groups = [str(g) for g in (svc.get('group_add') or [])]
+        self.assertTrue(groups,
+                        '没配 group_add —— 容器内 uid 10001 用不了挂进来的 docker.sock')
+        self.assertTrue(any('DOCKER_GID' in g for g in groups),
+                        f'group_add 没用 DOCKER_GID 变量：{groups}（宿主 GID 因机器而异，写死必错）')
+        env = (_ROOT / '.env.example').read_text(encoding='utf-8')
+        self.assertIn('DOCKER_GID', env, '.env.example 没说明 DOCKER_GID 怎么取')
+        self.assertIn('stat -c', env,
+                      '要给出取 GID 的命令：stat -c %g /var/run/docker.sock')
+
+    def test_diagnose_permission_denied_gives_socket_recipe(self) -> None:
+        """socket 连不上的权限错误要指向 group_add，而不是"请用 root 执行"。"""
+        mod = _load_update_mod()
+        hint = mod._diagnose_build_failure(
+            'permission denied while trying to connect to the Docker daemon socket '
+            'at unix:///var/run/docker.sock')
+        self.assertIn('group_add', hint, f'socket 权限错误没指向 group_add：{hint!r}')
+        self.assertIn('DOCKER_GID', hint)
+        # 与 socket 无关的权限问题仍给原来的提示（两件事不能混为一谈）
+        other = mod._diagnose_build_failure('mkdir /opt/workbuddy2api: permission denied')
+        self.assertIn('权限', other)
+        self.assertNotIn('group_add', other)
+
+    def test_docker_unusable_hint_is_actionable(self) -> None:
+        """docker 连不上时给出的提示必须可照做（容器形态：指向 group_add）。"""
+        mod = _load_update_mod(WB_RUN_MODE='docker')
+        with mock.patch.object(mod.subprocess, 'run',
+                               side_effect=FileNotFoundError('docker')):
+            hint = mod._docker_unusable_hint()
+        self.assertIn('DOCKER_GID', hint)
+        self.assertIn('group_add', hint)
+
+    def test_docker_usable_hint_is_empty(self) -> None:
+        """能用 docker 时不该有任何提示（否则每次更新都刷一段无关的告警）。"""
+        mod = _load_update_mod()
+        with mock.patch.object(mod.subprocess, 'run',
+                               return_value=mock.Mock(returncode=0)):
+            self.assertEqual(mod._docker_unusable_hint(), '')
+
+    def test_rebuild_upstream_skips_when_docker_unusable(self) -> None:
+        """docker 用不了时跳过上游、**不抛错**。
+
+        抛错会让 `--target both` 整体失败 —— 上游的问题不该把管理端也拖死，
+        而管理端才是用户唯一能操作的面板。
+        """
+        mod = _load_update_mod()
+        rep = _Rep()
+        with mock.patch.object(mod, '_docker_unusable_hint', return_value='提示正文'):
+            mod.rebuild_upstream(rep)  # 不应抛
+        self.assertIn('提示正文', rep.text())
 
 
 if __name__ == '__main__':

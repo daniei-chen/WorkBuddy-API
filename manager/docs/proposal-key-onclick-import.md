@@ -92,7 +92,7 @@
   给 claude 填成 `…/v1` 是实测踩过的坑：实际请求变成 `…/v1/v1/messages`，
   而面板上**那个路径存在但不是 POST 路由**，于是返回 **405**（不是 404）——
   报错看起来像"方法不对"，很容易让人往错误方向排查。本机实测已确认。
-  另：cc-switch 里真实的 claude provider 用的正是根地址 `https://www.chedankj.com/`。
+  另：实测的 cc-switch 配置里，claude provider 用的就是**根地址**（不写成 `/v1`）。
 - **写入前必须关闭/退出 cc-switch**，或在其运行时通过它的接口写入——直接改 SQLite 有被应用内存态覆盖的风险（与下文 ZCode 同类问题）。
 - `provider_endpoints` 表另存 URL 列表（`provider_id` + `app_type` + `url`），建议同步写入，保持 UI 中「端点」一致。
 - 建议 `id` 用稳定 UUID 存到面板侧（例如 `settings` 表记 `ccswitch_provider_id`），重复导入时**更新而非追加**，避免堆重复项。
@@ -223,9 +223,9 @@
   `next build`（导出模式）成功。
 - **2 个失败**（`test_ssrf_guard` 的 `test_allowed_hosts` 与
   `test_public_target_is_actually_probed`）**与本改动无关**，是本机网络环境所致：
-  代理软件以 TUN/fake-IP 模式把**全部**域名的 DNS 劫持到基准测试保留网段
-  `198.18.0.0/15`（实测 `example.com` → `198.18.0.115`、`api.openai.com` →
-  `198.18.0.116`），于是 SSRF 守卫按"解析到内部地址"拒绝探测。
+  代理软件以 TUN/fake-IP 模式把**全部**域名的 DNS 劫持到保留网段
+  （`198.18.0.0/15`，基准测试保留段），于是 SSRF 守卫按"解析到内部地址"
+  拒绝探测。
   退出代理或改直连后应恢复。
 - **4 个 error** 由 WorkBuddy 运行时的 safe-delete shim 拦截测试清理阶段的批量删除
   引起（`sitecustomize.py` 的 `_exit_bulk_guard_control` 抛 `SystemExit: 1`）。

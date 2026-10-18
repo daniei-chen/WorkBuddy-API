@@ -8,6 +8,9 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -15,11 +18,12 @@ import {
 } from 'recharts';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
+import {collectScopedExpiries} from '@/lib/dashboard-credits';
 import {getExpiryDailyGroup, groupExpiriesByDay} from '@/lib/display-prefs';
 import {accountApi, statsApi, upstreamApi, upstreamsApi} from '@/lib/api';
 import {useRealm} from '@/lib/realm-context';
 import type {
-  CreditExpiry,
+  CreditsFlow,
   CreditsMeta,
   StatsSummary,
   UsagePoint,
@@ -56,6 +60,13 @@ import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {Badge} from '@/components/ui/badge';
 import {Button} from '@/components/ui/button';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {useT} from '@/lib/i18n/provider';
 
 /**
@@ -69,6 +80,17 @@ const EMPTY_POINTS: UsagePoint[] = [];
 const EMPTY_CREDITS: Record<string, CreditsMeta> = {};
 const EMPTY_LIVE_CREDITS: Record<string, number> = {};
 const EMPTY_SLICES: GroupSlice[] = [];
+
+/** 积分收支的取数前空值（理由同 EMPTY_POINTS：必须是稳定引用） */
+const EMPTY_FLOW: CreditsFlow = {
+  days: 0,
+  from: '',
+  to: '',
+  today: {income: 0, expense: 0, net: 0},
+  week: {income: 0, expense: 0, net: 0},
+  total: {income: 0, expense: 0, net: 0},
+  daily: [],
+};
 
 /** `refreshCredits` 的返回体形状（扇出后要逐项相加，类型从 api 上取） */
 type CreditsResponse = Awaited<ReturnType<typeof accountApi.refreshCredits>>;
@@ -194,6 +216,30 @@ export default function DashboardPage() {
     credits: () => loadGroupCredits(),
   }, [realm]);
 
+  /**
+   * 积分收支的时段（当天 / 3 / 7 / 15 / 30 天）。
+   *
+   * **单独一个 hook**，不并进上面那个：上面那份的依赖是 `[realm]`，把时段塞进去
+   * 会让切时段时把账号池、用量趋势也一起清空重取（骨架闪一下）——那是「换了数据
+   * 上下文」的代价，而时段只是这一张图的查询范围。分开后只有本卡片重取。
+   */
+  const [flowDays, setFlowDays] = useState('7');
+  const flowState = useAsyncAll({
+    flow: () => statsApi.creditsFlow(Number(flowDays) || 7, realm),
+  }, [realm, flowDays]);
+  /**
+   * 只认**形状完整**的响应：网关错误体 / 空对象这类残缺数据会让 `total` 变
+   * undefined，直接读 `flow.total.income` 会把整个仪表盘打崩（真机渲染复现过：
+   * `TypeError: Cannot read properties of undefined (reading 'income')`）。
+   * 宁可退回空态，也不要整页白屏。
+   */
+  const rawFlow = flowState.values.flow;
+  const flow: CreditsFlow =
+    rawFlow && rawFlow.total && Array.isArray(rawFlow.daily) ? rawFlow : EMPTY_FLOW;
+  const flowFailed = 'flow' in flowState.errors;
+  /** 区间内是否有任何收支——全 0 时画图没意义，给空态 */
+  const hasFlow = flow.total.income > 0 || flow.total.expense > 0;
+
   const slices: GroupSlice[] = values.pool ?? EMPTY_SLICES;
   const summary: StatsSummary | null = values.summary ?? null;
   const daily: UsagePoint[] = values.daily ?? EMPTY_POINTS;
@@ -226,7 +272,10 @@ export default function DashboardPage() {
   // 账号健康度与用量会持续变化，用心跳刷新避免展示陈旧数据。
   // 走 reload（刷新模式）：只把新数据换上去，**不**重走首屏流程——
   // 否则骨架会每 30 秒闪一次，用户以为页面在抽风。
-  useHeartbeat(reload, 30000);
+  useHeartbeat(() => {
+    reload();
+    flowState.reload();
+  }, 30000);
 
   /** 有字段没刷新成功。此时至少还有一份数据在，用顶部提示如实说明，不清空内容 */
   const partialFailed = Object.keys(errors).length > 0;
@@ -294,20 +343,23 @@ export default function DashboardPage() {
   const totalCredits = creditsKnown.reduce((sum, a) => sum + (credOf(a) || 0), 0);
   const creditsLow = creditsKnown.filter((a) => (credOf(a) || 0) < 200).length;
   /**
-   * 最近一笔积分到期（全体账号里最早的那个到期时刻）。
+   * 当前版本账号的到期明细（按时刻升序）。
    *
    * 为什么值得占首页一行：积分过期即作废且不可恢复，用户能采取的行动
    * （多跑点任务把它用掉）只在到期**之前**有效。汇总卡片此前只报总量，
    * 看不出「总量虽多但大部分下周就没了」这种情况。
+   *
+   * 必须用 `scoped`，不能扫 `creditsMeta` 的全部条目：那份 map 是所有分组、
+   * 所有版本一起取回来的。余额已经按当前版本算，到期若用全表，切到国际版
+   * 仍会显示国内版更早的那一笔。名单或元数据变了都要重算——切版本时名单变、
+   * 刷新时元数据变，两边都可能单独发生。
    */
-  const nextExpiry = useMemo(() => {
-    let best: CreditExpiry | null = null;
-    for (const m of Object.values(creditsMeta)) {
-      const e = m.expiries?.[0];
-      if (e && (!best || e.at < best.at)) best = e;
-    }
-    return best;
-  }, [creditsMeta]);
+  const scopedExpiries = useMemo(
+    () => collectScopedExpiries(scoped, creditsMeta),
+    [scoped, creditsMeta],
+  );
+  /** 最近一笔：升序后的第一条。按天归并关着时卡片就显示它。 */
+  const nextExpiry = scopedExpiries[0] ?? null;
   // 7 天内的到期算紧急（与倒计时胶囊的琥珀/红分档同一条线）。取渲染时刻即可：
   // 阈值是 7 天，而本页每 30 秒重渲染一次，几秒的偏差不影响分档。
   const expiryUrgent = !!nextExpiry && nextExpiry.at - Date.now() / 1000 < 7 * 86400;
@@ -320,32 +372,20 @@ export default function DashboardPage() {
   }, []);
 
   /**
-   * 全体账号的到期明细（按时刻升序）。
-   *
-   * 与上面 nextExpiry 的区别：那个只看每个账号的**第一笔**，回答「最近一笔什么时候
-   * 没了」；这里收全量，供「按天归并」用——同一天到期的多笔要能相加，
-   * 只看第一笔永远算不出那一天的总和。
-   */
-  const allExpiries = useMemo(() => {
-    const out: CreditExpiry[] = [];
-    for (const m of Object.values(creditsMeta)) {
-      for (const e of m.expiries ?? []) out.push(e);
-    }
-    return out.sort((a, b) => a.at - b.at);
-  }, [creditsMeta]);
-
-  /**
    * 卡片上实际要显示的到期条目。
    *
    * 关闭（默认）= 最近一笔；开启 = 按本地日历日归并后的第一条（最近那一天，
    * 金额是那天到期的**总和**）。两者数量级不同（一笔 vs 一天），所以开关默认
    * 关闭——升级后看到的还是原来那个数，想按天看的自己打开。
+   *
+   * 两条路用的是同一份 `scopedExpiries`：按天归并要能把同一天的多笔相加，
+   * 只看每个账号的第一笔永远算不出那一天的总和；最近一笔则是这份升序列表的第一条。
    */
   const expiryShown = useMemo(
     () => (dailyGroup
-      ? groupExpiriesByDay(allExpiries)
+      ? groupExpiriesByDay(scopedExpiries)
       : (nextExpiry ? [nextExpiry] : [])),
-    [dailyGroup, allExpiries, nextExpiry],
+    [dailyGroup, scopedExpiries, nextExpiry],
   );
 
   const chartData = daily.map((d) => ({
@@ -544,7 +584,7 @@ export default function DashboardPage() {
           <div className="h-[220px] w-full">
             {chartData.length ? (
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={chartData} margin={{top: 4, right: 8, bottom: 0, left: -16}}>
+                <AreaChart data={chartData} margin={{top: 4, right: 8, bottom: 0, left: 0}}>
                   <defs>
                     <linearGradient id="gReq" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="var(--chart-1)" stopOpacity={0.35} />
@@ -618,6 +658,107 @@ export default function DashboardPage() {
         </div>
       </section>
 
+      {/* 积分收支（收入 / 支出）：用户反馈「只看得到余额，看不到收入多少、支出
+          多少」。时段由右上角下拉控制（当天 / 3 / 7 / 15 / 30 天），数字与折线
+          都跟着它走，不把「今日」「近 7 天」固定写死在上面。
+          ⚠️ 收入与支出是**两套口径**（见后端 credits_flow）：收入是「余额比上次
+          查询增加的部分」，按查询时刻归日，是近似值；支出是每次调用的真实扣费。
+          所以两者分列、不合并成单一「净额」下结论，并在悬停里如实说明口径。 */}
+      <section className="rounded-[20px] bg-muted p-4" aria-busy={flowState.isRefreshing}>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Coins className="h-4 w-4" />
+            {t('dashboard.creditsFlowTitle')}
+          </div>
+          <Select value={flowDays} onValueChange={setFlowDays}>
+            <SelectTrigger
+              className="h-8 w-[130px] rounded-full"
+              aria-label={t('dashboard.creditsFlowTitle')}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="1">{t('stats.today')}</SelectItem>
+              <SelectItem value="3">{t('stats.last3')}</SelectItem>
+              <SelectItem value="7">{t('stats.last7')}</SelectItem>
+              <SelectItem value="15">{t('stats.last15')}</SelectItem>
+              <SelectItem value="30">{t('stats.last30')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        {flowFailed && !flowState.values.flow ? (
+          // 取不到不能说「暂无收支」——那是在断言「你没有收支」，而事实是没拿到。
+          <div className="grid h-[120px] place-items-center text-xs text-muted-foreground">
+            {t('dashboard.creditsFlowFailed')}
+          </div>
+        ) : (
+          <>
+            {/* 三个数字都跟着上面的时段走（收入 / 支出 / 净增），不再固定写死
+                「今日」「近 7 天」。 */}
+            <div className="grid grid-cols-3 gap-3">
+              <CreditFlowTile
+                label={t('dashboard.income')}
+                value={flow.total.income}
+                tone="income"
+                title={t('dashboard.creditsIncomeTip')}
+              />
+              <CreditFlowTile
+                label={t('dashboard.expense')}
+                value={flow.total.expense}
+                tone="expense"
+                title={t('dashboard.creditsExpenseTip')}
+              />
+              <CreditFlowTile
+                label={t('dashboard.creditsNet')}
+                value={flow.total.net}
+                tone="net"
+                title={t('dashboard.creditsNetTip')}
+              />
+            </div>
+
+            <div className="mt-4 h-[220px] w-full">
+              {hasFlow ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  {/* 左边距不能给负数：轴宽 48 减去它才是刻度的可用宽度，
+                      4 位数的刻度会越出图表左边缘被裁掉（issue #184 的遮挡就是这么来的）。 */}
+                  <LineChart data={flow.daily} margin={{top: 4, right: 4, bottom: 0, left: 0}}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                    <XAxis dataKey="day" tickLine={false} axisLine={false} fontSize={11}
+                           stroke="var(--muted-foreground)" />
+                    {/* 双 Y 轴：收入常是几千、支出常是几十。同一根轴会把支出压成
+                        贴着 0 的直线，等于没画。左轴收入、右轴支出，颜色与曲线对应。 */}
+                    <YAxis yAxisId="inc" tickLine={false} axisLine={false} fontSize={11}
+                           stroke="var(--chart-2)" width={52} />
+                    <YAxis yAxisId="exp" orientation="right" tickLine={false} axisLine={false}
+                           fontSize={11} stroke="var(--destructive)" width={48} />
+                    <Tooltip
+                      contentStyle={{
+                        background: 'var(--popover)',
+                        border: '1px solid var(--border)',
+                        borderRadius: 12,
+                        fontSize: 12,
+                      }}
+                    />
+                    <Legend wrapperStyle={{fontSize: 11}} />
+                    <Line yAxisId="inc" type="monotone" dataKey="income"
+                          name={t('dashboard.income')} stroke="var(--chart-2)"
+                          strokeWidth={2} dot={false} />
+                    <Line yAxisId="exp" type="monotone" dataKey="expense"
+                          name={t('dashboard.expense')} stroke="var(--destructive)"
+                          strokeWidth={2} dot={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="grid h-full place-items-center text-xs text-muted-foreground">
+                  {t('dashboard.creditsFlowEmpty')}
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </section>
+
       <section className="rounded-[20px] bg-muted p-4">
         <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1">
           <span className="text-sm font-medium">{t('dashboard.healthSnapshot')}</span>
@@ -673,7 +814,7 @@ export default function DashboardPage() {
                     {/* 多于一个分组时才标归属：交错排列之后，光看昵称分不出
                         这条属于哪个池。单分组时它只是句废话。 */}
                     {multiGroup && (
-                      <span className="shrink-0 text-[10px] text-muted-foreground">
+                      <span className="shrink-0 text-[11px] text-muted-foreground">
                         {a.group.name}
                       </span>
                     )}
@@ -708,7 +849,9 @@ export default function DashboardPage() {
                       title={t('metric.credits')}
                     >
                       {typeof credOf(a) === 'number'
-                        ? t('metric.creditAmount', {n: fmtNumber(credOf(a))})
+                        ? t('metric.creditAmount',
+                            {n: fmtNumber(credOf(a)),
+                             count: Math.round(credOf(a) as number)})
                         : ''}
                     </span>
                   </div>
@@ -867,5 +1010,42 @@ function DashboardSkeleton() {
         </div>
       </section>
     </>
+  );
+}
+
+/**
+ * 积分收支小卡片：收入（正）绿、支出红，悬停给出统计口径。
+ *
+ * 为什么不用顶部那个 StatCard：本块在 `bg-muted` 的 section 内部，再嵌一层
+ * 同色的 bg-muted 会看不出卡片边界；这里用 `bg-background/60` 区分层次。
+ */
+function CreditFlowTile({label, value, tone, title}: {
+  label: string;
+  value: number;
+  tone: 'income' | 'expense' | 'net';
+  title: string;
+}) {
+  // 收入绿、支出红；净增按正负取色（正绿负红、零中性）。
+  const color =
+    tone === 'income'
+      ? 'text-emerald-600 dark:text-emerald-400'
+      : tone === 'expense'
+        ? 'text-red-600 dark:text-red-400'
+        : value > 0
+          ? 'text-emerald-600 dark:text-emerald-400'
+          : value < 0
+            ? 'text-red-600 dark:text-red-400'
+            : 'text-gray-900 dark:text-gray-100';
+  // 符号把「进 / 出」直接写在数字上：收入 +、支出 −、净增按正负。
+  // 金额一律取绝对值再拼符号，避免出现「−-120」这种双重负号。
+  const sign = tone === 'expense' || (tone === 'net' && value < 0) ? '−' : '+';
+  return (
+    <div className="rounded-2xl bg-background/60 px-3 py-2.5" title={title}>
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+      <div className={'mt-1 text-lg font-semibold tabular-nums ' + color}>
+        {sign}
+        {fmtNumber(Math.abs(value))}
+      </div>
+    </div>
   );
 }

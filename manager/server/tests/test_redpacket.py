@@ -160,22 +160,16 @@ class ValidateTest(unittest.TestCase):
             validate(1000, 5, KIND_TOKEN, MODE_LUCKY, 7, ['  '])     # 只有空白
         validate(1000, 5, KIND_TOKEN, MODE_LUCKY, 7, ['glm-5.2'])    # 正常
 
-    def test_credit_forbids_models(self) -> None:
-        """**积分红包必须不限定模型。**
+    def test_credit_models_are_optional(self) -> None:
+        """积分红包的模型范围是**可选**的（#131 起；此前一律拒绝）。
 
-        积分是「钱」，按上游真实扣费算，任何模型都能用；再叠一层模型限制
-        只会让人算不清「这红包到底值多少」（想控成本就少发点积分）。
-        所以传了反而拦下来把语义钉死，而不是默默忽略 —— 后者会让管理员
-        以为自己设的限制生效了。
+        不填 = 不限制（按真实扣费计，任何模型都能用，这也是它原本的行为）；
+        填了 = 只放行这些模型 —— 用来把一份额度限定到某个模型上。两类规则不再
+        「相反」：token 必填（量随模型变），积分可选。
         """
-        validate(100.0, 5, KIND_CREDIT, MODE_LUCKY, 7)               # 不传 = 对
-        validate(100.0, 5, KIND_CREDIT, MODE_LUCKY, 7, [])           # 空列表 = 对
-        with self.assertRaises(RedPacketError):
-            validate(100.0, 5, KIND_CREDIT, MODE_LUCKY, 7, ['glm-5.2'])
-
-
-class CreatePacketTest(unittest.TestCase):
-    """端到端：真的建出密钥、额度对、过期时间对、事务能回滚。"""
+        validate(100.0, 5, KIND_CREDIT, MODE_LUCKY, 7)               # 不传 = 不限制
+        validate(100.0, 5, KIND_CREDIT, MODE_LUCKY, 7, [])           # 空列表 = 不限制
+        validate(100.0, 5, KIND_CREDIT, MODE_LUCKY, 7, ['glm-5.2'])  # 指定模型 = 也允许
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -209,8 +203,8 @@ class CreatePacketTest(unittest.TestCase):
         args = {'name': '测试红包', 'kind': KIND_CREDIT, 'total': 100.0,
                 'shares': 5, 'mode': MODE_LUCKY, 'ttl_days': 7, 'actor': 'admin'}
         args.update(kw)
-        # token 红包**必须**限定模型、积分红包**必须**不限定（见 validate）。
-        # 这里按类别自动补上，免得每个用例都写一遍而漏掉。
+        # token 红包必须限定模型（积分红包可选，不填即不限制）。
+        # 这里只给 token 自动补上，免得每个用例都写一遍而漏掉。
         if args['kind'] == KIND_TOKEN and 'models' not in args:
             args['models'] = ['glm-5.2']
         return redpacket.create_packet(**args)
@@ -552,10 +546,11 @@ class RouteTest(unittest.TestCase):
                         json={**base, 'quota_kind': KIND_TOKEN, 'total_amount': 1000})
         self.assertEqual(r.status_code, 400, f'token 红包不给模型应被拒: {r.text}')
 
-        # 积分给了模型 → 400
+        # 积分给了模型 → 现在允许（#131）：创建成功，且红包上记着这个范围
         r = self.c.post('/api/red-packets',
                         json={**base, 'quota_kind': KIND_CREDIT, 'models': ['glm-5.2']})
-        self.assertEqual(r.status_code, 400, f'积分红包带模型应被拒: {r.text}')
+        self.assertEqual(r.status_code, 200, f'积分红包带模型应被接受: {r.text}')
+        self.assertEqual(r.json()['models'], ['glm-5.2'], '红包没记住模型范围')
 
 
 class ClaimTest(unittest.TestCase):
@@ -606,6 +601,31 @@ class ClaimTest(unittest.TestCase):
         self.assertTrue(got['key'].startswith('wbk_'), '必须返回明文密钥')
         self.assertGreater(got['amount'], 0)
         self.assertEqual(got['quota_kind'], KIND_CREDIT)
+
+    def test_credit_packet_models_land_on_the_claimed_key(self) -> None:
+        """#131：积分红包指定的模型范围，要落到领到的那把密钥上。
+
+        创建时限定（`models`）、领取时继承（`draw` 里建密钥那步）—— 两头都要有，
+        否则红包上写着「只能调 glm-5.2」，领到的密钥却什么都能调。
+        """
+        from server import keysvc, redpacket
+        p = redpacket.create_packet(
+            name='限定模型的红包', kind=KIND_CREDIT, total=100.0, shares=2,
+            mode=MODE_LUCKY, ttl_days=7, actor='admin', models=['glm-5.2'])
+        self.assertEqual(p['models'], ['glm-5.2'], '红包没记住模型范围')
+        got = redpacket.draw(p['code'], '9.9.9.9')
+        key = keysvc.resolve(got['key'])
+        self.assertIsNotNone(key)
+        self.assertEqual(key['models'], ['glm-5.2'], '领取到的密钥没有继承红包的模型范围')
+
+    def test_credit_packet_without_models_stays_unrestricted(self) -> None:
+        """不填模型 = 不限制（原有行为不变）：领到的密钥白名单是空的。"""
+        from server import keysvc, redpacket
+        p = self._make()
+        self.assertEqual(p['models'], [])
+        got = redpacket.draw(p['code'], '8.8.8.8')
+        key = keysvc.resolve(got['key'])
+        self.assertEqual(key['models'], [], '没限定模型的红包不该给密钥加上白名单')
 
     def test_same_ip_can_only_draw_once(self) -> None:
         """**核心**：同一个 IP 抽第二次必须被拒，且能区分出「已经领过」。"""

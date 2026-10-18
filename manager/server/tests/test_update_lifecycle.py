@@ -332,9 +332,6 @@ class ChildStdioEncoding(unittest.TestCase):
             self.assertIn('✓', out.read_text(encoding='utf-8'))
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class RestartStepOnWindows(unittest.TestCase):
     """Windows 原生部署：新代码就位后**不许**去调 systemctl，也不能报失败。
@@ -502,6 +499,28 @@ class UpdateProxyTest(unittest.TestCase):
         mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY='http://panel-proxy:7890')
         self.assertEqual(mod.UPDATE_PROXY, 'http://panel-proxy:7890')
 
+
+    def test_socks5_panel_proxy_is_not_handed_to_the_updater(self) -> None:
+        """面板能吃 socks5，更新器（urllib）吃不了 —— 不能带着它去下载。
+
+        带着它下载只会得到一条看不懂的报错；正确行为是忽略并记一条日志说清怎么办。
+        """
+        mod, _ = self._load(WB_UPDATE_PROXY=None,
+                            WB_HTTP_PROXY='socks5://user:secret@127.0.0.1:1080')
+        self.assertEqual(mod.UPDATE_PROXY, '',
+                         'socks5 被当成 http 代理交给 urllib 了，下载必然失败')
+        self.assertTrue(mod.PROXY_UNSUPPORTED)
+
+    def test_explicit_socks_update_proxy_is_also_ignored(self) -> None:
+        mod, _ = self._load(WB_UPDATE_PROXY='socks5://127.0.0.1:1080', WB_HTTP_PROXY=None)
+        self.assertEqual(mod.UPDATE_PROXY, '')
+        self.assertTrue(mod.PROXY_UNSUPPORTED)
+
+    def test_http_proxy_needs_no_warning(self) -> None:
+        mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY='http://panel-proxy:7890')
+        self.assertEqual(mod.PROXY_UNSUPPORTED, '',
+                         'http 代理被误判成不支持 —— 会平白多一条警告日志')
+
     def test_network_failure_hint_mentions_the_proxy_knob(self) -> None:
         mod, _ = self._load(WB_UPDATE_PROXY=None, WB_HTTP_PROXY=None)
         hint = mod._download_hint(OSError('The read operation timed out'))
@@ -509,3 +528,6 @@ class UpdateProxyTest(unittest.TestCase):
                       '下载失败时没有告诉用户「可能需要配代理」（issue #106 的第二个诉求）')
         # 与网络无关的失败不贴这条提示（避免误导）
         self.assertEqual(mod._download_hint(ValueError('bad url')), '')
+
+if __name__ == '__main__':
+    unittest.main()

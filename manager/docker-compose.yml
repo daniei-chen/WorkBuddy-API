@@ -74,6 +74,13 @@ services:
       WB_TRUST_PROXY: "1"
       # 生产环境不暴露 /docs 与 /openapi.json
       WB_ENABLE_DOCS: "0"
+      # 出口代理（可选）：写在与本文件同目录的 .env 里即可，compose 用 ${} 取过来。
+      # 支持 http:// / https:// / socks5://；内网与本机目标（含上游那一跳）始终直连。
+      WB_HTTP_PROXY: ${WB_HTTP_PROXY:-}
+      # 一键更新的下载代理（可选，只认 http/https）
+      WB_UPDATE_PROXY: ${WB_UPDATE_PROXY:-}
+      # 新账号默认绑定的命名线路（名字要在上游 config.json 的 proxies 里）
+      WB_DEFAULT_ACCOUNT_PROXY: ${WB_DEFAULT_ACCOUNT_PROXY:-}
     ports:
       # **只监听本机**：管理端必须藏在反向代理之后。
       # 若确需直接从别的机器访问，改成 "7864:7864"，但请先确保有 HTTPS 与访问控制——
@@ -125,6 +132,15 @@ services:
       # 自动降级为「请到宿主机执行 docker compose ...」，界面如实提示，不会
       # 静默失败。
       - /var/run/docker.sock:/var/run/docker.sock
+
+    # 挂上 socket 只是必要条件 —— 还得**进得了那个组**。
+    # 宿主的 socket 通常归 root:docker（GID 998/999），而本容器以 uid 10001 运行，
+    # 不在那个组里就是 permission denied。GID 因机器而异，所以用变量：
+    #   DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)   # 写进 .env
+    # 默认 999 是 Debian/Ubuntu 上最常见的值；取错了不会静默失败 —— 更新上游时会
+    # 给出取真实 GID 的提示。不需要容器内操作 docker 的话，连上面那行一起注释掉即可。
+    group_add:
+      - "${DOCKER_GID:-999}"
 
     extra_hosts:
       # 让容器能通过 host.docker.internal 访问宿主机上的上游

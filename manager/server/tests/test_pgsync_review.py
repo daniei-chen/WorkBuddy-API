@@ -5,13 +5,16 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import sqlite3
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from server import config
+from server import config, db
 from server.services import pgsync
 
 from .test_pgsync import _Case  # 复用同一套临时 HOME/DB 装置
@@ -164,6 +167,166 @@ class ImportScopeTest(_Case):
         self.assertIn('没有公共列', '\n'.join(logs), f'缺「没有公共列」的口径：{logs}')
         got = self.db.query_one('SELECT COUNT(*) AS c FROM renamed_cols')
         self.assertEqual(int(got['c']), 1, '列对不上就把本地那张表清空了 —— 数据凭空没了')
+
+
+class RestoreConcurrencyTest(_Case):
+    """恢复的耗时部分不得持有全局 DB 锁（审计 2026-10-18）。
+
+    旧实现把整段「清空 + 灌入」包在 `db._lock` 里：大库恢复几秒到几十秒，
+    期间网关的日志写入、鉴权、统计全部排队。新实现先写临时库，只在
+    「关连接 → 换文件 → 重开」的毫秒级窗口持锁 —— 这两条用例分别钉住
+    「复制期间可读写」与「失败不碰线上库」。
+    """
+
+    TABLE = 'restore_probe'
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute(f'CREATE TABLE IF NOT EXISTS {self.TABLE}(id INTEGER, v TEXT)')
+        self.db.execute(f"INSERT INTO {self.TABLE} VALUES(1, '旧值')")
+
+    def _run_import(self, rows_factory) -> None:
+        table = self.TABLE
+
+        class FakeSource:
+            def __init__(self, conn):  # noqa: ANN001
+                pass
+
+            def tables(self):
+                return [table]
+
+            def columns(self, _table):
+                return [
+                    {'name': 'id', 'type': 'INTEGER', 'notnull': False, 'pk': 0},
+                    {'name': 'v', 'type': 'TEXT', 'notnull': False, 'pk': 0},
+                ]
+
+            def rows(self, _table, _columns, batch=pgsync.BATCH):
+                yield from rows_factory()
+
+            def close(self):
+                pass
+
+        class Reporter:
+            data: dict = {}
+
+            def log(self, text, level='info'):
+                pass
+
+            def step(self, text, percent=None):
+                pass
+
+        with mock.patch.object(pgsync, '_PgSource', FakeSource), \
+             mock.patch.object(pgsync, '_require_psycopg', lambda: _StubPg([])), \
+             mock.patch.object(pgsync, '_local_backup', lambda: None):
+            pgsync.import_from_pg(
+                {'host': 'stub', 'port': 5432, 'dbname': 'x', 'user': 'u',
+                 'password': 'p', 'keep_local_backup': False, 'sslmode': 'prefer'},
+                Reporter())
+
+    def test_online_queries_are_not_blocked_while_copying(self) -> None:
+        gate = threading.Event()
+
+        def rows():
+            def probe():
+                # 真正走一遍 query 路径；若全局锁被恢复线程占着，这里会卡住。
+                db.query_one('SELECT 1')
+                gate.set()
+
+            threading.Thread(target=probe, daemon=True).start()
+            self.assertTrue(gate.wait(3), '恢复复制期间在线查询被阻塞')
+            yield [(1, '新值')]
+
+        self._run_import(rows)
+        got = self.db.query_one(f'SELECT v FROM {self.TABLE} WHERE id = 1')
+        self.assertEqual(got['v'], '新值', '恢复没有真正落到线上库')
+
+    def test_failure_during_copy_leaves_live_data_untouched(self) -> None:
+        def rows():
+            yield [(1, '新值')]
+            raise RuntimeError('镜像读到一半断了')
+
+        with self.assertRaises(RuntimeError):
+            self._run_import(rows)
+        got = self.db.query_one(f'SELECT v FROM {self.TABLE} WHERE id = 1')
+        self.assertEqual(got['v'], '旧值', '恢复失败却把线上库改掉了')
+        leftovers = list(Path(self._tmp.name).glob('.pgsync-restore-*.db'))
+        self.assertFalse(leftovers, f'失败后临时库没有清理：{leftovers}')
+
+
+class ReplaceDatabaseTest(_Case):
+    """`db.replace_database`：换库成功、失败回滚、残留文件清理。"""
+
+    def _staged_copy(self, value: str) -> Path:
+        staging = Path(self._tmp.name) / 'staging.db'
+        prober = Path(self._tmp.name) / 'probe.db'
+        with db._lock:
+            db.connect().execute('VACUUM INTO ?', (str(prober),))
+        conn = sqlite3.connect(str(prober))
+        try:
+            conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('swap_probe', ?)",
+                         (json.dumps(value),))
+            conn.commit()
+        finally:
+            conn.close()
+        os.replace(prober, staging)
+        return staging
+
+    def test_swap_replaces_data_and_cleans_temp_files(self) -> None:
+        self.db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('swap_probe', ?)",
+                        (json.dumps('旧'),))
+        staging = self._staged_copy('新')
+        db.replace_database(staging)
+        row = self.db.query_one("SELECT value FROM settings WHERE key = 'swap_probe'")
+        self.assertEqual(json.loads(row['value']), '新')
+        self.assertFalse(staging.exists(), '临时库没有被移走')
+        self.assertFalse(Path(str(config.DB_PATH) + '.swap-old').exists(),
+                         '旧库备份残留')
+
+    def test_swap_failure_restores_old_database(self) -> None:
+        self.db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('swap_probe', ?)",
+                        (json.dumps('旧'),))
+        staging = self._staged_copy('新')
+        real_replace = db.os.replace
+
+        def flaky(src, dst):
+            if Path(src) == staging:
+                raise OSError('磁盘写满了')
+            return real_replace(src, dst)
+
+        with mock.patch.object(db.os, 'replace', flaky):
+            with self.assertRaises(OSError):
+                db.replace_database(staging)
+        row = self.db.query_one("SELECT value FROM settings WHERE key = 'swap_probe'")
+        self.assertEqual(json.loads(row['value']), '旧', '替换失败后旧库没有被放回来')
+
+    def test_recovers_if_previous_swap_died_between_renames(self) -> None:
+        """上次换库死在「旧库已改名、新库还没就位」时，不能把仅存的数据删掉。"""
+        self.db.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('swap_probe', ?)",
+                        (json.dumps('旧'),))
+        staging = self._staged_copy('新')
+        target = Path(config.DB_PATH)
+        old = Path(str(target) + '.swap-old')
+
+        # 模拟崩溃现场：连接已关，正式库不在，只剩 .swap-old
+        with db._lock:
+            db._close_connection_locked()
+        os.replace(target, old)
+        self.assertFalse(target.exists())
+
+        real_replace = db.os.replace
+
+        def flaky(src, dst):
+            if Path(src) == staging:
+                raise OSError('磁盘写满了')
+            return real_replace(src, dst)
+
+        with mock.patch.object(db.os, 'replace', flaky):
+            with self.assertRaises(OSError):
+                db.replace_database(staging)
+        row = self.db.query_one("SELECT value FROM settings WHERE key = 'swap_probe'")
+        self.assertEqual(json.loads(row['value']), '旧',
+                         '崩溃残骸被当成垃圾删掉，仅存的数据丢了')
 
 
 class ValidationOrderTest(_Case):

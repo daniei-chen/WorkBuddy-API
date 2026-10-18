@@ -13,6 +13,7 @@ import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {ModelWhitelistInput} from '@/components/common/keys/ModelWhitelistInput';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
@@ -264,10 +265,12 @@ export default function KeysPage() {
         // '' 是有意义的取值（不限制版本），必须照传——后端以它区分
         // 「存量密钥，两版都能调」与「限定了某一版」
         //
-        // 新建时**以当前所在版本为准**（而不是 openCreate 时的快照）：
+        // 新建时默认**以当前所在版本为准**（而不是 openCreate 时的快照）：
         // 弹窗开着的时候用户可能切了版本，若沿用快照，创建出来的密钥版本
         // 会与界面上显示的不一致——那种错是静默的，只有调用时才暴露。
-        realm: editing ? form.realm : realm,
+        // 例外是用户在新建弹窗里显式打开了「不限制」（form.realm === ''，
+        // issue #191）：那是明确的意图，不能被页面版本覆盖掉。
+        realm: editing || form.realm === '' ? form.realm : realm,
         // 绑定上游（多上游 / 分组隔离）：null = 默认上游，照传——
         // 后端以它区分「显式改回默认上游」与「本次没提交该字段」（PATCH 语义）。
         upstream_id: form.upstream_id,
@@ -295,7 +298,12 @@ export default function KeysPage() {
       } else {
         const created = await keyApi.create(payload as Partial<ApiKey>);
         notify.ok(t('keys.keyCreated'));
-        if (created.key) setIssued(created.key);
+        if (created.key) {
+          setIssued(created.key);
+          // 上一把密钥的「一键导入」结果不能留到这一把：否则用户会以为新密钥
+          // 已经写入目标、或对着旧备份路径去核对。
+          setImported(null);
+        }
       }
       setFormOpen(false);
       // 刷新失败**不能**把这次创建判成失败：密钥已经建好了。
@@ -538,6 +546,11 @@ export default function KeysPage() {
 
       {/* 刷新时有请求失败：常驻提示，**不**顶掉已经显示出来的内容——那些数据仍然
           是对的，只是可能不是最新的。 */}
+      {/* 上游清单没取到：新建密钥的「绑定上游」只剩默认项，静默建出来会绑错池。
+          单独说清（比笼统的「部分失败」更能指导下一步）。 */}
+      {'upstreams' in errors && (
+        <LoadError message={t('keys.upstreamsFailed')} onRetry={reload} />
+      )}
       {partialFailed && (
         <LoadError message={t('state.partialFailed')} onRetry={reload} />
       )}
@@ -745,7 +758,7 @@ export default function KeysPage() {
         {/* 「暂无密钥」是**一条都没有**的断言，取不到时不能说这句（见上面首屏守卫的
             说明）。`keysFailed` 覆盖「另一份取到了、这一份没有」的部分失败：那时首屏
             守卫不会拦（values 里还有 upstreams），但列表这一块同样不知道有没有。 */}
-        {!keys.length && !keysFailed && (
+        {!shownKeys.length && !keysFailed && (
           <EmptyState
             icon={KeyRound}
             title={t('keys.emptyTitle')}
@@ -800,7 +813,7 @@ export default function KeysPage() {
                       value={form.expiryMode}
                       onValueChange={(v) => setForm({...form, expiryMode: v as FormState['expiryMode']})}
                     >
-                      <SelectTrigger className="flex-1">
+                      <SelectTrigger className="flex-1" aria-label={t('keys.expiry')}>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -853,7 +866,7 @@ export default function KeysPage() {
                     value={form.quotaCredit}
                     onChange={(e) => setForm({...form, quotaCredit: e.target.value})}
                   />
-                  <p className="text-[10px] leading-4 text-muted-foreground">
+                  <p className="text-[11px] leading-4 text-muted-foreground">
                     {t('keys.quotaCreditHint')}
                   </p>
                 </div>
@@ -880,7 +893,7 @@ export default function KeysPage() {
                       value={form.realm || '__all__'}
                       onValueChange={(v) => setForm({...form, realm: (v === '__all__' ? '' : v) as FormState['realm']})}
                     >
-                      <SelectTrigger>
+                      <SelectTrigger aria-label={t('keys.realm')}>
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -890,7 +903,7 @@ export default function KeysPage() {
                         <SelectItem value="__all__">{t('keys.realmAll')}</SelectItem>
                       </SelectContent>
                     </Select>
-                    <p className="text-[10px] leading-4 text-muted-foreground">
+                    <p className="text-[11px] leading-4 text-muted-foreground">
                       {form.realm === ''
                         ? t('keys.realmHintUnlimited')
                         : form.realm === 'global'
@@ -899,22 +912,45 @@ export default function KeysPage() {
                     </p>
                   </>
                 ) : (
-                  <div className="flex flex-wrap items-center gap-1.5 rounded-lg bg-muted px-3 py-2">
-                    <Badge
-                      variant="secondary"
-                      className={
-                        'rounded-full text-[10px] ' +
-                        (realm === 'global'
-                          ? 'text-blue-600 dark:text-blue-400'
-                          : 'text-emerald-600 dark:text-emerald-400')
-                      }
+                  <>
+                    <div className="flex flex-wrap items-center gap-1.5 rounded-lg bg-muted px-3 py-2">
+                      <Badge
+                        variant="secondary"
+                        className={
+                          'rounded-full text-[10px] ' +
+                          (form.realm === ''
+                            ? ''
+                            : realm === 'global'
+                              ? 'text-blue-600 dark:text-blue-400'
+                              : 'text-emerald-600 dark:text-emerald-400')
+                        }
+                      >
+                        {form.realm === ''
+                          ? t('keys.realmUnset')
+                          : realm === 'global'
+                            ? t('realm.global')
+                            : t('realm.cn')}
+                      </Badge>
+                      <span className="text-[11px] leading-4 text-muted-foreground">
+                        {form.realm === '' ? t('keys.realmUnlimitedOn') : t('keys.realmFollowsPage')}
+                      </span>
+                    </div>
+                    {/* 新建默认跟随当前版本（不给「国内版/国际版」二选一，选错了是静默的），
+                        但要留一个**显式**的「不限制」出口（issue #191）：有人需要一把两版
+                        都能调的密钥，而不必先建出来再编辑。 */}
+                    <label
+                      htmlFor="key-realm-unlimited"
+                      className="mt-1.5 flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground"
                     >
-                      {realm === 'global' ? t('realm.global') : t('realm.cn')}
-                    </Badge>
-                    <span className="text-[10px] leading-4 text-muted-foreground">
-                      {t('keys.realmFollowsPage')}
-                    </span>
-                  </div>
+                      <Switch
+                        id="key-realm-unlimited"
+                        checked={form.realm === ''}
+                        disabled={!isAdmin}
+                        onCheckedChange={(on) => setForm({...form, realm: on ? '' : realm})}
+                      />
+                      {t('keys.realmAll')}
+                    </label>
+                  </>
                 )}
               </div>
               <div className="space-y-1.5">
@@ -927,7 +963,7 @@ export default function KeysPage() {
                     setForm({...form, upstream_id: v === '__default__' ? null : Number(v)})
                   }
                 >
-                  <SelectTrigger>
+                  <SelectTrigger aria-label={t('keys.upstreamLabel')}>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -941,23 +977,31 @@ export default function KeysPage() {
                       ))}
                   </SelectContent>
                 </Select>
-                <p className="text-[10px] leading-4 text-muted-foreground">
+                <p className="text-[11px] leading-4 text-muted-foreground">
                   {t('keys.upstreamHint')}
                 </p>
               </div>
               <div className="space-y-1.5">
                 <Label className="text-[11px] text-muted-foreground">{t('keys.modelWhitelist')}</Label>
-                <Input
+                {/* 手输保留（清单里暂时没有的模型仍要能填），旁边给「从清单选择」：
+                    候选按版本分组，勾选即加入 —— 记不住名字、写错了等调用失败才发现的日子结束。 */}
+                <ModelWhitelistInput
                   value={form.models}
-                  onChange={(e) => {
-                    setForm({...form, models: e.target.value});
+                  realm={form.realm}
+                  placeholder="glm-5.2, global:gpt-5.4"
+                  onChange={(next) => {
+                    setForm({...form, models: next});
                     // 改了内容就作废上次结论，避免显示过期的「都对」
                     setUnknownModels(null);
                   }}
-                  // 失焦时查一次：不在每次按键时打接口（那是逐字请求），
+                  // 还在打字（草稿未提交）时同样要作废：否则改到一半就切走视线，
+                  // 看到的仍是上一版的结论（见组件里 onEdit 的说明）
+                  onEdit={() => setUnknownModels(null)}
+                  // 离开输入框时查一次：不在每次按键时打接口（那是逐字请求），
                   // 但要早于提交——提交时才发现就得重填一遍
-                  onBlur={async () => {
-                    const names = toLines(form.models);
+                  onBlur={async (next) => {
+                    // 用组件交回来的新值校验：此时 form.models 还没更新，读它会漏掉刚输入的模型。
+                    const names = toLines(next);
                     if (!names.length) {
                       setUnknownModels([]);
                       return;
@@ -969,7 +1013,6 @@ export default function KeysPage() {
                       setUnknownModels(null);   // 查不了就不显示，不编造
                     }
                   }}
-                  placeholder="glm-5.2, global:gpt-5.4"
                 />
                 {unknownModels !== null && unknownModels.length > 0 && (
                   <p ref={unknownRef}
@@ -981,7 +1024,7 @@ export default function KeysPage() {
                     版本归属由上面的选项控制（粗粒度，拦跨版本调用），
                     白名单在版本之内再收窄到具体几个模型（细粒度）。
                     写模型名时注意与所选版本一致——带 global: 前缀的是国际版模型。 */}
-                <p className="text-[10px] leading-4 text-muted-foreground">
+                <p className="text-[11px] leading-4 text-muted-foreground">
                   {/* 反引号包住的模型名由 RichText 渲染成等宽字体 */}
                   <RichText text={t('keys.modelPrefixNote')} />
                 </p>
@@ -1000,7 +1043,8 @@ export default function KeysPage() {
       </Dialog>
 
       {/* 一次性展示新密钥 */}
-      <Dialog open={!!issued} onOpenChange={(v) => !v && (setIssued(null), setExported(null))}>
+      <Dialog open={!!issued}
+              onOpenChange={(v) => { if (!v) { setIssued(null); setExported(null); setImported(null); } }}>
         {/* 尺寸必须**跟着视口走**：这个弹窗里有密钥、有一整段 JSON、还有导入区，
             内容比一般弹窗高得多。之前只写了个 max-w，高度没上限，于是窗口一矮
             （或系统缩放一大）底部就被 `overflow-hidden` 直接裁掉，连「我已保存」
@@ -1047,7 +1091,7 @@ export default function KeysPage() {
                             setExported(null);
                             setImported(null);
                           }}>
-                    <SelectTrigger className="h-7 w-[168px] rounded-full text-xs">
+                    <SelectTrigger className="h-7 w-[168px] rounded-full text-xs" aria-label={t('keys.exportTitle')}>
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>

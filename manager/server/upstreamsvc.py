@@ -241,8 +241,10 @@ def delete_upstream(upstream_id: object) -> tuple[bool, int]:
         uid = int(upstream_id)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return False, 0
-    conn = db.connect()
     with db._lock:
+        # 连接在锁内取：PG 恢复会在锁内关闭并重开共享连接，锁外拿到的句柄
+        # 可能在随后使用时已经被关掉。
+        conn = db.connect()
         try:
             conn.execute('BEGIN')
             row = conn.execute('SELECT COUNT(*) AS n FROM api_keys WHERE upstream_id = ?',

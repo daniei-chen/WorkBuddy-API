@@ -165,14 +165,27 @@ class PostParamLocationAuditTest(unittest.TestCase):
         # 账号分组（多账号池）：下列写端点都接受 `?upstream_id=` 指定作用于哪个
         # 分组（前端 accountApi 统一按 query 拼；缺省不传 = 默认分组）。
         '/api/accounts/checkin-all': {'upstream_id'},
+        # 领取活动补偿：与 checkin-all 同形，按 `?upstream_id=` 指定分组。
+        '/api/accounts/claim-compensation': {'upstream_id'},
+        # 一键刷新令牌：同 checkin-all，按 `?upstream_id=` 指定作用于哪个分组。
+        '/api/accounts/refresh-tokens': {'upstream_id'},
         '/api/accounts/{filename}/checkin': {'upstream_id'},
         '/api/accounts/{filename}/test': {'upstream_id'},
         '/api/accounts/{filename}/refresh': {'upstream_id'},
         '/api/accounts/{filename}/clear-cooling': {'upstream_id'},
+        '/api/accounts/{filename}/force-cooling': {'upstream_id'},
         '/api/accounts/{filename}/note': {'upstream_id'},
         '/api/accounts/{filename}/proxy': {'upstream_id'},
+        # 手写权重（issue #187）：与 proxy 同形，按 `?upstream_id=` 指定分组。
+        '/api/accounts/{filename}/weight': {'upstream_id'},
+        # 代理线路（设置 → 代理）：改名/删除要按分组重绑账号，前端按 query 传。
+        '/api/proxy-routes/{name}': {'upstream_id'},
+        '/api/proxy-routes/{name}/accounts': {'upstream_id'},
+        '/api/proxy-routes/{name}/auto-assign': {'upstream_id'},
         '/api/accounts/{filename}/disabled': {'upstream_id'},
         '/api/accounts/{filename}/move': {'upstream_id'},
+        # 账号导入（PR #145）：前端把分组与「是否覆盖同 uid」都按 query 传
+        '/api/accounts/upload': {'upstream_id', 'overwrite'},
         '/api/restart': {'upstream_id'},
     }
 

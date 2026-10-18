@@ -1,2 +1,5 @@
 # Reviewed production dependency baseline
 -r requirements.lock.txt
+# 上游 v2.4.0 新增依赖（issue #153 离线升级包上传用的 multipart、SOCKS5 代理用的
+# socksio）已钉进 requirements.lock.txt / requirements.hashes.txt；这里保留说明，
+# 安装仍以 lock 为准，避免两处版本漂移。

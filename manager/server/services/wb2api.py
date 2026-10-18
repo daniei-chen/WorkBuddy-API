@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from .. import config
+from .filelock import file_lock
 from . import realm as _realm
 from .errtext import err_text
 from .realm import realm_of, supports_checkin
@@ -66,15 +67,72 @@ def set_account_proxy(filename: str, proxy: str, auth_dir: Path | None = None) -
     path = _safe_file(filename, auth_dir)
     if path.is_symlink():
         raise ValueError('账号文件不能是符号链接')
-    raw = json.loads(path.read_text(encoding='utf-8'))
-    if not isinstance(raw, dict):
-        raise ValueError('账号文件格式异常')
-    if proxy:
-        raw['proxy'] = proxy
-    else:
-        raw.pop('proxy', None)
-    _atomic_write_json(path, raw)
+    # 读—改—写串行（见 filelock.py）：与续期/导入并发时，后写者不会用旧快照
+    # 把先写者刚改的字段盖回去。
+    with file_lock(path):
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict):
+            raise ValueError('账号文件格式异常')
+        if proxy:
+            raw['proxy'] = proxy
+        else:
+            raw.pop('proxy', None)
+        _atomic_write_json(path, raw)
     return {'file': filename, 'proxy': proxy}
+
+
+# 手写权重的取值范围（issue #187）：与上游 `auth.MinWeight` / `auth.MaxWeight`
+# 是同一口径。两边各有一份常量是因为它们跑在不同进程里——改一处必须同时改另一处。
+WEIGHT_MIN = 0.1
+WEIGHT_MAX = 100.0
+
+
+def _weight_of(raw: dict) -> float:
+    """读 auth 文件顶层 `weight`：非法值按 0（未设置）处理，与上游 Parse 同口径。
+
+    不做上下限钳制：钳制只在选号时发生（上游 `auth.PickWeight`），而列表要按
+    文件里的真实值回显，否则用户会看到「我填了 0.01，界面显示 0.1」。
+    """
+    try:
+        value = float(raw.get('weight') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value or value in (float('inf'), float('-inf')) or value < 0:
+        return 0.0
+    return value
+
+
+def set_account_weight(filename: str, weight: float,
+                       auth_dir: Path | None = None) -> dict:
+    """只更新手写权重，保留凭据及其他字段；写入复用账号文件的原子替换。
+
+    `weight` 传 0 = **清除**（恢复默认 1.0），与「把 1 写进文件」刻意区分：
+    默认值不该出现在每个账号文件里，否则手改过的文件会被悄悄加上一个键。
+    范围校验只在这里做（服务层唯一口径），路由负责把 ValueError 转成 400。
+    """
+    from .tencent import _atomic_write_json
+
+    try:
+        value = float(weight)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('权重必须是数字') from exc
+    if value != value or value in (float('inf'), float('-inf')):
+        raise ValueError('权重必须是有限数字')
+    if value != 0 and not (WEIGHT_MIN <= value <= WEIGHT_MAX):
+        raise ValueError(f'权重需在 {WEIGHT_MIN:g} 与 {WEIGHT_MAX:g} 之间（0 = 清除）')
+    path = _safe_file(filename, auth_dir)
+    if path.is_symlink():
+        raise ValueError('账号文件不能是符号链接')
+    with file_lock(path):
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(raw, dict):
+            raise ValueError('账号文件格式异常')
+        if value == 0:
+            raw.pop('weight', None)
+        else:
+            raw['weight'] = value
+        _atomic_write_json(path, raw)
+    return {'file': filename, 'weight': value}
 
 
 def _jwt_times(access_token: str) -> tuple[int, int] | None:
@@ -186,11 +244,15 @@ def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
             {
                 'file': path.name,
                 'proxy': str(raw.get('proxy') or ''),
+                # 会话名：旧版线路地址里的 `{account}` 靠它认出口 IP（界面不展示）。
+                # 旧的 proxy_pool（一个账号挂多条线路）已废弃，不再透传。
+                'proxy_session': str(raw.get('proxy_session') or ''),
                 'uid': str(acct.get('uid', '')),
                 'nickname': acct.get('nickname') or '未命名',
                 'enterprise_id': acct.get('enterpriseId', '') or '',
                 'expires_at': exp,
-                'is_expired': now >= exp,
+                # expiresAt=0 is an unknown expiry, not an already expired token.
+                'is_expired': exp > 0 and now >= exp,
                 'remain_seconds': max(0, int(exp - now)),
                 # 该令牌签发的总时长（供进度条按真实比例展示），解不出为 None
                 'ttl_seconds': ttl,
@@ -202,6 +264,10 @@ def list_auth_accounts(auth_dir: Path | None = None) -> list[dict]:
                 'realm': realm_of({'realm': raw.get('realm') or auth.get('realm'),
                                    'domain': auth.get('domain')}),
                 'domain': str(auth.get('domain') or ''),
+                # 手写权重（issue #187）：0 = 未设置（上游按 1.0 处理）。
+                # 原样给出，不做钳制——界面要按文件里的真实值回显，
+                # 钳制与默认值只在选号时生效（上游 auth.PickWeight）。
+                'weight': _weight_of(raw),
                 # 该版本是否支持签到体系（国际版没有，调用方据此跳过而不是打 4xx）
                 'checkin_supported': supports_checkin(
                     realm_of({'realm': raw.get('realm') or auth.get('realm'),
@@ -687,12 +753,11 @@ def clear_account_cooling_state(uid: str) -> dict:
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f'上游状态文件不是合法 JSON（{path}）：{exc}') from exc
     accounts = state.get('accounts') if isinstance(state, dict) else None
-    if not isinstance(accounts, dict) or not isinstance(accounts.get(uid), dict):
-        raise ValueError('该账号不在上游状态文件中')
-
-    # 保留一份最近一次强制清除前的快照，便于人工回退。state.json 不含凭证。
-    backup = path.with_name(path.name + '.force-clear.bak')
-    shutil.copy2(path, backup)
+    if not isinstance(accounts, dict):
+        raise ValueError(f'上游状态文件缺少 accounts 对象（{path}）')
+    if uid not in accounts or not isinstance(accounts.get(uid), dict):
+        # 尚未进入 state.json 的账号本来就没有持久化冷却状态，无需修改文件
+        return {'uid': uid, 'state_file': str(path), 'backup': '', 'before': {}}
 
     account = accounts[uid]
     before = {
@@ -708,6 +773,10 @@ def clear_account_cooling_state(uid: str) -> dict:
     # 落盘逻辑就这么做，其注释写明是为了避免「until 零值 + cool_kind」的不一致快照。
     # 写 0 不会立刻出问题（until 是零值，上游下次 Flush 也会按规范抹掉），但没必要
     # 在别人的文件里留一个自己造的非规范形态。
+    #
+    # 与 set_account_cooling_state 的取舍**不对称，这是刻意的**：那边是「要有一段
+    # 冷却」，必须写出 cool_kind=0（否则 until 有值却没有类型，上游按未知形态处理）；
+    # 这边是「不要冷却」，就按上游自己的规范删键。两条路都对，别"统一"成一个写法。
     account.pop('cool_kind', None)
     account['soft_streak'] = 0
     account.pop('model_cooldowns', None)
@@ -715,12 +784,78 @@ def clear_account_cooling_state(uid: str) -> dict:
     account['retry_count'] = 0
     account.pop('degrade_until', None)
     account['consecutive_fails'] = 0
-    # disabled=true 时 reason 是禁用原因，不属于冷却域，不能误清。
     if not bool(account.get('disabled')):
         account.pop('reason', None)
 
+    backup = path.with_name(path.name + '.force-clear.bak')
+    shutil.copy2(path, backup)
     _atomic_write_json(path, state)
     return {'uid': uid, 'state_file': str(path), 'backup': str(backup), 'before': before}
+
+
+def set_account_cooling_state(
+    uid: str,
+    until: str,
+    reason: str = '手动设置冷却',
+) -> dict:
+    """设定一个账号在 state.json 中的冷却截止时间与原因。
+
+    只修改 target uid 对应条目，`disabled` / `manual_disabled` / 凭证 / 积分
+    等正交状态保持不变。调用方必须先停止上游，否则周期 Flush 会覆盖本改动。
+    """
+    uid = str(uid or '').strip()
+    if not uid:
+        raise ValueError('uid 为空')
+    path = upstream_state_file()
+    try:
+        state = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError as exc:
+        raise ValueError(f'未找到上游状态文件：{path}') from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f'上游状态文件不是合法 JSON（{path}）：{exc}') from exc
+    accounts = state.get('accounts') if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        state = {'accounts': {}}
+    accounts = state.setdefault('accounts', {})
+    if not isinstance(accounts, dict):
+        accounts = state['accounts'] = {}
+
+    # 保留一份最近一次强制设置前的快照，便于人工回退。
+    backup = path.with_name(path.name + '.force-cooling.bak')
+    shutil.copy2(path, backup)
+
+    # 若账号尚未存在于 state.json 中（如新添加或刚启用尚未触发 Flush 的账号），
+    # 自动初始化默认结构，避免报错拒绝
+    account = accounts.setdefault(uid, {
+        'credits': 0,
+        'disabled': False,
+        'manual_disabled': False,
+        'until': '0001-01-01T00:00:00Z',
+        'cool_kind': 0,
+        'soft_streak': 0,
+        'session_dead_fails': 0,
+        'consecutive_fails': 0,
+        'credits_expiring': 0,
+    })
+    before = {
+        'until': account.get('until'),
+        'reason': account.get('reason'),
+        'cool_kind': account.get('cool_kind'),
+    }
+    account['until'] = until
+    account['cool_kind'] = 0  # 0 = CoolHard (hard_credit)，保证全冷却兜底时也不会被选中
+    account['reason'] = str(reason or '手动设置冷却').strip()
+    account['soft_streak'] = 0
+
+    _atomic_write_json(path, state)
+    return {
+        'uid': uid,
+        'state_file': str(path),
+        'backup': str(backup),
+        'before': before,
+        'until': until,
+        'reason': account['reason'],
+    }
 
 
 async def _set_upstream_running(running: bool) -> tuple[bool, str]:
@@ -825,6 +960,46 @@ async def force_clear_account_cooling(uid: str) -> tuple[bool, str, dict]:
         return False, '上游已重启，但冷却或模型限流状态仍然存在', changed
 
     return True, '已强制清除冷却与模型限流状态，上游已重启生效', changed
+
+
+async def force_set_account_cooling(
+    uid: str,
+    until: str,
+    reason: str = '手动设置冷却',
+) -> tuple[bool, str, dict]:
+    """强制设定账号冷却时间，并重启上游使离线修改生效。"""
+    uid = str(uid or '').strip()
+    if not uid:
+        return False, 'uid 为空', {}
+
+    stopped, stop_message = await _set_upstream_running(False)
+    if not stopped:
+        return False, f'停止上游失败：{stop_message}', {}
+
+    try:
+        changed = set_account_cooling_state(uid, until, reason)
+    except Exception as exc:  # noqa: BLE001
+        # 修改失败也必须尽力把上游拉回来，不能让它停在 maintenance 状态。
+        await _set_upstream_running(True)
+        return False, f'设定冷却失败：{exc}', {}
+
+    started, start_message = await _set_upstream_running(True)
+    if not started:
+        return False, f'状态已设定，但启动上游失败：{start_message}', changed
+
+    status = await _wait_for_upstream()
+    if not status.get('connected'):
+        return False, f'上游重启后未就绪：{status.get("error") or "未知错误"}', changed
+    account = next(
+        (x for x in status.get('accounts') or [] if str(x.get('uid') or '') == uid),
+        None,
+    )
+    if account is None:
+        return False, '状态已设定且上游已启动，但账号尚未进入账号池', changed
+    if not account.get('cooling'):
+        return False, '上游已重启，但冷却状态未生效（可能已过截止时间）', changed
+
+    return True, '已强制设定冷却状态，上游已重启生效', changed
 
 
 def admin_enabled_in_config() -> tuple[bool | None, str]:
@@ -1237,6 +1412,9 @@ _UPSTREAM_TEXT_MAX = 512
 # activity_report_count 决定每号每天发多少条对话）。前端的 max 只是
 # 输入框属性，拦不住直接调接口，必须服务端兜底。
 _INT_RANGES: dict[str, tuple[int, int, str]] = {
+    'random_delay_minutes': (0, 60, '分钟'),
+    'account_delay_min_seconds': (0, 600, '秒'),
+    'account_delay_max_seconds': (0, 600, '秒'),
     'activity_report_count': (1, 50, '条'),
     'max_in_flight': (0, 64, '个'),
     # 国际版在途上限分档（上游 2680f4c）。**语义与 max_in_flight 不同**：那边
@@ -1361,6 +1539,39 @@ def _sanitize_section(section: str, incoming: dict) -> dict:
             if val and val != '0' and not _DURATION_RE.match(val):
                 raise ValueError('expiring_soon 时长格式有误，应为 168h / 1h；留空或 0 = 禁用')
             out[key] = val
+        elif section == 'cooldown' and key == 'credit_exhausted':
+            # 积分耗尽冷却（issue #78，我们自己的上游补丁 0004）：空 = 旧行为
+            # 「硬冷却到次日 04:00 等签到」，填了 = 只退出这一小段。
+            #
+            # 三条语义都必须和后端一致，否则就是「保存成功、然后上游起不来」：
+            #   · 空串合法（= 不启用），所以不能要求必须匹配时长格式；
+            #   · **"0" 非法** —— Go 的 ParseDuration 认 "0"，补丁里再判 d <= 0 报错。
+            #     这一点与 expiring_soon / cost_explore_interval 相反（那两个 0 = 关闭），
+            #     所以不能复用它们的那条分支；
+            #   · 其余必须匹配 s/m/h（Go 不认 d）。
+            val = str(raw or '').strip()
+            if val:
+                if not _DURATION_RE.match(val):
+                    raise ValueError(
+                        'credit_exhausted 时长格式有误：留空 = 冷却到次日 4 点；'
+                        '填正时长如 10m / 1h（不支持 0，也不支持 d）'
+                    )
+                # 格式已过正则，所以一定能拆出「整数 + 单位」。
+                digits = int(re.match(r'\d+', val).group())
+                seconds = digits * {'s': 1, 'm': 60, 'h': 3600}[val[-1].lower()]
+                # **`0s`/`0m`/`0h` 都能过 `_DURATION_RE`**（它只校验形状，不看取值）。
+                # 补丁里对 `d <= 0` 是报错 —— 不在这里拦，用户会「保存成功、上游起不来」，
+                # 正是本函数开头点名的那个最难查的形态。
+                if seconds <= 0:
+                    raise ValueError(
+                        'credit_exhausted 不能填 0：留空 = 冷却到次日 4 点等签到恢复（默认），'
+                        '或填正时长如 10m / 1h'
+                    )
+                # 上界防的是溢出：Go 的 ParseDuration 对超出上限的值同样报错（上游起不来）。
+                # 一年对「积分冷却」早就等于「不启用」，不会挡住任何真实配置。
+                if seconds > 365 * 24 * 3600:
+                    raise ValueError('credit_exhausted 最多 8760h（一年）；想等于不启用就留空')
+            out[key] = val
         elif key in _INT_RANGES:
             # 统一区间校验（activity_report_count 等；见 _INT_RANGES 注释）
             out[key] = _check_int(key, raw)
@@ -1479,6 +1690,15 @@ def save_upstream_config(patch: dict) -> dict:
                 cfg[field].pop('device_token', None)
             cfg[field].update(clean)
 
+    if isinstance(patch.get('schedule'), dict) and any(
+        key in patch['schedule'] for key in ('account_delay_min_seconds', 'account_delay_max_seconds')
+    ):
+        schedule = cfg['schedule']
+        minimum = _check_int('account_delay_min_seconds', schedule.get('account_delay_min_seconds', 0))
+        maximum = _check_int('account_delay_max_seconds', schedule.get('account_delay_max_seconds', 0))
+        if minimum > maximum:
+            raise ValueError('账号最短间隔不能大于最长间隔')
+
     if 'upstash' in patch and isinstance(patch['upstash'], dict):
         incoming = patch['upstash']
         current = cfg.get('upstash')
@@ -1500,7 +1720,12 @@ def save_upstream_config(patch: dict) -> dict:
             'token': str(current.get('token') or ''),
         }
 
-    _atomic_write_json(path, cfg)
+    # 原子写（issue：审计 2026-10-18）：直接 write_text 会先截断再写，保存的瞬间
+    # 并发的网关请求可能读到半截文件（api_key / 代理线路回退为空），进程崩溃还会
+    # 留下坏配置。与账号文件同一套 tmp + os.replace。
+    from .tencent import _atomic_write_json
+    with file_lock(path):
+        _atomic_write_json(path, cfg)
     # 保存后立即让 realm 的配置缓存失效：否则 global.enabled / 两个 base 的改动
     # 最长要 10 秒后才生效，用户会以为没保存成功
     _realm.invalidate()
@@ -1779,9 +2004,18 @@ async def test_upstash(url: str, token: str | None = None) -> tuple[bool, str]:
         return False, blocked
 
     if not token:
+        # 用**已保存**的 Token 时，地址也必须是已保存的那一个：只允许测保存过的
+        # 组合，不允许「拿存好的 Token 去请求任意公网地址」。否则管理端（或
+        # admin scope 的 API Token）传入自己的服务器地址、token 留空，就能把
+        # 配置里的 Upstash Token 以 Authorization 头带出去（审计 2026-10-18）。
         try:
             cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
-            token = str((cfg.get('upstash') or {}).get('token') or '')
+            saved = (cfg.get('upstash') or {}) if isinstance(cfg, dict) else {}
+            saved_base = _upstash_rest_base(str(saved.get('url') or ''))
+            if not saved_base or saved_base != base:
+                return False, ('未提供 Token，且地址与已保存的不一致 —— '
+                               '请填写 Token 后再测试（不会把已存 Token 发往新地址）')
+            token = str(saved.get('token') or '')
         except Exception:  # noqa: BLE001
             token = ''
     if not token:

@@ -13,6 +13,8 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
 import {useT} from '@/lib/i18n/provider';
+import {errText} from '@/lib/api';
+import {notify} from '@/lib/toast';
 import {cn} from '@/lib/utils';
 
 export function ConfirmDialog({
@@ -82,6 +84,11 @@ export function ConfirmDialog({
               try {
                 await onConfirm();
                 setOpen(false);
+              } catch (err) {
+                // 以前只有 finally：业务失败会变成未处理的 rejection，弹窗不关、
+                // 界面毫无反应 —— 用户以为没点上，反复点。这里当场说清原因并
+                // 保持弹窗打开，让人能改完重试。
+                notify.err(errText(err));
               } finally {
                 setBusy(false);
               }

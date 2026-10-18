@@ -51,9 +51,14 @@ export function AuthProvider({children}: {children: ReactNode}) {
       const data = await authApi.me();
       setMe(data);
       writeCachedMe(data);
-    } catch {
-      setMe(null);
-      writeCachedMe(null);
+    } catch (e) {
+      // 只有 401（会话真的失效）才清登录态。网络抖动 / 5xx 时保留缓存：
+      // 以前一律 setMe(null) 会在后端瞬时故障时把有效会话用户踢回登录页。
+      const status = (e as {response?: {status?: number}}).response?.status;
+      if (status === 401) {
+        setMe(null);
+        writeCachedMe(null);
+      }
     } finally {
       setLoading(false);
     }

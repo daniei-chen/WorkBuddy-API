@@ -76,6 +76,7 @@ class LoginPollTestCase(unittest.TestCase):
         self.accounts._login_regions.clear()
         self.accounts._login_owner.clear()
         self.accounts._provisioned_states.clear()
+        self.accounts._login_ready.clear()
         if self._db._conn is not None:
             self._db._conn.close()
         self._db._conn = None
@@ -371,6 +372,65 @@ class RegionPlumbingTest(LoginPollTestCase):
 
         self.assertEqual(out['status'], 'waiting')
         self.assertEqual(self.accounts._login_regions.get('s-gl3'), 'TH')
+
+
+class SaveFailureRetryTest(LoginPollTestCase):
+    """落盘失败后的重试**不能再依赖腾讯**（issue #146）。
+
+    报障：国际版扫码后弹窗一直「等待中」，日志里却在刷 200 OK。根因是后台轮询
+    拿到 ready 之后落盘失败（auths 目录权限不对），而「重试」这条路径又回去问
+    腾讯 —— 那边这次拿到的是「等待中」，于是前端永远等不到结果，也看不到那句
+    「去修目录权限、修好直接重试」的可执行提示。
+
+    修法：拿到 ready 就把结果记下来，重试只重做落盘。这三条分别钉住：
+    失败仍如实报错、重试不再问腾讯、权限修好后能自己走通。
+    """
+
+    _BOOM = PermissionError(1, 'Operation not permitted', '/opt/workbuddy2api/auths/.x.json.ab.tmp')
+
+    def _poll(self, state: str = 's-savefail'):
+        return self._client().get('/api/auth/poll', params={'state': state})
+
+    def test_retry_after_save_failure_still_reports_it(self) -> None:
+        calls = {'n': 0}
+
+        async def fake_poll(state, realm=None):
+            calls['n'] += 1
+            # 第一次给 ready；之后模拟「腾讯不再报 ready」——这正是报障现场
+            return dict(_READY) if calls['n'] == 1 else {'status': 'waiting'}
+
+        with mock.patch.object(tencent, 'poll_login', fake_poll),              mock.patch.object(tencent, 'checkin',
+                               mock.AsyncMock(return_value=(0, 'ok'))),              mock.patch.object(tencent, 'write_auth_file', side_effect=self._BOOM):
+            first = self._poll()
+            second = self._poll()
+
+        self.assertEqual(first.status_code, 500, first.text)
+        self.assertIn('目录权限', first.json()['detail'])
+        self.assertEqual(second.status_code, 500,
+                         '第二次掉回了「等待中」——用户会一直等下去（#146 的现象）')
+        self.assertIn('目录权限', second.json()['detail'])
+        self.assertEqual(calls['n'], 1, '重试不该再问腾讯第二次')
+
+    def test_recovery_once_permissions_are_fixed(self) -> None:
+        """修好权限后，前端再轮询一次就应当成功（提示里承诺的就是这个）。"""
+        state = 's-recover'
+        boom_then_ok = [self._BOOM]
+
+        def write(account, auth_dir=None):  # noqa: ANN001
+            if boom_then_ok:
+                boom_then_ok.pop()
+                raise self._BOOM
+            return ('workbuddy-u-bg.json', False)
+
+        with mock.patch.object(tencent, 'poll_login',
+                               mock.AsyncMock(return_value=dict(_READY))),              mock.patch.object(tencent, 'checkin',
+                               mock.AsyncMock(return_value=(0, 'ok'))),              mock.patch.object(tencent, 'write_auth_file', side_effect=write),              mock.patch.object(self.accounts.reload, 'request_reload_or_restart'):
+            failed = self._poll(state)
+            recovered = self._poll(state)
+
+        self.assertEqual(failed.status_code, 500)
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        self.assertEqual(recovered.json()['status'], 'success')
 
 
 if __name__ == '__main__':

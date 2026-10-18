@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import time
+from pathlib import Path
 
 from fastapi import Depends, HTTPException, Request
 
@@ -128,18 +129,20 @@ def save_users(data: dict) -> None:
 
 
 def bootstrap_users() -> dict:
-    """首次启动：创建 admin 用户，密码取 WB_ADMIN_PASSWORD 或随机生成并打印一次。"""
+    """首次启动：创建 admin 用户，密码取 WB_ADMIN_PASSWORD 或随机生成。"""
     import os
     import sys
 
-    pwd = os.environ.get('WB_ADMIN_PASSWORD', '').strip() or secrets.token_urlsafe(9)
+    env_pwd = os.environ.get('WB_ADMIN_PASSWORD', '').strip()
+    pwd = env_pwd or secrets.token_urlsafe(9)
     data = {
         'secret': config.new_secret(),
         'users': [{'username': 'admin', 'role': 'admin', 'pwd_hash': make_hash(pwd)}],
         'api_keys': [],
     }
     save_users(data)
-    if not os.environ.get('WB_ADMIN_PASSWORD', '').strip():
+    if not env_pwd:
+        _write_initial_password_file(pwd)
         print('=' * 60, file=sys.stderr)
         print('[WorkBuddy Manager] 已生成初始管理员账号', file=sys.stderr)
         print(f'  用户名: admin', file=sys.stderr)
@@ -147,6 +150,55 @@ def bootstrap_users() -> dict:
         print('  请登录后立即在「设置 → 管理用户」中修改密码。', file=sys.stderr)
         print('=' * 60, file=sys.stderr)
     return data
+
+
+def initial_password_path() -> Path:
+    """初始密码落盘文件的位置（与 users.json 同级）。"""
+    return config.USERS_FILE.with_name('initial-admin-password.txt')
+
+
+def _write_initial_password_file(pwd: str) -> None:
+    """把随机生成的初始密码落盘，0600。
+
+    为什么必须留一份：随机密码**只在 stderr 打一次**（issue #179）。journal 会被
+    轮转、安装脚本可能因为竞态没抓到、用户在几屏日志里也可能翻过去 —— 一旦错过，
+    库里只有 pbkdf2 哈希，`users.json` 里也读不出明文，于是**没有任何办法登录**。
+    落一份明文 + 登录页指路，是唯一能把这个死结解开的办法。
+
+    权限与 users.json 同级（仅属主可读写）：那已经是能伪造任意管理员会话的
+    secret 所在，再多一个同样只属主可读的明文密码不改变暴露面。
+
+    改过密码后由 clear_initial_password_file() 抹掉。
+    """
+    target = initial_password_path()
+    try:
+        # 与 save_users 同样的降级写法：不支持 O_CREAT mode 的平台上退化为
+        # 写完再 chmod，并继续收紧权限。
+        try:
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        except OSError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(f'{pwd}\n')
+        else:
+            target.write_text(f'{pwd}\n', encoding='utf-8')
+        _restrict_permissions(target)
+    except OSError:
+        # 写不进去也不能影响启动：日志里那条记录仍然是唯一副本。
+        pass
+
+
+def clear_initial_password_file() -> None:
+    """密码被改掉（或显式重置）后，抹掉明文副本。
+
+    留着旧密码文件等于给了一份永远有效的凭据 —— 那正是 issue #179 想要的
+    「找回来」能力用过期的方式继续生效，安全上不能接受。
+    """
+    try:
+        initial_password_path().unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ── 会话签名 ─────────────────────────────────────────────

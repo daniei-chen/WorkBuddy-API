@@ -1,5 +1,5 @@
 [Unit]
-Description=WorkBuddy Manager (账号池管理 + OpenAI 兼容反代网关)
+Description=WorkBuddy Manager (CodeBuddy 账号池管理控制台 · OpenAI 兼容网关)
 After=network.target docker.service
 Wants=docker.service
 
@@ -24,6 +24,12 @@ Environment=WB_ENABLE_DOCS=0
 Environment=WB_GATEWAY_RATE_PER_MIN=120
 # 首次启动若不设 WB_ADMIN_PASSWORD，会随机生成并打印到日志（journalctl 可见）
 # Environment=WB_ADMIN_PASSWORD=改成你的强密码
+#
+# 上面这些之外的可选项（出口代理 WB_HTTP_PROXY、更新代理 WB_UPDATE_PROXY、
+# 新账号默认线路 WB_DEFAULT_ACCOUNT_PROXY…）写进安装目录的 .env 就行 —— 由下面
+# 这行读进来。`-` 表示文件不存在时不报错（老部署没有该文件也能启动）。
+# 注意：EnvironmentFile 的值是**字面量**，别在值后面写行内注释。
+EnvironmentFile=-/opt/workbuddy-manager/.env
 
 ExecStart=/usr/bin/python3 -m uvicorn server.main:app --host 0.0.0.0 --port 7864
 Restart=always

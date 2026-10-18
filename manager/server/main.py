@@ -14,13 +14,19 @@ import asyncio
 
 from . import config, db, redpacket, security
 from .iputil import client_ip
+from .stdio_utf8 import force_utf8_stdio
 from .routers import (
     accounts, anthropic, auth, gateway, keys, logs, models, playground,
     pgsync as pgsync_router, redpackets, responses, security as security_router,
-    settings, stats, system, tokens, upstreams,
+    proxies, settings, stats, system, tokens, upstreams,
 )
-from .services import accountlog, pgsync, renew, tasklog, taskrun
+from .services import accountlog, dailyplan, pgsync, renew, tasklog, taskrun
 from .routers import budgets
+
+# 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
+# 一旦出现 emoji（账号昵称就可能带）就会抛 UnicodeEncodeError —— 与「成长任务」
+# 那次崩溃同源（issue #147），只是触发条件更少。
+force_utf8_stdio()
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,9 @@ async def lifespan(app: FastAPI):
     # token 自动续期（issue #40）：上游只在「保活时刻」与「有流量时」刷新，
     # 长期闲置的账号会一路走到过期。这里按剩余寿命巡检补齐那个空档。
     renew.start_scheduler()
+    # 每日任务计划（签到 / 领奖 / 做任务）：管理端自己的调度器，把「一键」动作
+    # 做成每天到点自动跑。默认全部关闭，由用户在账号页显式开启（full 有风控风险）。
+    dailyplan.start_scheduler()
     # 请求日志的「账号」回填（issue #69）：账号是上游选的、不在响应里回传，
     # 只能从它的容器日志里读出来再按时间对回去（见 accountlog 的说明）。
     accountlog.start_collector()
@@ -81,10 +90,12 @@ async def lifespan(app: FastAPI):
         tasklog.stop_collector()
         taskrun.stop_scheduler()
         renew.stop_scheduler()
+        dailyplan.stop_scheduler()
         accountlog.stop_collector()
         pgsync.stop_scheduler()
-        from . import pooledhttp
-        await pooledhttp.close()
+        # 出站客户端是共享的（issue #144：Windows 上每次新建要 ~1 秒），
+        # 退出时统一关掉，别把连接池与 SSL 上下文丢在原地。
+        await config.close_clients()
 
 
 def _warn_if_exposed() -> None:
@@ -106,7 +117,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='1.0.79',
+    version='2.4.0',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，
@@ -143,10 +154,17 @@ if config.CORS_ORIGINS:
 # 取得比网关默认（8MB）宽松些：管理端有「保存上游配置」这类正常的大请求。
 MAX_API_BODY_BYTES = 16 * 1024 * 1024
 
+# 唯一需要更大请求体的管理端路径：上传离线升级包（issue #153）。发布包现在约
+# 11 MB，将来会变大，所以这里给到 64 MB —— 仍然是个**硬上限**，不是没有上限：
+# 上传本身还要过会话管理员鉴权，且落盘后立刻做 tar.gz 结构与 .version 校验。
+# 与 `updater.PACKAGE_MAX_BYTES` 必须一致（有测试盯着，别只改一边）。
+MAX_PACKAGE_BODY_BYTES = 64 * 1024 * 1024
+PACKAGE_UPLOAD_PATHS = ('/api/system/update-package',)
+
 
 @app.middleware('http')
 async def limit_api_body(request: Request, call_next):
-    """给 `/api/*` 的请求体加上限。
+    """给 `/api/*` 的请求体加上限（上传升级包那条路放宽，见上面的常量）。
 
     声明长度的快速拒绝；实际分块累计、总读取超时和缓冲容量由
     APIBodyGuard 在读取 JSON 前统一校验。
@@ -156,9 +174,11 @@ async def limit_api_body(request: Request, call_next):
             declared = int(request.headers.get('content-length') or 0)
         except ValueError:
             declared = 0
-        if declared > MAX_API_BODY_BYTES:
+        limit = (MAX_PACKAGE_BODY_BYTES
+                 if request.url.path in PACKAGE_UPLOAD_PATHS else MAX_API_BODY_BYTES)
+        if declared > limit:
             return JSONResponse(
-                {'detail': f'请求体过大（上限 {MAX_API_BODY_BYTES // 1024 // 1024} MB）'},
+                {'detail': f'请求体过大（上限 {limit // 1024 // 1024} MB）'},
                 status_code=413,
             )
     return await call_next(request)
@@ -177,6 +197,8 @@ app.include_router(security_router.router)
 # 管理面作用域化 API Token（见 docs/api-tokens.md）；接口本身只接受会话鉴权
 app.include_router(tokens.router)
 app.include_router(settings.router)
+# 代理线路与全局出口代理（设置 → 代理）
+app.include_router(proxies.router)
 # PostgreSQL 异地备份：把本地数据镜像出去、需要时拉回来（见 services/pgsync）
 app.include_router(pgsync_router.router)
 # 多上游（账号池分组）：密钥绑定上游 = 请求走那个池，见 upstreamsvc

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -485,7 +486,107 @@ def connect() -> sqlite3.Connection:
         # 「今日」趋势图会是一片空白，而卡片数字明明有值。用请求日志补一次今天
         # （幂等、只补今天、失败不影响启动）。
         ensure_hourly_today()
+        # 启动时也清一次侧表：低流量部署可能很久攒不够触发周期清理的写入量。
+        _prune_side_tables()
     return _conn
+
+
+def _close_connection_locked() -> None:
+    """关掉共享连接。调用方必须持有 `_lock`。
+
+    先做一次 TRUNCATE checkpoint：WAL 模式下未合并的页还在 `-wal` 里，只 close
+    不 checkpoint 的话，随后删除伴生文件会连带丢掉最后那批已提交的数据。
+    """
+    global _conn
+    conn, _conn = _conn, None
+    if conn is None:
+        return
+    try:
+        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    except sqlite3.Error:
+        pass
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def replace_database(staging: Path) -> None:
+    """用 *staging* 替换当前数据库，并重新打开共享连接。
+
+    **调用方不得持有 `_lock`**：这里是「先关闭、再改名、再重开」的窗口，
+    只在替换的瞬间持锁（毫秒级）；耗时的那部分（把镜像写进临时库）由调用方
+    在锁外完成 —— 这正是恢复不再阻塞网关的原因。
+
+    staging 必须是本进程独占的完整 SQLite 库（调用方负责关闭它的连接）。
+    """
+    staging = Path(staging)
+    if not staging.is_file():
+        raise FileNotFoundError(f'待替换的数据库不存在：{staging}')
+
+    target = Path(config.DB_PATH)
+    old = Path(str(target) + '.swap-old')
+    wal = Path(str(target) + '-wal')
+    shm = Path(str(target) + '-shm')
+
+    with _lock:
+        # 上一次替换在第 1、2 步之间崩溃时，正式库不在、.swap-old 才是最后
+        # 一份成功数据。先把它放回去再继续，绝不能当成残骸删掉。
+        if not target.exists() and old.exists():
+            os.replace(old, target)
+        # 清掉上一次异常中断留下的残骸（正常路径下不存在）。
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+        _close_connection_locked()
+        # 关闭连接时 SQLite 会做最后一次 checkpoint 并删除 WAL。若还剩非空
+        # WAL，说明还有未合并的已提交数据（异常关闭/别的连接占着），此时
+        # 删掉它就等于丢数据 —— 重开连接、放弃换库，让旧库连同 WAL 原样保留。
+        if wal.exists() and wal.stat().st_size > 0:
+            connect()
+            raise RuntimeError('数据库 WAL 未能合并，已放弃替换以免丢数据')
+        # WAL/SHM 必须在连接关闭之后删：Windows 上打开着的句柄不能删，
+        # 硬删会抛 WinError 32；POSIX 上虽然能删，但旧 WAL 留在原地更危险。
+        for path in (wal, shm):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        moved = False
+        try:
+            if target.exists():
+                os.replace(target, old)
+                moved = True
+            os.replace(staging, target)
+            # 旧库的 WAL/SHM **绝不能**留给新库：文件名相同，SQLite 会把它们
+            # 当成新库自己的日志重放，轻则数据对不上，重则直接损坏。
+            for path in (wal, shm):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            connect()
+            if moved:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            # 回滚：关掉可能已经打开的新库，把旧文件放回去再重开。
+            # 这一步失败意味着磁盘/权限出了大问题，只能留日志让人工处理。
+            _close_connection_locked()
+            try:
+                if moved:
+                    if target.exists():
+                        target.unlink()
+                    if old.exists():
+                        os.replace(old, target)
+                connect()
+            except Exception:
+                logger.exception('数据库替换回滚失败，需要人工检查：%s', target)
+            raise
 
 
 # 增量迁移：SQLite 的 CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
@@ -1055,8 +1156,38 @@ _REQUEST_LOG_CHECK_EVERY = 2000
 _request_log_writes = 0
 
 
+# 侧表保留策略（审计 2026-10-18）：这几张表以前只增不减。
+#   · usage_hourly：每天 × 每密钥 × 每模型 × 24 行，长期跑会拖慢查询与备份；
+#   · task_logs：采集器持续写入；
+#   · audit_logs：**未认证路径也能写**（失败令牌会留痕），没有上限等于给了一个
+#     填磁盘的入口（请求日志有 90 天保留，审计反而没有）。
+_HOURLY_RETAIN_DAYS = 90
+_TASK_LOG_RETAIN_DAYS = 90
+_AUDIT_LOG_MAX_ROWS = 20000
+
+
+def _prune_side_tables() -> None:
+    """给只增不减的侧表加保留期 / 条数上限。旁路操作，失败绝不影响主流程。"""
+    now = int(time.time())
+    hourly_cutoff = time.strftime('%Y-%m-%d',
+                                  time.localtime(now - _HOURLY_RETAIN_DAYS * 86400))
+    task_cutoff = now - _TASK_LOG_RETAIN_DAYS * 86400
+    for sql, args in (
+        ('DELETE FROM usage_hourly WHERE day < ?', (hourly_cutoff,)),
+        ('DELETE FROM task_logs WHERE ts < ?', (task_cutoff,)),
+        # 保留最新 N 行：删除 id <= 第 N+1 新那行的 id；不足 N 行时子查询为 NULL，
+        # `id <= NULL` 不成立，什么都不会删。
+        ('DELETE FROM audit_logs WHERE id <= (SELECT id FROM audit_logs '
+         'ORDER BY id DESC LIMIT 1 OFFSET ?)', (_AUDIT_LOG_MAX_ROWS,)),
+    ):
+        try:
+            execute(sql, args)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _prune_request_logs() -> None:
-    """按保留期清理请求日志（滚动删除最旧的）。
+    """按保留期清理请求日志（滚动删除最旧的），顺手清理侧表。
 
     旁路操作：任何失败都不能影响写入本身（更不能影响转发）。
     """
@@ -1065,6 +1196,7 @@ def _prune_request_logs() -> None:
         execute('DELETE FROM request_logs WHERE ts < ?', (cutoff,))
     except Exception:  # noqa: BLE001
         pass
+    _prune_side_tables()
 
 
 def add_request_log(**fields: object) -> None:

@@ -72,6 +72,11 @@ dev/.shots-admin
 dev/.admin-flow
 # 白名单校验验收（verify_whitelist_hint.py）的临时数据与截图
 dev/.wl-hint
+# 「设置 → 代理」页面的浏览器验收（verify_proxy_page_ui.py）
+dev/.proxy-ui
+dev/.shots-proxy
+dev/.enhance-ui
+dev/.shots-enhance
 dev/.shots-wl
 # 用量页「默认今日」验收（verify_stats_today_ui.py）的临时数据与截图
 dev/.stats-today
@@ -117,6 +122,9 @@ dev/.pack-test
 # 红包抽奖页验收（verify_claim_ui.py）的临时数据与截图
 dev/.claim-ui
 dev/.shots-claim-ui
+# 新增控件验收（verify_new_controls_ui.py）的临时数据与截图
+dev/.new-controls
+dev/.shots-new-controls
 # DeviceTokenTest 的临时文件现场（test_outbound_alignment.py，只清文件、目录保留）
 server/tests/_dt_tmp/
 
@@ -129,5 +137,9 @@ server/tests/_dt_tmp/
 .tools/
 local-ops/
 LOCAL_DEPLOY_NOTES.md
+# 安装器构建产物（windows\launcher\build.ps1 输出）
+/windows/launcher/dist/
 start-all.cmd
 stop-all.cmd
+dev/.weight-task
+dev/.shots-weight-task

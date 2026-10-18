@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 import sys
+from urllib.parse import urlsplit
 import logging
 import time
 
@@ -13,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
 from .. import observability
+from ..services import modelmap, proxyroutes
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -98,25 +101,129 @@ def _bearer(request: Request) -> str:
 # 所以做法是：上限改成**本端自己的**配置（`WB_GATEWAY_MAX_BODY_MB`），默认调到
 # 32 MB —— 足够容纳常见的长上下文与附件，又不会让单进程内存失控。
 #
-# 兼容：上游若仍是**旧版**（配置里还有 server.max_body_mb），继续尊重它的取值
-# （见 max_body_bytes），这样升级顺序不受限：先升哪边都不会出现「一边说 256MB
-# 另一边 413」的错配。
+# 上限取值（v2.4.0 语义 + 本端硬顶）：
+#   1. 上游 config.json 的 server.max_body_mb（本机 2api 写的是 1024）——**采信**；
+#   2. 读不到/没这个键 → 本端 WB_GATEWAY_MAX_BODY_MB（默认 64MB）；
+#   3. 无论哪种，都不超过本端硬顶 WB_GATEWAY_MAX_BODY_CEILING_MB（默认 1024）。
+# 为什么硬顶必须留在**网关**：本端要把完整 body 读进内存再 json.loads（峰值约
+# 体积的 2~3 倍），上游 Go 端能背压、本端不能。配置写错（比如填 99999）时
+# 不能把进程内存一次性交出去。
 _BODY_LIMIT_TTL = 10
-_body_limit_cache: dict[str, float | int] = {'at': 0.0, 'bytes': 0}
+_body_limit_cache: dict[str, float | int] = {'at': 0.0, 'bytes': 0, 'source': ''}
 DEFAULT_MAX_BODY_MB = max(1, _env_int('WB_GATEWAY_MAX_BODY_MB', 64))
+# 本端硬顶：上游配置再大也不越过它（保护本进程内存，见上面的说明）
+BODY_CEILING_MB = max(1, _env_int('WB_GATEWAY_MAX_BODY_CEILING_MB', 1024))
+# 上限是**谁**定的：'upstream' / 'env' / ''（默认），'+ceiling' 表示被硬顶截断。
+# 保留这个字段是为了 413 文案能指向真正该改的地方。
+_BODY_LIMIT_SOURCE: dict[str, str] = {'value': ''}
+
+
+def _env_set(name: str) -> bool:
+    value = (os.environ.get(name) or '').strip()
+    return value != ''
 
 
 def max_body_bytes() -> int:
-    # The legacy Go server.max_body_mb field was retired. The public Nginx path accepts 64 MiB.
-    return DEFAULT_MAX_BODY_MB * 1024 * 1024
+    """当前生效的请求体上限（字节）。
+
+    取值顺序：上游 config.json 的 `server.max_body_mb` → 本端
+    `WB_GATEWAY_MAX_BODY_MB`；最后再被 `BODY_CEILING_MB` 截断。
+    10 秒缓存：改配置很快生效，又不必每请求读文件。
+    """
+    now = time.time()
+    cached = int(_body_limit_cache['bytes'])
+    if cached and now - float(_body_limit_cache['at']) < _BODY_LIMIT_TTL:
+        return cached
+    limit_mb = DEFAULT_MAX_BODY_MB
+    source = 'env' if _env_set('WB_GATEWAY_MAX_BODY_MB') else ''
+    try:
+        cfg = json.loads(config.UPSTREAM_CONFIG.read_text(encoding='utf-8'))
+        mb = int((cfg.get('server') or {}).get('max_body_mb') or 0)
+        if mb > 0:
+            limit_mb = mb
+            source = 'upstream'
+    except Exception:  # noqa: BLE001
+        # 配置读不到就沿用本端默认值：网关不能因为读不到配置而拒绝服务
+        pass
+    if limit_mb > BODY_CEILING_MB:
+        limit_mb = BODY_CEILING_MB
+        source = f'{source}+ceiling' if source else 'ceiling'
+    limit = limit_mb * 1024 * 1024
+    _body_limit_cache['at'] = now
+    _body_limit_cache['bytes'] = limit
+    _body_limit_cache['source'] = source
+    _BODY_LIMIT_SOURCE['value'] = source
+    return limit
+
+# ── max_tokens 上限钳制 ────────────────────────────────────────────
+#
+# 上游的 `Request.max_tokens` 是 **int32**（上限 2147483647）。超出后上游拒绝时
+# 不是回 400，而是把它包成 `no_healthy_account` + 503——客户端据此以为「服务暂时
+# 不可用」而重试，但参数越界重试多少次都一样失败。
+#
+# 实测触发来源：有客户端按「剩余额度 → max_tokens」做减法（形如 `1e10 - 已消耗`，
+# 约 99.99 亿，是 int32 上限的 4.66 倍）。这类值是**算出来的**、不是用户填的，
+# 客户端那侧的换算逻辑我们改不到，只能由网关兜住。
+#
+# 阈值取 1e6：上游 /v1/models 里最大的 max_output_tokens 实测为 131072，
+# 1e6 有约 7 倍余量，不会误伤正常请求，又能挡住这类减法式产物。
+MAX_TOKENS_CEILING = 1_000_000
+
+# 一并钳制的字段：三种协议各自的输出上限字段名。
+# `max_completion_tokens` 是 OpenAI 较新的名字（o-series / gpt-5 时代取代
+# `max_tokens`），部分客户端已默认用它；上游同样按 int32 读，实测越界时一样
+# 回 503。网关是透传的，客户端发什么就转发什么，故必须一并兜住。
+_MAX_TOKENS_FIELDS = ('max_tokens', 'max_completion_tokens', 'max_output_tokens')
+
+
+def clamp_max_tokens(body: dict) -> None:
+    """原地钳制请求体里的输出上限字段（见 _MAX_TOKENS_FIELDS）。
+
+    为什么是**原地改**而不是返回新 dict：`_chat` 与两个协议层都是拿到 body 后
+    直接转发，原地把越界值压回上限，调用方无需改动其余逻辑。
+
+    非数字一律**原样保留**（不猜测、不置默认）：把它交回上游去判，网关不替
+    上游做协议决定——历史上替上游兜底过的字段都留下了难以回溯的偏差。
+    """
+    if not isinstance(body, dict):
+        return
+    for field in _MAX_TOKENS_FIELDS:
+        value = body.get(field)
+        # bool 是 int 的子类，必须排除；None 交给上游按「未提供」处理
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if value <= MAX_TOKENS_CEILING:
+            continue
+        body[field] = MAX_TOKENS_CEILING
 
 
 def _payload_too_large(limit: int) -> JSONResponse:
+    """413 的正文必须说清「上限是多少、谁定的、该去哪改」。
+
+    issue #180 的教训：以前不管上限从哪来都写「由环境变量 WB_GATEWAY_MAX_BODY_MB
+    决定」—— 而用户的上游是旧版、config.json 里还留着 `server.max_body_mb`，
+    面板**优先**听它，于是用户改了环境变量毫无效果，还以为面板不认这个配置。
+    """
     mb = limit // 1024 // 1024
+    source = _BODY_LIMIT_SOURCE.get('value') or ''
+    if source == 'upstream':
+        where = ('该上限来自**上游** config.json 的 server.max_body_mb（面板优先听它，'
+                 '改本端环境变量不生效）：把那个值调大并重启上游，'
+                 '或者删掉该键让面板改用 WB_GATEWAY_MAX_BODY_MB')
+    elif source == 'upstream+ceiling':
+        where = (f'上游允许更大，但被本端硬顶 WB_GATEWAY_MAX_BODY_CEILING_MB 截到 {mb} MB'
+                 '（保护本进程内存：单请求峰值约为体积的 2~3 倍）')
+    elif source == 'ceiling':
+        where = (f'默认允许更大，但被本端硬顶 WB_GATEWAY_MAX_BODY_CEILING_MB 截到 {mb} MB'
+                 '（保护本进程内存）')
+    elif source == 'env':
+        where = ('该上限来自环境变量 WB_GATEWAY_MAX_BODY_MB（改完要重启面板）')
+    else:
+        where = ('当前用的是默认上限；可在 .env 里设 WB_GATEWAY_MAX_BODY_MB 提高'
+                 '（改完要重启面板）')
     return _oai_error(
-        f'请求体超过 {mb} MB 上限：请压缩内容（精简上下文或附件）。'
-        f'该上限由本网关设置（环境变量 WB_GATEWAY_MAX_BODY_MB），'
-        f'上游自 9d1a21b 起已不再限制请求体大小',
+        f'请求体超过 {mb} MB 上限：请压缩内容（精简上下文或附件），或提高上限。'
+        f'{where}。上游自 9d1a21b 起已不再限制请求体大小',
         413, 'invalid_request_error', 'payload_too_large',
     )
 
@@ -475,18 +582,18 @@ def _key_reject_code(reason: object, is_model_list: bool) -> str:
 
 
 def _map_model(model: str | None) -> str | None:
-    """「模型映射」查表：别名 → 真名；没有映射时原样返回。
+    """「模型映射」查表：别名 → 真名；没命中就落到**兜底模型**（issue #173），
+    两者都没有时原样返回。
 
     设置坏掉（存成了非对象）时按「没有映射」处理，**不能让整个网关 5xx**：
     映射是可选的便利功能，坏数据只该影响它自己那一项，不连坐（与
     `db._json_list` 对非法 JSON 列的处理同一原则）。
+
+    语义集中在 `services/modelmap`，这里只取结果：白名单补条目与别名校验走同一份
+    实现 —— 三处各写一遍必然漂移，而漂移出来的错位（能调用、但客户端的模型清单里
+    没有它）只有用户能发现。
     """
-    if not model:
-        return model
-    mapping = db.get_setting('model_map', {}) or {}
-    if not isinstance(mapping, dict):
-        return model
-    return mapping.get(model, model)
+    return modelmap.target_for(db.get_setting('model_map', {}) or {}, model)
 
 
 def _upstream_headers(upstream: dict | None = None) -> dict:
@@ -515,6 +622,38 @@ def _upstream_headers(upstream: dict | None = None) -> dict:
     return headers
 
 
+def _upstream_hint(upstream: dict | None) -> str:
+    """502/503 时补一句「本次打的是哪个上游、这一跳会不会走出口代理」。
+
+    为什么要有（issue #167：两位用户都报「直接 curl 上游是通的、经面板全 502」）：
+    原来的报错只有异常文本，看不出面板往哪打的、中间有没有代理。而最常见的两种成因
+    恰恰要靠这两条信息才能自查：
+
+      · 上游地址 / 端口填错（面板打的是配置里那个地址，不是你以为的那个）；
+      · **上游地址写成公网域名、同时又配了出口代理**：面板→上游这一跳会走代理，
+        代理绕不回你自己那台机器，于是全 502 —— 而内网与本机地址是自动直连的。
+
+    `_is_internal_host` 与转发用的判断是同一个函数，所以这里说的「会走代理」就是
+    真实行为，不是提示语里另算一套。
+    """
+    up = upstream or upstreamsvc.default_upstream()
+    base = str(up.get('base_url') or '').strip()
+    if not base:
+        return ''
+    try:
+        host = urlsplit(base).hostname
+    except ValueError:
+        host = None
+    proxy = config.effective_http_proxy()
+    if proxy and host:
+        if config._is_internal_host(host):       # noqa: SLF001 —— 与转发判断同一份实现
+            return f'（本次请求的上游：{base}；该地址属内网/本机，这一跳直连）'
+        masked = proxyroutes.mask_url(proxy)
+        return (f'（本次请求的上游：{base}；这一跳会经出口代理 {masked} —— '
+                f'代理到不了这个地址就会 502）')
+    return f'（本次请求的上游：{base}）'
+
+
 def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
                   ua: str | None) -> tuple[dict | None, JSONResponse | None]:
     """按密钥解析本次请求该走哪个上游；不可用时返回**明确报错**。
@@ -527,6 +666,9 @@ def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
         return upstreamsvc.resolve_for_key(key), None
     except upstreamsvc.UpstreamUnavailable as exc:
         _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False)
+        # 这里不加 _upstream_hint：本函数讲的是「密钥绑定的上游不可用」，作用域里
+        # 也没有那个上游对象 —— 报出默认上游的地址只会把人带偏（异常文本已经说清
+        # 是哪个分组、该启用还是改绑）。
         return None, _oai_error(str(exc), 503, 'api_error', 'upstream_unavailable')
 
 
@@ -565,6 +707,69 @@ def _scan_sse(pending: str, usage: dict) -> tuple[str, bool]:
                 ):
                     saw_content = True
     return pending, saw_content
+
+
+# ── 密钥自查用量（issue #137）─────────────────────────────
+# 拿密钥自身鉴权、只回这把密钥自己的数字，**只读面板已记录的值、不触发任何上游请求**
+# （否则「查一下还剩多少」会变成一次真实调用，反过来加剧额度消耗与限流）。
+#
+# 有意**不套用**调用时的那套校验（额度用尽 / 已过期 / 被停用 / IP 白名单）：恰恰是
+# 在调不动的时候，用户最需要看到「还剩多少、为什么调不动」。密钥本身已证明归属，
+# 这里只暴露它自己的元数据，把状态如实回给调用方，而不是再甩一个 401。
+#
+# 本地定制：`/v1/usage` 已经是本仓库的「按密钥用量统计」（在用、且被客户端依赖），
+# 上游 issue #137 的「配额自查」改挂 /v1/key，两个契约都保留、互不覆盖。
+@router.get('/v1/key')
+def key_usage(request: Request):
+    ip = iputil.client_ip(request)
+    ua = request.headers.get('user-agent')
+    path = request.url.path
+    token = _bearer(request)
+    # 认不出调用方的访问仍要进**入站日志**：这条路径与其它网关入口一样是
+    # 未鉴权可达的，漏记会让「谁在扫我」少一块（安全审计口径，见 `_log_ip`）。
+    if not token:
+        _log_ip(ip, path, True, ua, 'missing_key')
+        return _oai_error('缺少 API Key，请在 Authorization 头中提供 Bearer 令牌',
+                          401, 'authentication_error', 'missing_api_key')
+    key = keysvc.resolve(token)
+    if not key:
+        _log_ip(ip, path, True, ua, 'invalid_key')
+        return _oai_error('API Key 无效', 401, 'authentication_error', 'invalid_api_key')
+
+    def allowance(limit: int | None, used: int | None) -> dict:
+        used_n = int(used or 0)
+        limit_n = int(limit or 0)
+        return {
+            'used': used_n,
+            'limit': limit_n or None,          # None = 不限制
+            'remaining': max(0, limit_n - used_n) if limit_n else None,
+        }
+
+    now = int(time.time())
+    expires_at = int(key.get('expires_at') or 0)
+    # 记一行**请求日志**（与 `/v1/models` 同口径，0 token）：否则一把密钥被
+    # 监控脚本每分钟轮询查用量时，运维在「请求日志」里完全看不出流量从哪来。
+    # 这一行经 `_record` 顺带把「最近使用」与「来源 IP」留痕——与模型列表页、
+    # 面板 API 令牌一致；但 token / 积分消耗**一分不记**（记账口径只认真实调用）。
+    _record(key, ip, '', '', 200, 0, 0, 0, ua, None, False)
+    return {
+        'object': 'key.usage',
+        'key': {
+            'name': key.get('name') or '',
+            'prefix': key.get('prefix') or '',
+            'realm': key.get('realm') or '',
+            'enabled': bool(key.get('enabled')),
+            'expires_at': expires_at,
+            'expired': bool(expires_at and now >= expires_at),
+            'models': list(key.get('models') or []),
+        },
+        'tokens': allowance(key.get('quota'), key.get('used_tokens')),
+        'credits': allowance(key.get('quota_credit'), key.get('used_credit')),
+        'last_used_at': int(key.get('last_used_at') or 0),
+        # 这几个数字是面板**已记录**的值，读取时刻即 snapshot_at；不是向上游现问的。
+        'snapshot_at': now,
+        'data_source': 'panel-recorded',
+    }
 
 
 # ── 模型列表 ─────────────────────────────────────────────
@@ -801,6 +1006,9 @@ async def list_models(request: Request):
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', resp.status_code, 0, 0, latency, request.headers.get('user-agent'), None, False)
         payload = _scope_models(resp.json(), key)
+        # 能力字段兜底（issue #211）：随包上游的版本可能比面板旧 —— 补丁只在上游
+        # 侧时，下游经面板拿到的清单仍缺字段，客户端会整条跳过模型。
+        payload = _listing_compat_models(payload)
         # Anthropic 客户端（Claude Code 等）也会调这个路径，但期望的结构不同
         if request.headers.get('anthropic-version'):
             payload = _as_anthropic_models(payload)
@@ -808,7 +1016,7 @@ async def list_models(request: Request):
     except Exception as exc:  # noqa: BLE001
         latency = int((time.time() - started) * 1000)
         _record(key, ip, '', '', 502, 0, 0, latency, request.headers.get('user-agent'), str(exc), False)
-        return _oai_error_with_blip_body(f'上游不可用: {exc}', 502, exc)
+        return _oai_error_with_blip_body(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, exc)
 
 
 def _as_anthropic_models(payload: object) -> object:
@@ -859,6 +1067,10 @@ def _alias_entries(items: list, allow: list[str]) -> list[dict]:
 
     条目取别名所指模型的信息，只把 `id` 换成别名——**那才是客户端要发的名字**
     （发清单里的真名会被白名单拒掉）。
+
+    解析走 `modelmap.target_for`（含兜底，issue #173）：配了兜底模型之后，白名单里
+    任意名字**都调得通**，那就不该只在没有兜底时补条目 —— 否则客户端拿到的清单里
+    缺了那个名字，用户会以为"白名单没生效"，而其实是清单没列。
     """
     mapping = db.get_setting('model_map', {}) or {}
     if not isinstance(mapping, dict) or not mapping:
@@ -874,7 +1086,7 @@ def _alias_entries(items: list, allow: list[str]) -> list[dict]:
         # 本身就是清单里的模型 → 上面的白名单裁剪已保留它，不重复添加
         if not name or name in seen or name in by_bare:
             continue
-        target = mapping.get(name)
+        target = modelmap.target_for(mapping, name)
         src = by_bare.get(keysvc._bare_model(target)) if target else None
         if not src:
             continue          # 别名指向的模型不在本版本清单里 → 调不通，不给
@@ -917,6 +1129,51 @@ def _scope_models(payload: object, key: dict | None) -> object:
     # 别名：白名单可能写的是下游熟悉的别名，它不在清单里，要补进来
     scoped += _alias_entries(in_realm, allow)
     return {**payload, 'data': scoped}
+
+
+def _listing_compat_models(payload: object) -> object:
+    """补齐第三方模型目录客户端要读的能力字段（issue #211）。
+
+    上游从 #156 起在它自己的 `/v1/models` 里补了 `modalities` /
+    `supported_reasoning_levels`。但面板是**独立进程**，随包分发的上游可能比面板
+    旧（补丁只打在上游），于是下游经面板拿到的清单仍缺字段 —— 报告人的 Magpie
+    就是这样整条跳过模型、看不到多模态与推理档位的。
+
+    这里在面板侧再补一遍，口径与上游的 `addListingCompat` 一致，且**只增不改**：
+
+      · `modalities`：缺字段时补 `{"input": ["text"] + (["image"] if
+        supports_images)}`。文本是所有模型都有的能力；缺整个字段会让客户端
+        直接跳过（这正是 #211 的现场）；
+      · `supported_reasoning_levels`：缺字段且有 `reasoning_supported_efforts`
+        时派生成 `[{"effort": e}]`；没有档位就不编造；
+      · `supports_reasoning`：有档位而字段缺失时补 `true`。
+
+    认不出的结构（不是 `{data:[...]}`）原样透传 —— 不在看不懂的响应上动手脚。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = payload.get('data')
+    if not isinstance(items, list):
+        return payload
+    out: list = []
+    for m in items:
+        if not isinstance(m, dict) or not m.get('id'):
+            out.append(m)
+            continue
+        entry = dict(m)
+        if 'modalities' not in entry:
+            inputs = ['text']
+            if entry.get('supports_images') is True:
+                inputs.append('image')
+            entry['modalities'] = {'input': inputs}
+        efforts = entry.get('reasoning_supported_efforts')
+        if 'supported_reasoning_levels' not in entry and isinstance(efforts, list):
+            levels = [{'effort': e} for e in efforts if isinstance(e, str) and e]
+            if levels:
+                entry['supported_reasoning_levels'] = levels
+                entry.setdefault('supports_reasoning', True)
+        out.append(entry)
+    return {**payload, 'data': out}
 
 
 # ── 对话补全（v1 / v2）──────────────────────────────────
@@ -999,6 +1256,10 @@ async def _chat(request: Request, upstream_path: str):
     if mapped:
         body['model'] = mapped
 
+    # 越界的 max_tokens 会被上游包装成 503（见 clamp_max_tokens 的说明），
+    # 鉴权后、转发前压回上限。
+    clamp_max_tokens(body)
+
     stream = bool(isinstance(body, dict) and body.get('stream'))
     if stream:
         # 让上游在最后一个 chunk 返回 usage，便于精确计量
@@ -1044,7 +1305,7 @@ async def _chat(request: Request, upstream_path: str):
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
-            return _oai_error_with_blip(f'上游不可用: {exc}', 502, exc)
+            return _oai_error_with_blip(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, exc)
 
     # 流式转发
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5, identity=_forwarding_identity(key,upstream))
@@ -1055,7 +1316,7 @@ async def _chat(request: Request, upstream_path: str):
         await client.aclose()
         latency = int((time.time() - started) * 1000)
         _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True)
-        return _oai_error_with_blip(f'上游不可用: {exc}', 502, exc)
+        return _oai_error_with_blip(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, exc)
 
     status_code = resp.status_code
     content_type = resp.headers.get('content-type', 'text/event-stream')

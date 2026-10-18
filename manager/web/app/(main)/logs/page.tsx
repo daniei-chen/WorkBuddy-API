@@ -96,7 +96,7 @@ function AccountCell({account}: {account: string | null}) {
     <>
       <span>{m ? m[1] : account}</span>
       {m && m[2] && (
-        <span className="ml-1 font-mono text-[10px] text-muted-foreground">{m[2]}</span>
+        <span className="ml-1 font-mono text-[11px] text-muted-foreground">{m[2]}</span>
       )}
     </>
   );
@@ -318,7 +318,7 @@ export default function LogsPage() {
           <div className="space-y-1.5">
             <Label className="text-[11px] text-muted-foreground">{t('logs.filterRange')}</Label>
             <Select value={days} onValueChange={(v) => { setDays(v); setPage(1); }}>
-              <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
+              <SelectTrigger className="bg-background" aria-label={t('logs.filterRange')}><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="1">{t('logs.last24h')}</SelectItem>
                 <SelectItem value="7">{t('stats.last7')}</SelectItem>
@@ -330,7 +330,7 @@ export default function LogsPage() {
           <div className="space-y-1.5">
             <Label className="text-[11px] text-muted-foreground">{t('logs.filterKey')}</Label>
             <Select value={keyId} onValueChange={(v) => { setKeyId(v); setPage(1); }}>
-              <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
+              <SelectTrigger className="bg-background" aria-label={t('logs.filterKey')}><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">{t('logs.allKeys')}</SelectItem>
                 {keys.map((k) => (
@@ -342,7 +342,7 @@ export default function LogsPage() {
           <div className="space-y-1.5">
             <Label className="text-[11px] text-muted-foreground">{t('accounts.colStatus')}</Label>
             <Select value={status} onValueChange={(v) => { setStatus(v); setPage(1); }}>
-              <SelectTrigger className="bg-background"><SelectValue /></SelectTrigger>
+              <SelectTrigger className="bg-background" aria-label={t('accounts.colStatus')}><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">{t('common.all')}</SelectItem>
                 <SelectItem value="ok">{t('common.success')}</SelectItem>
@@ -409,7 +409,7 @@ export default function LogsPage() {
                 <TableCell className="text-xs">
                   {l.model || '—'}
                   {l.mapped_model && l.mapped_model !== l.model && (
-                    <span className="ml-1 text-[10px] text-muted-foreground">→{l.mapped_model}</span>
+                    <span className="ml-1 text-[11px] text-muted-foreground">→{l.mapped_model}</span>
                   )}
                 </TableCell>
                 <TableCell>
@@ -448,7 +448,7 @@ export default function LogsPage() {
                   ) : (
                     <span className="text-muted-foreground/70">—</span>
                   )}
-                  {l.stream && <span className="ml-1 text-[10px] text-muted-foreground">{t('logs.streamShort')}</span>}
+                  {l.stream && <span className="ml-1 text-[11px] text-muted-foreground">{t('logs.streamShort')}</span>}
                   {/* 提示词缓存（issue #69）：用户靠这条判断「缓存到底有没有起作用」。
                       上游没返回这三个字段时整块不显示（而不是显示 0%）——
                       与「确实没命中」不是一回事。 */}
@@ -506,6 +506,7 @@ export default function LogsPage() {
               variant="outline"
               size="icon"
               className="h-7 w-7 rounded-md"
+              aria-label={t('common.previousPage')}
               disabled={page <= 1}
               onClick={() => setPage((p) => Math.max(1, p - 1))}
             >
@@ -515,6 +516,7 @@ export default function LogsPage() {
               variant="outline"
               size="icon"
               className="h-7 w-7 rounded-md"
+              aria-label={t('common.nextPage')}
               disabled={page >= pages}
               onClick={() => setPage((p) => Math.min(pages, p + 1))}
             >
@@ -531,7 +533,7 @@ export default function LogsPage() {
             <DrawerDescription>{detail ? fmtDateTime(detail.ts) : ''}</DrawerDescription>
           </DrawerHeader>
           {detail && (
-            <div className="space-y-3 px-4 pb-8 text-xs">
+            <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 pb-8 text-xs">
               {([
                 ['ip', t('logs.rowIp'), detail.ip],
                 ['key', t('logs.rowKey'), detail.key_name || '—'],

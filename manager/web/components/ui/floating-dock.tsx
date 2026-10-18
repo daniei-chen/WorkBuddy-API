@@ -78,7 +78,7 @@ const FloatingDockMobile = memo(
             {open && (
               <motion.div
                 layoutId="nav"
-                className="absolute inset-x-0 bottom-full mb-2 flex flex-col gap-1"
+                className="absolute inset-x-0 bottom-full mb-2 flex max-h-[min(70dvh,420px)] flex-col gap-1 overflow-y-auto"
               >
                 {/*
                   手机端也要分组。原来这里是 `if (item.title === 'divider') return null`
@@ -136,6 +136,7 @@ const FloatingDockMobile = memo(
                             ) : item.href ? (
                             <a
                               href={withBasePath(item.href)}
+                              aria-label={item.title}
                               className={cn(
                                   'flex h-8 w-8 items-center justify-center rounded-full bg-gray-50 dark:bg-neutral-900',
                                   buttonClassName,
@@ -151,6 +152,7 @@ const FloatingDockMobile = memo(
                           ) : (
                             <button
                               onClick={item.onClick}
+                              aria-label={item.title}
                               className={cn(
                                   'flex h-8 w-8 items-center justify-center rounded-full bg-gray-50 dark:bg-neutral-900',
                                   buttonClassName,
@@ -172,6 +174,8 @@ const FloatingDockMobile = memo(
           </AnimatePresence>
           <button
             data-slot="dock-mobile-toggle"
+            aria-label={open ? 'collapse navigation' : 'expand navigation'}
+            aria-expanded={open}
             onClick={toggleOpen}
             className={cn(
                 'flex h-8 w-8 items-center justify-center rounded-full bg-gray-50 dark:bg-neutral-800',
@@ -401,11 +405,12 @@ const IconContainer = memo(
       {
         // 原生 <a> 不经过 next/link，basePath 不会自动生效
         href: withBasePath(href),
+        'aria-label': title,
         ...((external || href.startsWith('https://')) ?
             {target: '_blank', rel: 'noopener noreferrer'} :
             {}),
       } :
-      {onClick};
+      {onClick, 'aria-label': title};
 
       return (
         <Element {...elementProps}>

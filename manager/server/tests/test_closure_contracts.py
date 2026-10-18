@@ -112,43 +112,52 @@ class BodyContracts(unittest.IsolatedAsyncioTestCase):
     async def test_timeout(self):
         self.assertEqual(await self.exercise([b'x'],delay=0.05,timeout=0.01),408)
 
-    async def test_slow_handler_does_not_hold_body_capacity(self):
-        guard = APIBodyGuard(lambda *_: None, concurrency=1)
-        started = asyncio.Event()
-        finish = asyncio.Event()
-        async def slow_app(scope, receive, send):
-            await receive()
-            started.set()
-            await finish.wait()
-            await send({'type':'http.response.start','status':200,'headers':[]})
-            await send({'type':'http.response.body','body':b'ok'})
-        guard.app = slow_app
-        async def request_body():
-            return {'type':'http.request','body':b'{}','more_body':False}
-        async def no_body():
-            return {'type':'http.request','body':b'','more_body':False}
-        async def send(_): pass
-        first = asyncio.create_task(guard(
-            {'type':'http','path':'/api/write','headers':[(b'content-length',b'2')]},
-            request_body,send))
-        await started.wait()
-        second_called = asyncio.Event()
-        async def slow_get(scope, receive, send):
-            await receive()
-            second_called.set()
-            await send({'type':'http.response.start','status':200,'headers':[]})
-            await send({'type':'http.response.body','body':b'ok'})
-        original = guard.app
-        guard.app = slow_get
-        second = asyncio.create_task(guard(
-            {'type':'http','path':'/api/stats/daily','method':'GET','headers':[]},no_body,send))
-        try:
-            await asyncio.wait_for(second_called.wait(),timeout=0.2)
-        finally:
-            finish.set()
-            guard.app = original
-            await asyncio.gather(first,second)
-        self.assertEqual(guard.active,0)
+class BodyGuardConcurrency(unittest.IsolatedAsyncioTestCase):
+    """并发名额只算带 body 的请求：面板一次刷新十几个 GET，不该被 503。"""
+
+    def _guard(self, concurrency):
+        self.gate = asyncio.Event()
+
+        async def app(scope, receive, send):
+            await self.gate.wait()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'ok'})
+
+        return APIBodyGuard(app, concurrency=concurrency)
+
+    async def _one(self, guard, method, path, body=b''):
+        out = []
+
+        async def send(msg):
+            out.append(msg)
+
+        async def receive():
+            return {'type': 'http.request', 'body': body, 'more_body': False}
+
+        await guard({'type': 'http', 'method': method, 'path': path, 'headers': []},
+                    receive, send)
+        return out[0]['status']
+
+    async def test_parallel_gets_are_not_rejected(self):
+        guard = self._guard(4)
+        tasks = [asyncio.create_task(self._one(guard, 'GET', '/api/me')) for _ in range(20)]
+        await asyncio.sleep(0.05)
+        self.gate.set()
+        results = await asyncio.gather(*tasks)
+        self.assertEqual(results, [200] * 20, '无 body 的 GET 不该占用并发名额')
+
+    async def test_body_requests_beyond_limit_are_rejected(self):
+        guard = self._guard(2)
+        tasks = [asyncio.create_task(self._one(guard, 'POST', '/api/x', b'{}')) for _ in range(3)]
+        await asyncio.sleep(0.05)
+        self.gate.set()
+        results = sorted(await asyncio.gather(*tasks))
+        self.assertEqual(results, [200, 200, 503], '带 body 的请求仍受并发名额约束')
+
+    async def test_default_concurrency_is_generous(self):
+        self.assertGreaterEqual(APIBodyGuard(object()).concurrency, 16,
+                                '名额太小会让面板刷新大面积 503')
+
 
 class SchemaContracts(unittest.TestCase):
     def test_reject_unknown_section_field_type(self):

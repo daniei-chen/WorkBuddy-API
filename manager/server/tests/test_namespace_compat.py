@@ -52,8 +52,11 @@ class NamespaceCompatTests(unittest.TestCase):
         self.assertIn('apply_patch', bridge.custom_names)
         self.assertEqual(bridge.outbound_name('apply_patch'), 'apply_patch')
         self.assertEqual(bridge.outbound_name('read_file'), 'read_file')
-        self.assertEqual(bridge.restore('read_file_2'), ('read_file', 'function'))
-        self.assertEqual(bridge.restore('stat'), ('stat', 'function'))
+        self.assertEqual(bridge.restore('read_file_2'), ('read_file', 'function', None))
+        self.assertEqual(bridge.restore('read_file'), ('read_file', 'function', 'shell'))
+        self.assertEqual(bridge.restore('stat'), ('stat', 'function', 'nested.inner'))
+        self.assertEqual(bridge.restore('unknown'), ('unknown', 'function', None))
+        self.assertEqual(bridge.outbound_name('stat', 'nested.inner'), 'stat')
 
     def test_history_and_choice_use_outbound_names(self):
         body = {
@@ -181,6 +184,7 @@ class NamespacedCustomStreamTest(unittest.TestCase):
         self.assertEqual(payload['item']['type'], 'custom_tool_call')
         self.assertEqual(payload['item']['name'], 'apply_patch')
         self.assertEqual(payload['item']['input'], 'PATCH')
+        self.assertNotIn('namespace', payload['item'])
 
     def test_custom_decision_uses_one_criterion(self) -> None:
         """「是不是 custom」与「取哪份入参」必须是**同一个判据**。

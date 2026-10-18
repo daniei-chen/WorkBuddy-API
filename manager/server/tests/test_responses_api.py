@@ -118,7 +118,9 @@ class ToolOutputImageTest(unittest.TestCase):
       · 只取文字 → 工具输出的图片**静默丢失**，模型看不到图；
       · 把整段内容 str() → 图片 base64 被当**文本**分词，一张几 MB 的图能算出
         上百万 token，直接撑爆上下文（Anthropic 层实测 3.36MB ≈ 234 万 token）。
-    正确做法：文字留在 tool 消息，图片提升为紧随其后的 user 消息。
+    正确做法：文字留在 tool 消息；图片提升到**整组** tool 结果之后的一条
+    user 消息 —— 不能插在两条 tool 之间（上游按组配对校验，插在中间会
+    返回 400 / 11148）。
     """
 
     def test_image_only_output_is_lifted_not_stringified(self) -> None:
@@ -136,6 +138,9 @@ class ToolOutputImageTest(unittest.TestCase):
                         f'图片被序列化进文本了：长度 {len(tool_msg["content"])}')
         img_msg = next(m for m in out['messages'] if m['role'] == 'user')
         self.assertEqual([b['type'] for b in img_msg['content']], ['image_url'])
+        # 单工具单图：序列保持 调用→tool→user（与本修复一致，未变成更多 user）
+        self.assertEqual([m['role'] for m in out['messages']],
+                         ['assistant', 'tool', 'user'])
 
     def test_text_and_image_keeps_both(self) -> None:
         out = R.to_chat_request({'model': 'm', 'input': [
@@ -165,15 +170,125 @@ class ToolOutputImageTest(unittest.TestCase):
         img_msg = next(m for m in out['messages'] if m['role'] == 'user')
         self.assertEqual(img_msg['content'][0]['image_url']['url'], 'https://x/y.png')
 
-    def test_image_follows_its_own_tool_message(self) -> None:
-        """图片必须紧跟它那次工具调用的 tool 消息（顺序即归属）。"""
+    def test_tool_images_follow_the_whole_tool_group(self) -> None:
+        """一轮里多个工具结果各自带图：整组 tool 排完，图片按序合并进一条 user。
+
+        旧契约是每个 tool 后面紧跟自己的图片（tool→user→tool→user）。
+        后一条 user 插在两条 tool 结果中间，破坏上游「tool_calls 后成组
+        连续配对」校验，返回 400 / 11148（tool calls and tool results do
+        not match），整个会话从此不可继续——这是线上实际观察到的失败，
+        因此改为整组合并。
+        """
         out = R.to_chat_request({'model': 'm', 'input': [
             {'type': 'function_call_output', 'call_id': 'c1', 'output': [
                 {'type': 'input_image', 'image_url': 'https://x/a.png'}]},
-            {'type': 'function_call_output', 'call_id': 'c2', 'output': 'done'},
+            {'type': 'function_call_output', 'call_id': 'c2', 'output': [
+                {'type': 'input_image', 'image_url': 'https://x/b.png'}]},
         ]})
         roles = [m['role'] for m in out['messages']]
-        self.assertEqual(roles, ['tool', 'user', 'tool'])
+        self.assertEqual(roles, ['tool', 'tool', 'user'])
+        img_msg = out['messages'][-1]
+        self.assertEqual(
+            [b['image_url']['url'] for b in img_msg['content']],
+            ['https://x/a.png', 'https://x/b.png'])
+
+    def test_group_with_one_image_merges_only_that_image(self) -> None:
+        """多工具其一无图：仍是 tool→tool→user，user 只含那张图。"""
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'type': 'function_call_output', 'call_id': 'c1', 'output': 'done'},
+            {'type': 'function_call_output', 'call_id': 'c2', 'output': [
+                {'type': 'input_image', 'image_url': 'https://x/only.png'}]},
+        ]})
+        roles = [m['role'] for m in out['messages']]
+        self.assertEqual(roles, ['tool', 'tool', 'user'])
+        self.assertEqual(out['messages'][0]['content'], 'done')
+        img_msg = out['messages'][-1]
+        self.assertEqual(
+            [b['image_url']['url'] for b in img_msg['content']],
+            ['https://x/only.png'])
+
+    def test_group_text_and_images_keep_text_in_tool_and_merge_images(self) -> None:
+        """多工具均有「文字+图」：文字留在各自 tool 消息，图片合并进一条 user。"""
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'type': 'function_call_output', 'call_id': 'c1', 'output': [
+                {'type': 'input_text', 'text': '第一张'},
+                {'type': 'input_image', 'image_url': 'https://x/1.png'}]},
+            {'type': 'function_call_output', 'call_id': 'c2', 'output': [
+                {'type': 'input_text', 'text': '第二张'},
+                {'type': 'input_image', 'image_url': 'https://x/2.png'}]},
+        ]})
+        roles = [m['role'] for m in out['messages']]
+        self.assertEqual(roles, ['tool', 'tool', 'user'])
+        tools = [m for m in out['messages'] if m['role'] == 'tool']
+        self.assertEqual([m['content'] for m in tools], ['第一张', '第二张'])
+        img_msg = out['messages'][-1]
+        self.assertEqual(
+            [b['image_url']['url'] for b in img_msg['content']],
+            ['https://x/1.png', 'https://x/2.png'])
+
+    def test_realistic_multi_call_group_stays_contiguous(self) -> None:
+        """真实形状：一条 assistant 两个 tool_calls，两条 tool 结果连续，图片组后合成。"""
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'type': 'function_call', 'call_id': 'c1', 'name': 'view_image', 'arguments': '{}'},
+            {'type': 'function_call', 'call_id': 'c2', 'name': 'view_image', 'arguments': '{}'},
+            {'type': 'function_call_output', 'call_id': 'c1', 'output': [
+                {'type': 'input_image', 'image_url': 'https://x/1.png'}]},
+            {'type': 'function_call_output', 'call_id': 'c2', 'output': [
+                {'type': 'input_image', 'image_url': 'https://x/2.png'}]},
+        ]})
+        roles = [m['role'] for m in out['messages']]
+        self.assertEqual(roles, ['assistant', 'tool', 'tool', 'user'])
+        self.assertEqual(
+            [c['id'] for c in out['messages'][0]['tool_calls']], ['c1', 'c2'])
+        self.assertEqual(
+            [m['tool_call_id'] for m in out['messages'] if m['role'] == 'tool'],
+            ['c1', 'c2'])
+
+    def test_interleaved_developer_notice_stays_out_of_tool_group(self) -> None:
+        """组内夹带 developer 通知（<image_resize_notice>）也要延后。
+
+        线上实证：同一轮两次 view_image，客户端在两条工具结果之间插了一条
+        `<image_resize_notice>` developer 消息。旧实现遇到该通知会提前结束
+        工具组（tool→user→system→tool→user），上游仍报 11148。通知必须延后
+        到整组 tool 结果与图片之后。
+        """
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'type': 'function_call', 'call_id': 'c1', 'name': 'view_image', 'arguments': '{}'},
+            {'type': 'function_call', 'call_id': 'c2', 'name': 'view_image', 'arguments': '{}'},
+            {'type': 'function_call_output', 'call_id': 'c1', 'output': [
+                {'type': 'input_image', 'image_url': 'https://x/1.png'}]},
+            {'type': 'message', 'role': 'developer', 'content': [
+                {'type': 'input_text', 'text': '<image_resize_notice> resized'}]},
+            {'type': 'function_call_output', 'call_id': 'c2', 'output': [
+                {'type': 'input_image', 'image_url': 'https://x/2.png'}]},
+            {'type': 'message', 'role': 'user', 'content': [
+                {'type': 'input_text', 'text': '域名 quiz.ddjian.xyz'}]},
+        ]})
+        roles = [m['role'] for m in out['messages']]
+        self.assertEqual(roles, ['assistant', 'tool', 'tool', 'user', 'system', 'user'])
+        # tool 结果连续且顺序不变
+        self.assertEqual(
+            [m['tool_call_id'] for m in out['messages'] if m['role'] == 'tool'],
+            ['c1', 'c2'])
+        # 图片合并成一条，排在 tool 组之后、通知之前
+        img_msg = out['messages'][3]
+        self.assertEqual(
+            [b['image_url']['url'] for b in img_msg['content']],
+            ['https://x/1.png', 'https://x/2.png'])
+        self.assertIn('image_resize_notice', out['messages'][4]['content'])
+
+    def test_notice_before_first_tool_result_is_deferred(self) -> None:
+        """通知落在第一条工具结果之前：同样延后，别在 tool_calls 与结果之间落系统消息。"""
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'type': 'function_call', 'call_id': 'c1', 'name': 'view_image', 'arguments': '{}'},
+            {'type': 'message', 'role': 'developer', 'content': [
+                {'type': 'input_text', 'text': 'notice-before-first'}]},
+            {'type': 'function_call_output', 'call_id': 'c1', 'output': [
+                {'type': 'input_image', 'image_url': 'https://x/1.png'}]},
+        ]})
+        roles = [m['role'] for m in out['messages']]
+        self.assertEqual(roles, ['assistant', 'tool', 'user', 'system'])
+        self.assertIn('notice-before-first', out['messages'][-1]['content'])
 
 
 class RequestConversionTest(unittest.TestCase):
@@ -198,6 +313,64 @@ class RequestConversionTest(unittest.TestCase):
              'content': [{'type': 'input_text', 'text': 'q'}]},
         ]})
         self.assertEqual(out['messages'], [{'role': 'user', 'content': 'q'}])
+
+    def test_agent_message_plain_encrypted_content_is_forwarded(self) -> None:
+        """明文任务正文即使放在 encrypted_content 块里也不能被静默丢弃。"""
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'type': 'agent_message', 'content': [
+                {'type': 'input_text', 'text': '子代理任务：'},
+                {'type': 'encrypted_content', 'encrypted_content': '读取 parser.py 并总结'},
+            ]},
+        ]})
+        self.assertEqual(out['messages'], [
+            {'role': 'user', 'content': '子代理任务：\n读取 parser.py 并总结'},
+        ])
+
+    def test_agent_message_ciphertext_is_omitted_and_warned(self) -> None:
+        """不可解的 Fernet 风格载荷不应作为乱码转发，也不应把载荷写进日志。"""
+        ciphertext = 'gAAAAABforeign-encrypted-payload'
+        with self.assertLogs(R.logger, level='WARNING') as captured:
+            out = R.to_chat_request({'model': 'm', 'input': [
+                {'type': 'agent_message', 'content': [
+                    {'type': 'input_text', 'text': '子代理任务：'},
+                    {'type': 'encrypted_content', 'encrypted_content': ciphertext},
+                ]},
+            ]})
+        self.assertEqual(out['messages'], [
+            {'role': 'user', 'content': '子代理任务：'},
+        ])
+        self.assertTrue(any('encrypted_content' in line for line in captured.output))
+        self.assertNotIn(ciphertext, '\n'.join(captured.output))
+
+    def test_agent_message_plain_payload_preserves_image_block_order(self) -> None:
+        """明文任务与图片混排时，不能因压平成字符串而丢图或改变块顺序。"""
+        out = R.to_chat_request({'model': 'm', 'input': [
+            {'type': 'agent_message', 'content': [
+                {'type': 'input_text', 'text': '任务：'},
+                {'type': 'encrypted_content', 'encrypted_content': '说明这张图'},
+                {'type': 'input_image', 'image_url': 'https://example.com/image.png'},
+            ]},
+        ]})
+        self.assertEqual(out['messages'], [{
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': '任务：'},
+                {'type': 'text', 'text': '说明这张图'},
+                {'type': 'image_url', 'image_url': {'url': 'https://example.com/image.png'}},
+            ],
+        }])
+
+    def test_agent_message_invalid_encrypted_content_is_ignored(self) -> None:
+        """空值和非字符串不是明文任务，不得字符串化后送给模型。"""
+        for value in (None, '', 42, {'text': '不是字符串'}, ['任务']):
+            with self.subTest(value=value):
+                out = R.to_chat_request({'model': 'm', 'input': [
+                    {'type': 'agent_message', 'content': [
+                        {'type': 'input_text', 'text': '任务：'},
+                        {'type': 'encrypted_content', 'encrypted_content': value},
+                    ]},
+                ]})
+                self.assertEqual(out['messages'], [{'role': 'user', 'content': '任务：'}])
 
     def test_developer_role_maps_to_system(self) -> None:
         """Chat Completions 没有 developer 角色，原样传会被上游拒。"""
@@ -368,6 +541,31 @@ class RequestConversionTest(unittest.TestCase):
         ]})
         self.assertEqual(out['tools'][0]['function']['name'], 'get')
 
+    def test_namespaced_history_uses_qualified_tool_mapping(self) -> None:
+        tools = [
+            {'type': 'namespace', 'name': 'collaboration', 'tools': [
+                {'type': 'function', 'name': 'spawn_agent'},
+            ]},
+            {'type': 'namespace', 'name': 'other', 'tools': [
+                {'type': 'function', 'name': 'spawn_agent'},
+            ]},
+        ]
+        out = R.to_chat_request({
+            'model': 'm',
+            'tools': tools,
+            'input': [{
+                'type': 'function_call',
+                'call_id': 'call_1',
+                'name': 'spawn_agent',
+                'namespace': 'other',
+                'arguments': '{}',
+            }],
+        })
+        mapped_call_name = out['messages'][0]['tool_calls'][0]['function']['name']
+        declared_names = [tool['function']['name'] for tool in out['tools']]
+        self.assertEqual(mapped_call_name, declared_names[1])
+        self.assertNotEqual(mapped_call_name, declared_names[0])
+
     def test_nested_tools_also_accepted(self) -> None:
         out = R.to_chat_request({'model': 'm', 'input': 'x', 'tools': [
             {'type': 'function', 'function': {'name': 'get', 'parameters': {}}},
@@ -515,6 +713,25 @@ class NonStreamingResponseTest(unittest.TestCase):
         self.assertEqual(item['name'], 'get')
         self.assertEqual(item['arguments'], '{"a":1}')
         self.assertTrue(item['id'].startswith('fc_'))
+        self.assertNotIn('namespace', item)
+
+    def test_namespaced_tool_call_restores_namespace(self) -> None:
+        bridge = R._ToolBridge([{
+            'type': 'namespace',
+            'name': 'collaboration',
+            'tools': [{'type': 'function', 'name': 'spawn_agent'}],
+        }])
+        chat_name = bridge.chat_tools[0]['function']['name']
+        obj = R.to_responses_object({
+            'choices': [{'message': {'content': None, 'tool_calls': [
+                {'id': 'call_1', 'type': 'function',
+                 'function': {'name': chat_name, 'arguments': '{}'}},
+            ]}, 'finish_reason': 'tool_calls'}],
+        }, 'm', 'resp_1', bridge=bridge)
+        item = obj['output'][0]
+        self.assertEqual(item['type'], 'function_call')
+        self.assertEqual(item['name'], 'spawn_agent')
+        self.assertEqual(item['namespace'], 'collaboration')
 
     def test_custom_tool_call_is_restored(self) -> None:
         patch = '*** Begin Patch\n*** Add File: probe.txt\n+ok\n*** End Patch'
@@ -589,6 +806,72 @@ class StreamContractTest(unittest.TestCase):
         self.assertEqual(len(tools), 1)
         self.assertEqual(tools[0]['name'], 'get')
         self.assertEqual(tools[0]['arguments'], '{"a":1}', '参数分片没被拼回')
+
+    def test_namespaced_tool_call_restores_namespace_in_stream_output(self) -> None:
+        bridge = R._ToolBridge([{
+            'type': 'namespace',
+            'name': 'collaboration',
+            'tools': [{'type': 'function', 'name': 'spawn_agent'}],
+        }])
+        chat_name = bridge.chat_tools[0]['function']['name']
+        t = R._StreamTranslator('m', 'resp_1', bridge=bridge)
+        chunks: list[bytes] = []
+        chunks += t.feed(delta(tool={
+            'index': 0,
+            'id': 'call_1',
+            'function': {'name': chat_name, 'arguments': '{}'},
+        }))
+        chunks += t.feed(delta(finish='tool_calls'))
+        events = [
+            json.loads(line[5:].strip())
+            for chunk in chunks
+            for line in chunk.decode().splitlines()
+            if line.startswith('data:')
+        ]
+        done = next(event for event in events
+                    if event['type'] == 'response.output_item.done')
+        completed = next(event for event in events
+                         if event['type'] == 'response.completed')
+        self.assertEqual(done['item']['name'], 'spawn_agent')
+        self.assertEqual(done['item']['namespace'], 'collaboration')
+        self.assertEqual(
+            completed['response']['output'][0]['namespace'], 'collaboration')
+
+    def test_buffered_namespaced_function_keeps_metadata_with_fragmented_name(self) -> None:
+        """含 custom 工具的缓冲路径必须等名字拼完整，再一致地发 added/done。"""
+        bridge = R._ToolBridge([
+            {'type': 'custom', 'name': 'apply_patch'},
+            {'type': 'namespace', 'name': 'collaboration', 'tools': [
+                {'type': 'function', 'name': 'spawn_agent'},
+            ]},
+        ])
+        t = R._StreamTranslator('m', 'resp_1', bridge.custom_names, bridge)
+        chunks = t.feed(delta(tool={
+            'index': 0, 'id': 'call_1',
+            'function': {'name': 'spawn_', 'arguments': '{"task":'},
+        }))
+        chunks += t.feed(delta(tool={
+            'index': 0, 'function': {'name': 'agent', 'arguments': '"检查"}'},
+        }))
+        self.assertFalse(any(b'event: response.output_item.added' in c for c in chunks))
+        chunks += t.feed(delta(finish='tool_calls'))
+        events = [
+            json.loads(line[5:].strip())
+            for chunk in chunks
+            for line in chunk.decode().splitlines()
+            if line.startswith('data:')
+        ]
+        added = next(e['item'] for e in events if e['type'] == 'response.output_item.added')
+        done = next(e['item'] for e in events if e['type'] == 'response.output_item.done')
+        completed = next(e['response']['output'][0] for e in events
+                         if e['type'] == 'response.completed')
+        for item in (added, done, completed):
+            self.assertEqual(item['type'], 'function_call')
+            self.assertEqual(item['name'], 'spawn_agent')
+            self.assertEqual(item['namespace'], 'collaboration')
+        self.assertEqual(added['id'], done['id'])
+        self.assertEqual(added['arguments'], '')
+        self.assertEqual(done['arguments'], '{"task":"检查"}')
 
     def test_custom_tool_stream_uses_raw_input_events(self) -> None:
         t = R._StreamTranslator('m', 'resp_1', {'apply_patch'})
@@ -889,6 +1172,148 @@ class EndpointTest(unittest.TestCase):
         self.assertEqual(text, 'Hello there')
         self.assertEqual(terminal['response']['status'], 'completed')
         self.assertEqual(terminal['response']['usage']['total_tokens'], 6)
+
+    def test_namespaced_tool_call_roundtrips_through_endpoint(self) -> None:
+        """HTTP 入口真实走请求/响应转换；只有上游 HTTP 被本地 mock 替代。"""
+        token = keysvc.create_key('t')['key']
+        tool_defs = [
+            {'type': 'namespace', 'name': 'collaboration', 'tools': [
+                {'type': 'function', 'name': 'spawn_agent'},
+            ]},
+            {'type': 'namespace', 'name': 'other', 'tools': [
+                {'type': 'function', 'name': 'spawn_agent'},
+            ]},
+        ]
+        upstream_stream = b''.join(sse(
+            delta(tool={'index': 0, 'id': 'call_1',
+                        'function': {'name': 'spawn_agent', 'arguments': '{}'}}),
+            delta(tool={'index': 1, 'id': 'call_2',
+                        'function': {'name': 'other__spawn_agent', 'arguments': '{}'}}),
+            delta(finish='tool_calls',
+                  usage={'prompt_tokens': 5, 'completion_tokens': 2}),
+        )) + b'data: [DONE]\n\n'
+        replay_data = {
+            'choices': [{
+                'message': {'role': 'assistant', 'content': 'replayed'},
+                'finish_reason': 'stop',
+            }],
+            'usage': {'prompt_tokens': 6, 'completion_tokens': 1},
+        }
+
+        class _StreamResponse:
+            status_code = 200
+            headers = {'content-type': 'text/event-stream'}
+
+            async def aiter_bytes(self):
+                yield upstream_stream
+
+            async def aclose(self):
+                return None
+
+        class _JsonResponse:
+            status_code = 200
+
+            def json(self):
+                return replay_data
+
+            @property
+            def text(self):
+                return json.dumps(replay_data)
+
+        class _Client:
+            def __init__(self):
+                self.requests = []
+                self.responses = [_StreamResponse(), _JsonResponse()]
+
+            def build_request(self, method, url, **kwargs):
+                self.requests.append(kwargs['json'])
+                return object()
+
+            async def send(self, request, stream=True):
+                return self.responses.pop(0)
+
+            async def post(self, url, *, json, **kwargs):
+                self.requests.append(json)
+                return self.responses.pop(0)
+
+            async def aclose(self):
+                return None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        fake_client = _Client()
+        fake_upstream = {
+            'base_url': 'http://mock-upstream.invalid',
+            'api_key': 'test-only',
+            'is_default': False,
+        }
+        with mock.patch.object(config, 'http_client',
+                               lambda *args, **kwargs: fake_client), \
+             mock.patch.object(R.upstreamsvc, 'resolve_for_key',
+                               return_value=fake_upstream):
+            streamed = self.client.post(
+                '/v1/responses',
+                headers={'Authorization': f'Bearer {token}'},
+                json={
+                    'model': 'glm-5.2',
+                    'stream': True,
+                    'input': 'invoke namespaced tools',
+                    'tools': tool_defs,
+                },
+            )
+            replayed = self.client.post(
+                '/v1/responses',
+                headers={'Authorization': f'Bearer {token}'},
+                json={
+                    'model': 'glm-5.2',
+                    'input': [
+                        {'type': 'function_call', 'call_id': 'call_1',
+                         'name': 'spawn_agent', 'namespace': 'collaboration',
+                         'arguments': '{}'},
+                        {'type': 'function_call', 'call_id': 'call_2',
+                         'name': 'spawn_agent', 'namespace': 'other',
+                         'arguments': '{}'},
+                    ],
+                    'tools': tool_defs,
+                },
+            )
+
+        self.assertEqual(streamed.status_code, 200, streamed.text)
+        events = [
+            json.loads(line[5:].strip())
+            for line in streamed.content.decode().splitlines()
+            if line.startswith('data:')
+        ]
+        done_items = [
+            event['item'] for event in events
+            if event['type'] == 'response.output_item.done'
+            and event['item']['type'] == 'function_call'
+        ]
+        completed = next(event for event in events
+                         if event['type'] == 'response.completed')
+        expected_namespaces = ['collaboration', 'other']
+        self.assertEqual([item['namespace'] for item in done_items],
+                         expected_namespaces)
+        self.assertEqual(
+            [item['namespace'] for item in completed['response']['output']],
+            expected_namespaces,
+        )
+
+        self.assertEqual(replayed.status_code, 200, replayed.text)
+        self.assertEqual(replayed.json()['output_text'], 'replayed')
+        declared_names = [
+            tool['function']['name'] for tool in fake_client.requests[0]['tools']
+        ]
+        replay_names = [
+            call['function']['name']
+            for call in fake_client.requests[1]['messages'][0]['tool_calls']
+        ]
+        self.assertEqual(declared_names, ['spawn_agent', 'other__spawn_agent'])
+        self.assertEqual(replay_names, declared_names)
 
     def test_upstream_midstream_error_becomes_response_failed(self) -> None:
         """中途出错要以 response.failed 收尾——该事件会让客户端抛错，

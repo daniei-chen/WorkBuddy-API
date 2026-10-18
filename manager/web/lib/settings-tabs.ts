@@ -17,6 +17,7 @@
 /** 与 `TabsTrigger` 的 `value` 一一对应，顺序即导航顺序。 */
 export const SETTINGS_TABS = [
   'upstream',
+  'proxy',
   'models',
   'users',
   'tokens',
@@ -54,6 +55,7 @@ export function settingsTabHref(tab: SettingsTab): string {
  */
 export const SETTINGS_TAB_LABEL_KEYS: Record<SettingsTab, string> = {
   upstream: 'settings.tabUpstream',
+  proxy: 'settings.tabProxy',
   models: 'settings.tabModels',
   users: 'settings.tabUsers',
   tokens: 'settings.tabTokens',

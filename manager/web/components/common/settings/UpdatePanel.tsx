@@ -11,22 +11,24 @@ import {
   RotateCcw,
   Server,
   ShieldCheck,
-  ShieldOff,
   Sparkles,
   Terminal,
+  Upload,
   Trash2,
   X,
   XCircle,
 } from 'lucide-react';
 import {errText, systemApi} from '@/lib/api';
-import type {UpdateCheck, UpdateStatus} from '@/lib/types';
+import type {UpdateCheck, UpdatePackageMeta, UpdateStatus} from '@/lib/types';
 import {notify} from '@/lib/toast';
-import {fmtAgo} from '@/lib/format';
+import {fmtAgo, fmtDateTime} from '@/lib/format';
 import {useAuth} from '@/lib/auth-context';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
 import {Input} from '@/components/ui/input';
+import {Label} from '@/components/ui/label';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {LoadError} from '@/components/common/states/LoadError';
 import {RichText} from '@/lib/i18n/rich-text';
 import {useT} from '@/lib/i18n/provider';
 
@@ -74,21 +76,28 @@ export function UpdatePanel() {
    * 不依赖 finished_at 是否存在，避免时间戳缺失时关不掉。
    */
   const [resultDismissed, setResultDismissed] = useState(false);
+  /** 离线升级包（issue #153）：已上传的包 + 上传在途状态 + 用户填的发布页摘要 */
+  const [pkg, setPkg] = useState<UpdatePackageMeta | null>(null);
+  const [pkgBusy, setPkgBusy] = useState(false);
+  const [pkgSha, setPkgSha] = useState('');
   /** 清除上次更新记录（issue #105）在途状态 */
   const [clearBusy, setClearBusy] = useState(false);
-  /** 上游版本固定输入（空 = 跟随分支） */
   const [refInput, setRefInput] = useState('');
   const [refBusy, setRefBusy] = useState(false);
+  /** 四份数据**全部**没取到：版本与「有没有新版本」都不能下结论（服务可能正在重启） */
+  const [loadFailed, setLoadFailed] = useState(false);
   const refInited = useRef(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
     try {
-      const [st, vs, ck] = await Promise.allSettled([
+      const [st, vs, ck, pk] = await Promise.allSettled([
         systemApi.updateStatus(),
         systemApi.versions(),
         systemApi.checkUpdate(),
+        systemApi.packageMeta(),
       ]);
+      if (pk.status === 'fulfilled') setPkg(pk.value);
       if (st.status === 'fulfilled') {
         setStatus(st.value);
         if (!refInited.current) {
@@ -98,10 +107,84 @@ export function UpdatePanel() {
       }
       if (vs.status === 'fulfilled') setVersions(vs.value);
       if (ck.status === 'fulfilled') setCheck(ck.value);
+      // 全失败才报错：更新期间服务重启，单份失败是瞬时的；但四份都没到，
+      // 页面上「版本 — / 无更新」就是在编造结论。
+      setLoadFailed([st, vs, ck, pk].every((x) => x.status === 'rejected'));
     } catch {
       /* 更新期间服务重启，忽略瞬时失败 */
     }
   }, []);
+
+  /**
+   * 上传离线升级包。
+   *
+   * 前端只做「选文件 + 可选填发布页摘要」，核对与落盘都在服务端：填了摘要就当场
+   * 比对（不一致直接拒收），没填就只验证结构，界面把这一点写清楚。
+   */
+  const uploadPackage = useCallback(async (file: File) => {
+    setPkgBusy(true);
+    try {
+      const meta = await systemApi.uploadPackage(file, pkgSha.trim());
+      setPkg(meta);
+      notify.ok(t('updatePanel.pkgUploaded', {version: meta.version || ''}),
+                t('updatePanel.pkgUploadedDesc', {mb: String(Math.round((meta.size || 0) / 1024 / 1024))}));
+      setPkgSha('');
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setPkgBusy(false);
+    }
+  }, [pkgSha, t]);
+
+  const startFromPackage = useCallback(async (target: 'manager' | 'both') => {
+    setBusy(true);
+    try {
+      const r = await systemApi.startUpdate(target, 'uploaded');
+      notify.ok(t('updatePanel.updateStarted'), r.message);
+      await load();
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [load, t]);
+
+  const dropPackage = useCallback(async () => {
+    setPkgBusy(true);
+    try {
+      await systemApi.deletePackage();
+      setPkg({present: false});
+      notify.ok(t('updatePanel.pkgCleared'));
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setPkgBusy(false);
+    }
+  }, [t]);
+
+  /** GitHub Token（版本检测 / 一键更新的认证，issue #205）：只回掩码 */
+  const [gh, setGh] = useState<{configured: boolean; masked: string; source: 'env' | 'panel' | ''} | null>(null);
+  const [ghInput, setGhInput] = useState('');
+  const [ghBusy, setGhBusy] = useState(false);
+
+  useEffect(() => {
+    systemApi.githubToken().then(setGh).catch(() => setGh(null));
+  }, []);
+
+  const saveGh = useCallback(async (token: string) => {
+    setGhBusy(true);
+    try {
+      const r = await systemApi.saveGithubToken(token);
+      setGh({...r, source: r.configured ? 'panel' : ''});
+      setGhInput('');
+      notify.ok(token ? t('updatePanel.ghSaved') : t('updatePanel.ghCleared'));
+      await recheck();
+    } catch (e) {
+      notify.err(errText(e));
+    } finally {
+      setGhBusy(false);
+    }
+  }, [t]);
 
   /** 强制重新检测（绕过服务端 6 小时缓存） */
   const recheck = useCallback(async () => {
@@ -111,6 +194,11 @@ export function UpdatePanel() {
       setCheck(r);
       if (r.has_any) {
         notify.warn(t('updatePanel.newVersion'), describeAvailable(r, t));
+      } else if (r.manager.error || r.upstream.error) {
+        // **失败不能说成结论**（issue #204）：403/网络失败时旧缓存会回退，
+        // 以前这里照样弹「已是最新」，把一次失败说成了"没有新版本"。
+        notify.warn(t('updatePanel.checkFailed'),
+          (r.manager.error || r.upstream.error).slice(0, 160));
       } else {
         notify.ok(t('updatePanel.upToDate'), t('updatePanel.upToDateDesc'));
       }
@@ -215,6 +303,10 @@ export function UpdatePanel() {
 
   return (
     <div className="space-y-4">
+      {/* 四份数据全没取到：下面的版本号 / 「已是最新」都不可信，先阻断结论。 */}
+      {loadFailed && !running && (
+        <LoadError message={t('updatePanel.loadFailed')} onRetry={load} />
+      )}
       {/* 当前版本 */}
       <div className="rounded-[20px] bg-muted p-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -244,27 +336,16 @@ export function UpdatePanel() {
             <div className="text-[11px] text-muted-foreground">{t('updatePanel.manager')}</div>
             <div className="mt-1 flex items-center gap-1.5 text-sm font-semibold tabular-nums">
               {versions?.manager || status?.version || '—'}
-              {/* 供应链防护：本次更新的包是否经过签名校验，必须让用户看得见 */}
-              {status?.signature?.status === 'verified' && (
+              {/* 本次装的东西有没有被核对过：让用户看得见，不只留在日志里 */}
+              {status?.integrity?.status === 'digest' && (
                 <span
                   className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400"
-                  title={
-                    status.signature.detail
-                      ? t('updatePanel.signedTitleDetail', {detail: status.signature.detail})
-                      : t('updatePanel.signedTitle')
-                  }
+                  title={status.integrity.digest
+                    ? t('updatePanel.verifiedTitleDetail', {digest: status.integrity.digest})
+                    : t('updatePanel.verifiedTitle')}
                 >
                   <ShieldCheck className="h-3 w-3" />
-                  {t('updatePanel.signed')}
-                </span>
-              )}
-              {status?.signature?.status === 'skipped' && (
-                <span
-                  className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400"
-                  title={t('updatePanel.unsignedTitle')}
-                >
-                  <ShieldOff className="h-3 w-3" />
-                  {t('updatePanel.unsigned')}
+                  {t('updatePanel.verified')}
                 </span>
               )}
             </div>
@@ -317,13 +398,13 @@ export function UpdatePanel() {
                     <span className="font-medium text-foreground">{check.manager.latest}</span>
                   </div>
                 )}
-                {/* 签名未就绪：发布后到维护者签名之间有个窗口期，这时更新一定会被
-                    拒绝。先说清楚、并把按钮收起来，比让人点下去看到「已拒绝安装」好
-                    （issue #127/#129）。签名上传后最迟五分钟、或点一次刷新就会恢复。 */}
-                {check.manager.has_update && check.manager.sig_ready === false && (
+                {/* 产物未就位：版本可见但没有 .tar.gz 时点更新只会拿到 404。先说清楚、
+                    并把按钮收起来（issue #127/#129 是同一类窗口期问题）。产物上传后
+                    最迟五分钟、或点一次刷新就会恢复。 */}
+                {check.manager.has_update && check.manager.assets_ready === false && (
                   <div className="flex items-start gap-1.5 text-[11px] text-amber-600 dark:text-amber-400">
                     <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span>{t('updatePanel.sigPending')}</span>
+                    <span>{t('updatePanel.assetsPending')}</span>
                   </div>
                 )}
                 {check.upstream.has_update && (
@@ -352,14 +433,14 @@ export function UpdatePanel() {
                         <ul className="mt-1 max-h-[220px] space-y-0.5 overflow-auto rounded-xl bg-background/60 p-2">
                           {check.upstream.changes.map((c) => (
                             <li key={c.sha} className="flex gap-2">
-                              <span className="shrink-0 font-mono text-[10px] text-muted-foreground/70">
+                              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
                                 {c.sha}
                               </span>
                               <span className="min-w-0 flex-1 break-all">{c.subject}</span>
                             </li>
                           ))}
                           {check.upstream.truncated && (
-                            <li className="pt-0.5 text-[10px] text-muted-foreground/70">
+                            <li className="pt-0.5 text-[11px] text-muted-foreground">
                               {t('updatePanel.changesTruncated', {n: check.upstream.changes.length})}
                             </li>
                           )}
@@ -407,10 +488,10 @@ export function UpdatePanel() {
                 <Button
                   size="sm"
                   className="rounded-full"
-                  // 签名未就绪时不放行：这条路必然以「已拒绝安装」收场，让用户点了
-                  // 再失败只是把同一条信息换个地方说（见上方提示）。
-                  disabled={!isAdmin || busy || running || check.manager.sig_ready === false}
-                  title={check.manager.sig_ready === false ? t('updatePanel.sigPending') : undefined}
+                  // 产物未就位时不放行：这条路必然以 404 收场，让用户点了再失败只是把
+                  // 同一条信息换个地方说（见上方提示）。
+                  disabled={!isAdmin || busy || running || check.manager.assets_ready === false}
+                  title={check.manager.assets_ready === false ? t('updatePanel.assetsPending') : undefined}
                   onClick={async () => {
                     setBusy(true);
                     try {
@@ -428,6 +509,67 @@ export function UpdatePanel() {
                   {t('updatePanel.updateManager')}
                 </Button>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GitHub Token（issue #205）：未认证 60 次/小时/IP，共享出口很容易被限流 */}
+      {isAdmin && (
+        <div className="rounded-[20px] bg-muted p-4">
+          <div className="mb-1 text-xs font-medium">{t('updatePanel.ghTitle')}</div>
+          <div className="mb-2 text-[11px] leading-4 text-muted-foreground">
+            <RichText text={t('updatePanel.ghDesc')} />
+          </div>
+          <div className="flex flex-wrap items-end gap-2">
+            <div className="min-w-[16rem] flex-1 space-y-1">
+              <Input
+                type="password"
+                value={ghInput}
+                onChange={(e) => setGhInput(e.target.value)}
+                placeholder={gh?.configured ? gh.masked : t('updatePanel.ghPlaceholder')}
+                className="h-8 bg-background font-mono text-xs"
+                autoComplete="off"
+              />
+            </div>
+            <Button size="sm" className="rounded-full" disabled={ghBusy || !ghInput.trim()}
+                    onClick={() => saveGh(ghInput.trim())}>
+              <ShieldCheck className="h-3.5 w-3.5" />
+              {t('common.save')}
+            </Button>
+            {gh?.configured && (
+              <Button size="sm" variant="outline" className="rounded-full" disabled={ghBusy}
+                      onClick={() => saveGh('')}>
+                <Trash2 className="h-3.5 w-3.5" />
+                {t('updatePanel.ghClear')}
+              </Button>
+            )}
+          </div>
+          <div className="mt-2 text-[11px] text-muted-foreground">
+            {gh?.source === 'env'
+              ? t('updatePanel.ghFromEnv')
+              : gh?.configured
+                ? t('updatePanel.ghConfigured', {masked: gh.masked})
+                : t('updatePanel.ghNotSet')}
+          </div>
+        </div>
+      )}
+
+      {/* 本次检测失败、值来自上次成功结果：必须说明，不能让人以为「已经是最新」 */}
+      {check && (check.manager.error || check.upstream.error) && !status?.running && (
+        <div className="flex items-start gap-2 rounded-[20px] border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+          <div className="min-w-0 space-y-1 text-[11px] leading-4">
+            <div className="font-medium">{t('updatePanel.checkFailed')}</div>
+            <div className="break-all text-muted-foreground">
+              {(check.manager.error || check.upstream.error).slice(0, 200)}
+            </div>
+            <div className="text-muted-foreground">
+              {check.manager.stale || check.upstream.stale
+                ? t('updatePanel.staleNote', {
+                    at: fmtDateTime(Math.max(check.manager.stale_at || 0, check.upstream.stale_at || 0)),
+                  })
+                : t('updatePanel.checkFailedHint')}
             </div>
           </div>
         </div>
@@ -482,17 +624,10 @@ export function UpdatePanel() {
               {status?.ok
                 ? (status?.duration ? t('updatePanel.doneDuration', {n: status.duration}) : '') +
                   t('updatePanel.doneRestart') +
-                  (status?.signature?.status === 'verified' ? t('updatePanel.doneSigned') : '')
+                  (status?.integrity?.status === 'digest' ? t('updatePanel.doneVerified') : '')
                 : t('updatePanel.failedDetail')}
             </div>
-            {status?.ok && status?.signature?.status === 'skipped' && (
-              <div className="flex items-start gap-1.5 pt-1 text-[11px] text-amber-600 dark:text-amber-400">
-                <ShieldOff className="mt-0.5 h-3 w-3 shrink-0" />
-                <span>
-                  <RichText text={t('updatePanel.skippedWarn')} />
-                </span>
-              </div>
-            )}
+
           </div>
           <button
             type="button"
@@ -573,6 +708,91 @@ export function UpdatePanel() {
           <p className="mt-2 text-[11px] text-muted-foreground">{t('updatePanel.readonlyNote')}</p>
         )}
       </div>
+
+      {/* 离线升级包（issue #153）：内网 / 拿不到 GitHub 的机器，从别处下载发布包上传 */}
+      {isAdmin && (
+        <div className="rounded-[20px] bg-muted p-4">
+          <div className="mb-1 flex flex-wrap items-center gap-2 text-sm font-medium">
+            <Upload className="h-4 w-4" />
+            {t('updatePanel.pkgTitle')}
+            {pkg?.present && pkg.version && (
+              <Badge variant="secondary" className="rounded-full font-mono text-[10px]">
+                {pkg.version}
+              </Badge>
+            )}
+          </div>
+          <div className="mb-3 text-[11px] leading-4 text-muted-foreground">
+            <RichText text={t('updatePanel.pkgDesc')} />
+          </div>
+
+          {pkg?.present ? (
+            <div className="space-y-2">
+              <div className="rounded-2xl bg-background/60 px-3.5 py-2.5 text-[11px] leading-5">
+                <div className="font-mono">{pkg.name || t('updatePanel.pkgUnnamed')}</div>
+                <div className="text-muted-foreground break-all">
+                  sha256 {pkg.sha256 || '—'}
+                  {pkg.size ? ` · ${(pkg.size / 1024 / 1024).toFixed(1)} MB` : ''}
+                  {pkg.expected_sha256 ? ` · ${t('updatePanel.pkgCompared')}` : ` · ${t('updatePanel.pkgNotCompared')}`}
+                </div>
+                {!pkg.expected_sha256 && (
+                  <div className="mt-1 text-amber-600 dark:text-amber-500">
+                    {t('updatePanel.pkgCompareHint')}
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" className="rounded-full"
+                        disabled={busy || running}
+                        onClick={() => void startFromPackage('both')}>
+                  <DownloadCloud className="mr-1.5 h-3.5 w-3.5" />
+                  {t('updatePanel.pkgUseBoth')}
+                </Button>
+                <Button size="sm" variant="outline" className="rounded-full"
+                        disabled={busy || running}
+                        onClick={() => void startFromPackage('manager')}>
+                  {t('updatePanel.pkgUseManager')}
+                </Button>
+                <Button size="sm" variant="ghost" className="rounded-full"
+                        disabled={pkgBusy || running}
+                        onClick={() => void dropPackage()}>
+                  {t('updatePanel.pkgClear')}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="flex flex-col gap-1">
+                  <Label className="text-[11px] text-muted-foreground">{t('updatePanel.pkgFile')}</Label>
+                  <input
+                    type="file"
+                    accept=".tar.gz,application/gzip"
+                    disabled={pkgBusy || running}
+                    className="text-[11px] file:mr-2 file:rounded-full file:border-0 file:bg-background file:px-3 file:py-1.5 file:text-[11px] file:text-foreground"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) void uploadPackage(file);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
+                <label className="flex min-w-[16rem] flex-1 flex-col gap-1">
+                  <Label className="text-[11px] text-muted-foreground">{t('updatePanel.pkgShaLabel')}</Label>
+                  <Input className="h-8 bg-background font-mono text-[11px]"
+                         value={pkgSha} placeholder={t('updatePanel.pkgShaPlaceholder')}
+                         onChange={(e) => setPkgSha(e.target.value)} />
+                </label>
+              </div>
+              {pkgBusy && (
+                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  {t('updatePanel.pkgUploading')}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 上游版本固定：上游某个提交自身有问题时，固定回上一个可用提交 */}
       <div className="rounded-[20px] bg-muted p-4">

@@ -22,6 +22,7 @@ import type {CheckinLog, TaskLog, TaskLogResponse} from '@/lib/types';
 import {fmtDateTimeMarked, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
+import {RefreshPlanCard} from '@/components/common/accounts/RefreshPlanCard';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
@@ -334,6 +335,10 @@ export default function TasksPage() {
   // 后端也以 require_admin 兜底。国际版无成长中心体系，故不显示。
   const runner = isAdmin && (realm ?? 'cn') === 'cn' ? <TaskRunnerPanel /> : null;
 
+  // 计划任务（令牌刷新计划 + 每日任务）：到点自动跑的东西放「任务」这一页才对 ——
+  // 它跟「这个账号是谁」无关，只跟「什么时候做什么」有关（用户反馈：原先挂在账号页）
+  const planCard = isAdmin ? <RefreshPlanCard /> : null;
+
   /**
    * 首屏守卫：一份数据都没到（还在加载，或两份全失败）时**不渲染内容区**。
    *
@@ -349,6 +354,7 @@ export default function TasksPage() {
       <div className="flex flex-col gap-4 md:gap-6">
         {header}
         {runner}
+      {planCard}
         {isInitialFailed ? <LoadError variant="page" onRetry={reload} /> : <TasksSkeleton />}
       </div>
     );
@@ -358,6 +364,7 @@ export default function TasksPage() {
     <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
       {header}
       {runner}
+      {planCard}
 
       {/* 移动端：三块整合成一张卡片，用分段切换，避免又长又碎 */}
       <div className="flex gap-1 rounded-full bg-muted p-1 md:hidden">
@@ -402,7 +409,7 @@ export default function TasksPage() {
             </div>
             <div className="flex items-center gap-2">
               <Select value={checkinDays} onValueChange={setCheckinDays}>
-                <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]" aria-label={t('tasks.checkinTitle')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {RANGES.map((r) => (
                     <SelectItem key={r.value} value={r.value} className="text-xs">{t(r.key)}</SelectItem>
@@ -474,7 +481,7 @@ export default function TasksPage() {
                         {checkinResultText(l)}
                       </span>
                     </div>
-                    <div className="mt-0.5 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                    <div className="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
                       <span className="truncate tabular-nums">{fmtDateTimeMarked(l.ts)}</span>
                       <span className="shrink-0">{sourceLabel(l.source)}</span>
                     </div>
@@ -600,7 +607,7 @@ export default function TasksPage() {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Select value={taskDays} onValueChange={setTaskDays}>
-              <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]">
+              <SelectTrigger className="h-7 w-[116px] rounded-full text-[11px]" aria-label={t('tasks.taskLogTitle')}>
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -734,7 +741,7 @@ export default function TasksPage() {
                   >
                     {taskLogResultText(l)}
                   </div>
-                  <div className="mt-1 flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                  <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
                     <span className="truncate" title={l.uid}>
                       {accountLabel(l)}
                     </span>

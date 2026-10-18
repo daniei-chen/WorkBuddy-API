@@ -42,6 +42,42 @@ class UpstreamConfigRoundTrip(unittest.TestCase):
         self._tmp.cleanup()
 
     # ── 时刻数组 ─────────────────────────────────────────
+    def test_random_delay_roundtrip_preserves_existing_schedule_and_secrets(self) -> None:
+        write_cfg(self.cfg_path, {'api_key': 'synthetic', 'schedule': {
+            'checkin_hours': [9, 21], 'cat_enabled': False}})
+        wb2api.save_upstream_config({'schedule': {'random_delay_minutes': 60}})
+        got = read_cfg(self.cfg_path)
+        self.assertEqual(got['schedule'], {'checkin_hours': [9, 21],
+                                         'cat_enabled': False, 'random_delay_minutes': 60})
+        self.assertEqual(got['api_key'], 'synthetic')
+        wb2api.save_upstream_config({'schedule': {'random_delay_minutes': 0}})
+        self.assertEqual(read_cfg(self.cfg_path)['schedule']['random_delay_minutes'], 0)
+
+    def test_random_delay_rejects_invalid_values_without_writing(self) -> None:
+        original = {'schedule': {'checkin_hours': [9, 21]}}
+        write_cfg(self.cfg_path, original)
+        for value in (-1, 61, True, False, 1.5, '60', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                wb2api.save_upstream_config({'schedule': {'random_delay_minutes': value}})
+            self.assertEqual(read_cfg(self.cfg_path), original)
+
+    def test_account_delays_validate_merged_range_and_preserve_configuration(self) -> None:
+        write_cfg(self.cfg_path, {'api_key': 'synthetic', 'schedule': {'checkin_hours': [9, 21]}})
+        wb2api.save_upstream_config({'schedule': {
+            'account_delay_min_seconds': 30, 'account_delay_max_seconds': 120}})
+        good = read_cfg(self.cfg_path)
+        self.assertEqual(good['schedule']['account_delay_min_seconds'], 30)
+        self.assertEqual(good['schedule']['account_delay_max_seconds'], 120)
+        for patch in ({'account_delay_min_seconds': 121}, {'account_delay_max_seconds': 29},
+                      {'account_delay_min_seconds': -1}, {'account_delay_max_seconds': 601},
+                      {'account_delay_min_seconds': True}, {'account_delay_max_seconds': 1.5}):
+            with self.subTest(patch=patch), self.assertRaises(ValueError):
+                wb2api.save_upstream_config({'schedule': patch})
+            self.assertEqual(read_cfg(self.cfg_path), good)
+        wb2api.save_upstream_config({'schedule': {
+            'account_delay_min_seconds': 0, 'account_delay_max_seconds': 0}})
+        self.assertEqual(read_cfg(self.cfg_path)['api_key'], 'synthetic')
+
     def test_hours_written_as_int_array(self) -> None:
         write_cfg(self.cfg_path, {'schedule': {'checkin_hours': [9, 21]}})
         wb2api.save_upstream_config({'schedule': {'travel_hours': [9, 21]}})
@@ -95,6 +131,31 @@ class UpstreamConfigRoundTrip(unittest.TestCase):
         with self.assertRaises(ValueError):
             wb2api.save_upstream_config({'cooldown': {'soft_rate': 'soon'}})
         self.assertEqual(read_cfg(self.cfg_path)['pool']['breaker_cooldown'], '30m')
+
+    def test_credit_exhausted_allows_empty_but_not_zero(self) -> None:
+        """积分耗尽冷却（issue #78）：空 = 默认行为，`0` = 上游判非法。
+
+        这条与 expiring_soon / cost_explore_interval **相反**（那两个 0 = 关闭），
+        所以不能共用它们的分支：放行 `0` 会写进一份让上游启动失败（补丁里判
+        `d <= 0` 报错）的配置，用户看到的是「保存成功、然后反代挂了」。
+        """
+        write_cfg(self.cfg_path, {})
+        # 空串合法：等价于不启用，落盘为 ""，上游归一化成 0 → 保持旧行为
+        wb2api.save_upstream_config({'cooldown': {'credit_exhausted': ''}})
+        self.assertEqual(read_cfg(self.cfg_path)['cooldown']['credit_exhausted'], '')
+        # 正时长合法，且必须**原样存字符串**（上游是 time.ParseDuration）
+        wb2api.save_upstream_config({'cooldown': {'credit_exhausted': ' 10m '}})
+        self.assertEqual(read_cfg(self.cfg_path)['cooldown']['credit_exhausted'], '10m')
+        # 0 与 0s 必须拒（Go 的 ParseDuration 认它们，是补丁里的 d <= 0 判非法）
+        for bad in ('0', '0s'):
+            with self.assertRaises(ValueError, msg=f'{bad} 应被拒'):
+                wb2api.save_upstream_config({'cooldown': {'credit_exhausted': bad}})
+            self.assertEqual(read_cfg(self.cfg_path)['cooldown']['credit_exhausted'], '10m')
+        # 非法格式与 Go 不认的 d 单位同样拒
+        for bad in ('soon', '7d', '-5m', '10'):
+            with self.assertRaises(ValueError, msg=f'{bad} 应被拒'):
+                wb2api.save_upstream_config({'cooldown': {'credit_exhausted': bad}})
+        self.assertEqual(read_cfg(self.cfg_path)['cooldown']['credit_exhausted'], '10m')
 
     # ── 不覆盖同段其他键 ─────────────────────────────────
     def test_partial_patch_preserves_siblings(self) -> None:

@@ -191,13 +191,13 @@ export default function ClaimPage() {
                 {t('redPacket.modelsScoped', {list: info.models.join(', ')})}
               </p>
             )}
-            <p className="mt-1 text-[11px] text-muted-foreground/70">
+            <p className="mt-1 text-[11px] text-muted-foreground">
               {t('claim.expiresAt', {at: fmtDateTime(info.expires_at)})}
             </p>
 
             {/* 抽之前就说清「拿到之后往哪儿用」——省得领完还要回来问 */}
             <div className="mt-4 rounded-2xl bg-background px-3 py-2 text-left">
-              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+              <div className="text-[11px] uppercase tracking-wide text-muted-foreground">
                 {t('claim.endpoint')}
               </div>
               <div className="mt-1 flex items-center gap-1.5">
@@ -307,7 +307,7 @@ export default function ClaimPage() {
                   <Copy className="mr-1.5 h-4 w-4" />{t('claim.copy')}
                 </Button>
                 {got.models.length > 0 && (
-                  <div className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
+                  <div className="mt-1.5 text-[11px] leading-4 text-muted-foreground">
                     {t('redPacket.modelsScoped', {list: got.models.join(', ')})}
                   </div>
                 )}
@@ -322,7 +322,7 @@ export default function ClaimPage() {
                   </code>
                   <CopyButton value={endpoint} title={t('claim.copyEndpoint')} />
                 </div>
-                <p className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
+                <p className="mt-1.5 text-[11px] leading-4 text-muted-foreground">
                   {t('claim.endpointHint')}
                 </p>
               </div>
@@ -330,7 +330,7 @@ export default function ClaimPage() {
               <Button className="w-full rounded-full transition-transform active:scale-[0.98]" onClick={closeAndCopy}>
                 <Check className="mr-1.5 h-4 w-4" />{t('claim.done')}
               </Button>
-              <p className="text-center text-[10px] leading-4 text-muted-foreground">
+              <p className="text-center text-[11px] leading-4 text-muted-foreground">
                 {t('claim.closeHint')}
               </p>
             </div>

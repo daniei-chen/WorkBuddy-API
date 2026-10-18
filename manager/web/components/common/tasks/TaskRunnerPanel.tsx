@@ -1,6 +1,6 @@
 'use client';
 
-import {useCallback, useEffect, useRef, useState} from 'react';
+import {useState} from 'react';
 import {Play, Square, Eye, Gift, Sparkles, Loader2, TriangleAlert} from 'lucide-react';
 import {Button} from '@/components/ui/button';
 import {Badge} from '@/components/ui/badge';
@@ -12,12 +12,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/animate-ui/radix/dialog';
-import {accountApi, errText} from '@/lib/api';
 import {useI18n} from '@/lib/i18n/provider';
 import {RichText} from '@/lib/i18n/rich-text';
-import {notify} from '@/lib/toast';
 import {translateRunLine} from '@/lib/i18n/taskrun';
-import type {TaskRunStatus} from '@/lib/types';
+import {useTaskRun} from '@/lib/use-task-run';
 
 /**
  * 成长任务一键执行面板（issue #19）。
@@ -33,65 +31,9 @@ import type {TaskRunStatus} from '@/lib/types';
  * 定时只跑「领奖」：点亮绝不进定时（后端的调度器硬性只允许 claim）。
  */
 export function TaskRunnerPanel() {
-  const {t, tp} = useI18n();
-  const [status, setStatus] = useState<TaskRunStatus | null>(null);
+  const {t} = useI18n();
   const [confirmFull, setConfirmFull] = useState(false);
-  const [busy, setBusy] = useState(false);
-  // 轮询定时器：跑的时候高频、闲着的时候不轮询（省请求）
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const s = await accountApi.taskRunStatus();
-      setStatus(s);
-      return s;
-    } catch {
-      return null; // 拉状态失败不打扰用户（页面其它部分照常）
-    }
-  }, []);
-
-  useEffect(() => {
-    let alive = true;
-    const tick = async () => {
-      const s = await load();
-      if (!alive) return;
-      // 执行中每 2 秒刷新一次输出；结束后停下（避免无意义的轮询）
-      timer.current = setTimeout(tick, s?.running ? 2000 : 15000);
-    };
-    tick();
-    return () => {
-      alive = false;
-      if (timer.current) clearTimeout(timer.current);
-    };
-  }, [load]);
-
-  async function run(mode: 'preview' | 'claim' | 'full', confirm = false) {
-    setBusy(true);
-    try {
-      await accountApi.taskRunStart(mode, 'ALL', confirm);
-      // 描述用界面的模式名（后端回的是「已开始执行（preview）」这类中文原文）
-      notify.ok(t('tasks.runStarted'), t(`tasks.runMode_${mode}`));
-      await load();
-    } catch (e) {
-      notify.err(errText(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function stop() {
-    setBusy(true);
-    try {
-      const r = await accountApi.taskRunStop();
-      // 后端只回两种固定文案（已停止 / 当前没有正在执行的任务），走短语表
-      (r.ok ? notify.ok : notify.info)(tp(r.message));
-      await load();
-    } catch (e) {
-      notify.err(errText(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+  const {status, busy, run, stop} = useTaskRun({target: 'ALL'});
 
   const running = status?.running === true;
   const unavailable = status && !status.available;

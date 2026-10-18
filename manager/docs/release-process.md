@@ -26,6 +26,40 @@
 - **改动上游代码**：改本地那份源码（`/opt/workbuddy2api`），
   然后 `docker compose up -d --build`。改的是别人的 MIT 代码，需保留其
   `LICENSE` 与版权声明。
+
+### 我们自己改上游的那条路（补丁 + 重打包）
+
+上游停更之后，「上游代码的改动」都由我们提出并留在 `dev/upstream-patches/*.patch`
+里，**补丁是唯一事实来源**；本地改完就直接改源码目录的那种做法不再用于需要随包的
+功能（那样改动只存在于某个人的机器上，下次重打包就丢了）。
+
+1. 改代码：从**当前 `upstream-src` 资产**解开一份干净树（`tar xzf` 即可，别在
+   本地运行目录上改），在里面写改动与 Go 用例；
+2. 出补丁：`git init` 一个只含基线的仓库 → 改完 `git add -N` 新文件 → `git diff`
+   存成 `dev/upstream-patches/000N-<名字>.patch`（**含测试文件**，0001/0003 都是这个
+   体例；后续补丁只描述自己的增量，不要重述前面几个补丁）；
+3. 验补丁：在一份**未被该补丁改动过**的资产基线上 `git apply --check` 通过、
+   `apply_upstream_patches.py` 报 `applied:`、再跑一次报 `already applied:`。
+   源码树里会生成 `.wb2a-patches.json`（补丁名 → 字节哈希）：后续补丁改写前面补丁的
+   新增行时（0009 → 0010 就是），按内容判定会误报「没打」，清单记录的是事实；
+4. 重打包：`dev/pack_fixed_upstream_src.py <那份树> -o <输出> --stamp '<一句话>'`
+   —— 它会按序号依次应用全部补丁（已应用的会跳过），再打成 `workbuddy2api-src.tar.gz`；
+5. 验收：解开新包 `go build ./...` + `go test ./...`（必要时加 `-race`）、
+   包内 `scripts/` 的 Python 用例，然后
+   `gh release upload upstream-src <包> --clobber` 覆盖载体 Release；
+6. 记录：上传后核对资产的 **size 与 sha256** 与本地一致，并把「基线摘要 → 产出摘要」
+   写进该功能自己的 docs（如 `docs/random-daily-tasks.md`、`docs/credit-exhausted-cooldown.md`）。
+
+**顺序要求**：重打包必须在**当次面板发版之前**完成 —— CI 是从载体 Release 取
+`upstream/` 塞进发布包的，晚一步设备装到的就还是旧上游。面板侧只加字段不算完成：
+旧上游会忽略未知字段，用户会看到「保存成功但没生效」。
+
+**CI 的发布门禁**（2.2.1 起）：发布作业会把随包上游当成一次真实构建来验 ——
+`apply_upstream_patches.py` 必须报「补丁数 = 文件数，且没有现场新应用的」，
+然后 `go build ./...`、`go test ./...`、对**补丁动过的文件**跑 `gofmt -l`，
+并校验 `server/main.py` 的 `version=` 与 tag 一致。以前只跑 Python 测试，
+上游补丁的缺陷可以一路进 Release。
+
 - **`adapt(upstream)` 提交**：有可访问的上游代码要跟时照旧写——把核对过的上游
   提交号写进提交信息，供下次对照。
 
@@ -159,38 +193,59 @@ python -m unittest discover -s server/tests -t .   # 全绿才继续
 git add -A && git commit -m "chore(release): vX.Y.Z"
 git push origin main
 
-# 3) 打 tag（CI 会构建并创建一个**草稿** Release，**CI 不签名、也不发布**）
+# 3) 打 tag（CI 会构建并创建一个**草稿** Release，CI 不发布）
 git tag vX.Y.Z && git push origin vX.Y.Z
 
-# 4) 等 CI 完成后，在本机对**最终产物**签名并上传
-gh release download vX.Y.Z --repo ithtelab/workbuddy-manager --pattern '*.tar.gz'
-ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
-gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
-  --repo ithtelab/workbuddy-manager
+# 4) 等 CI 完成后，下载**最终产物**核对
+gh release download vX.Y.Z --repo ithtelab/workbuddy-manager \
+  --pattern 'workbuddy-manager-vX.Y.Z.tar.gz' --dir /tmp/vX.Y.Z
+bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz
+#    → 打印本地 sha256，与 Releases 页面「产物校验（sha256）」里的值比一眼
+tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5      # 抽查包结构
+#    再解开看 .version 与 server/main.py 的版本号
 
-# 5) 重新下载验证（不要用刚签名的那份，要重新拉）
-#    比对 sha256 → 用 deploy/update.py 的 check_signature 验签 → 解开核对版本号
-
-# 6) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
+# 5) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
 gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 ```
 
-两条都不能漏：
+关键的一条：**草稿不发布，用户永远看不到这个版本** —— 面板与更新器的版本检查都读
+`releases/latest`，而它会跳过草稿。草稿这一步是 issue #127/#129 之后加的：早先 CI
+直接把 Release 公开发布，产物还在上传时点「一键更新」就会拿到半成品或 404。现在
+用户侧看到的一直是上一个**已发布且产物齐全**的版本。
 
-* **没有 `.sig` 的 Release 会被所有用户的一键更新拒绝**（签名是信任链）；
-* **草稿不发布，用户永远看不到这个版本** —— 面板与更新器的版本检查都读
-  `releases/latest`，而它会跳过草稿。
+2026-10-14 起**不再有「维护者离线签名」这一步**：更新器只核对发布页给的 sha256 与
+文件大小（发布说明里就印着那个哈希，工作流自动附上）。为什么取消、还剩下哪些保证、
+老版本怎么过渡，见 [release-signing.md](release-signing.md)。
 
-草稿这一步是 issue #127/#129 之后加的：以前 CI 直接把 Release 公开发布，
-维护者签名要几分钟到几十分钟，这期间任何人点「一键更新」都会被「没有可用的
-签名文件」拒绝 —— 提示还像是在说发布流程坏了。现在「构建完、没签名」的产物
-只躺在草稿里，用户侧看到的一直是上一个**已签名且已发布**的版本。
+## 发布包字节的可复现性
+
+CI 打包时固定了文件排序、mtime 与属主，并让 gzip 不写时间戳（`gzip -n`）。同一份
+暂存内容重复打包会得到同一个 sha256 —— 这是发布说明里的哈希能作为承诺的前提。
+改打包命令时不要退回普通的 `tar czf`（它会把构建时刻与属主写进字节流）。
+
+## 发布包里放哪些文档
+
+发布包只装**用户文档**（`docs/` 下的 9 篇：使用指南、功能一览、界面预览、开发与架构、
+安全说明、API Token、账号出口线路、安全审查报告、发布包签名），外加 `docs/images/`
+里的截图。名单在 `.github/workflows/release.yml` 的 `docs-pack` 段，由
+`server/tests/test_docs_packaging.py` 双向守着（README 链到的必须在名单里；名单里
+不许有 README 链不到的），打包时还有一道反向核对（包内 `docs/` 出现计划外文件即失败）。
+
+**维护者/开发的文档留在仓库里、不进包**：发布流程、签名密钥管理、i18n 说明、
+命名兼容笔记、上游修复记录、功能提案、设计与实现方案。理由两条：用户在安装目录里
+翻到这些没有用；更要紧的是「内部细节被写进这些文档 → 静默分发给所有部署，收不回来」。
+想让一篇文档进包，在 README 里链一下就够了 —— 它会自动被算进用户文档集合；
+反过来，若某篇用户文档链到了内部文档，那篇内部文档也会被判成用户文档（测试会要求
+把它加进名单），要么链、要么不链，别留个死链给用户。
+
+> 已经发布出去的旧包不会因此改变（发布包是快照）：这份名单只对**下一次及以后**的
+> 发版生效。
 
 ## 多人协作时的分工
 
-仓库有 write 权限的协作者**可以直接推 tag**，推了就触发 CI 建**草稿** Release
-——但他们**签不了名、也发布不了**（私钥与「发布」这一步都只在维护者手上，
-这是设计如此）。所以协作发版的分工是「**协作者准备，维护者签字并发布**」：
+仓库有 write 权限的协作者**可以直接推 tag**，推了就触发 CI 建**草稿** Release ——
+但**发布**这一步只在维护者手上（`protect-tags` 规则集把 tag 创建限制给管理员角色，
+发布草稿也只有维护者会做）。所以协作发版的分工是「**协作者准备，维护者核对并发布**」：
 
 **协作者可以独立完成的部分**
 
@@ -201,28 +256,24 @@ python -m unittest discover -s server/tests -t .   # 全绿
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-**维护者收尾（签名 + 发布）**
+**维护者收尾（核对 + 发布）**
 
 ```bash
-gh release download vX.Y.Z --repo ithtelab/workbuddy-manager --pattern '*.tar.gz'
-ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
-gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
-  --repo ithtelab/workbuddy-manager
-# 核对（重新下载 + 验签 + 解开看版本号）之后发布：
+gh release download vX.Y.Z --repo ithtelab/workbuddy-manager \
+  --pattern 'workbuddy-manager-vX.Y.Z.tar.gz' --dir /tmp/vX.Y.Z
+bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz  # 与发布页哈希对一眼
+tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5              # 抽查包结构
+# 解开看 .version / server/main.py 的版本号之后发布：
 gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 ```
 
-签名前核对密钥没拿错：`ssh-keygen -lf ~/.ssh/workbuddy-release.pub` 应输出
-`SHA256:xmHLJDKH/vYtAp59XwXPVE4A/CwXAOpxTlYh7KC677Y`。
-
-**协作者推完 tag、维护者还没签之前，用户侧什么都看不到**：CI 建的是草稿，而版本
-检查读的 `releases/latest` 会跳过草稿 —— 不会出现「点了更新却被拒绝」的窗口期。
-维护者签名并发布之后版本才对用户生效；发现草稿里缺 `.sig` 时按上面步骤补签即可，
-不必重跑 CI。
+**协作者推完 tag、维护者还没核对之前，用户侧什么都看不到**：CI 建的是草稿，而版本
+检查读的 `releases/latest` 会跳过草稿 —— 不会出现「点了更新却拿到半成品」的窗口期。
+核对无误、发布之后版本才对用户生效。
 
 > tag 与 main 分支都有保护规则（见下节）：协作者不能创建/删除 `v*` tag，
-> 也不能直接往 main 推。这不是不信任，而是让「能改代码」与「能发布可信产物」
-> 保持分离——这正是签名机制要解决的问题。
+> 也不能直接往 main 推。这不是不信任，而是让「能改代码」与「能发布对用户生效的
+> 版本」保持分离。
 
 ## 仓库保护规则
 
@@ -267,13 +318,17 @@ gh api graphql -f query='{ repository(owner:"ithtelab", name:"workbuddy-manager"
 
 > 用角色而不是具体用户，是为了以后增减管理员时不用改规则。
 
-## 为什么签名不能自动化
+## 为什么现在不用操心「签名自动化」
 
-私钥不进 CI：恶意 PR 合并后可以改 workflow 的任意步骤，密钥放那里等于直接
-交给攻击者。签名必须由维护者在本机执行。详见 [release-signing.md](release-signing.md)。
+2026-10-14 起发布包不做离线私钥签名，改成核对发布页给的 sha256 与文件大小（CI 会把
+哈希自动印进发布说明）。于是「私钥要不要进 CI」这个长期争论在这条链路上不再存在，
+也再没有「维护者必须先在本机签一次、用户才装得上」的窗口期。当时为什么不把私钥放进
+CI（能合并 PR 的攻击者可以改 workflow 把密钥外传）、现在的信任边界、以及老版本怎么
+过渡，都在 [release-signing.md](release-signing.md)。
 
 ## 如果网络不稳
 
 下载产物时若**体积小于 GitHub 报告的大小**，是下载被截断（本机代理不稳），
-不是产物被动过——用 `curl -C -` 续传后重新比对 sha256 即可。
-验签会正确拒绝截断的文件，这是设计如此。
+不是产物被动过 —— 用 `curl -C -` 续传后重新比对 sha256 即可。一键更新遇到这种情况
+会当场拒绝（「发布包大小不符，已拒绝安装」），再点一次更新就会重下，用户侧不需要
+为此去查发布流程。

@@ -1,6 +1,7 @@
 """上游配置、模型映射与管理端用户。"""
 from __future__ import annotations
 
+import os
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -8,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from .. import db, security
 from ..iputil import client_ip
-from ..services import reload, updater, wb2api
+from ..services import modelmap, reload, updater, wb2api
 
 router = APIRouter(prefix='/api', tags=['settings'])
 
@@ -63,7 +64,8 @@ class UpstashTestIn(BaseModel):
 
 
 @router.post('/settings/upstash/test')
-async def test_upstash(body: UpstashTestIn, user: dict = Depends(security.require_admin)) -> dict:
+async def test_upstash(body: UpstashTestIn,
+                       user: dict = Depends(security.require_session_admin)) -> dict:
     """探测 Upstash 是否可用（走其 REST 接口 PING）。"""
     ok, message = await wb2api.test_upstash(body.url, body.token)
     return {'ok': ok, 'message': message}
@@ -89,9 +91,57 @@ def get_model_map(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('/settings/model-map')
 def save_model_map(body: dict[str, str], user: dict = Depends(security.require_admin)) -> dict:
-    clean = {str(k): str(v) for k, v in body.items() if str(k).strip() and str(v).strip()}
+    """保存映射表。键既可以是真实别名，也可以是兜底的 `*`（issue #173）。
+
+    校验集中在 `services/modelmap.validate`：这里只拒「落库后一定会坏」的那一类
+    —— 目前只有「目标写成 `*`」（查表会把 `*` 当模型名发给上游，而界面上显示着
+    "已设置兜底"，用户从报错里反推不出原因）。
+
+    ValueError 要**转成 400**：服务端校验按 4xx 送达，浏览器里才能把 detail 那句
+    原因显示出来；漏了这一步它就是 500，用户只看到「服务器错误」而拿不到该改什么
+    （浏览器验收里真踩到过：直接调接口写 `{"*": "*"}` 得到的是 500 空 body）。
+    """
+    try:
+        clean = modelmap.validate(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.set_setting('model_map', clean)
     return clean
+
+# ── GitHub Token（版本检测 / 一键更新）────────────────────
+@router.get('/settings/github-token')
+def get_github_token(user: dict = Depends(security.require_admin)) -> dict:
+    """读当前生效的 GitHub Token（**只回掩码**）。
+
+    为什么只给管理员：它是凭据，能操作对应的 GitHub 账号配额；普通用户不需要它。
+    环境变量里已有值时界面要说明「由部署注入、面板填写不生效」，否则用户会以为
+    自己填的那份没保存（issue #205 的现场就是「没地方填、也不知道有没有生效」）。
+    """
+    env_token = next((str(os.environ.get(k) or '').strip()
+                      for k in ('WB_GITHUB_TOKEN', 'GITHUB_TOKEN')
+                      if (os.environ.get(k) or '').strip()), '')
+    stored = str(db.get_setting('github_token', '') or '').strip()
+    effective = env_token or stored
+    return {
+        'configured': bool(effective),
+        'masked': updater.mask_token(effective),
+        'source': 'env' if env_token else ('panel' if stored else ''),
+    }
+
+
+@router.put('/settings/github-token')
+def save_github_token(body: dict, user: dict = Depends(security.require_admin)) -> dict:
+    """保存面板这份 GitHub Token（空串 = 清除）。
+
+    不做格式校验（GitHub 的 token 形态换过几次），但长度上限兜住误贴整段文本；
+    保存后不返回明文 —— 与其它凭据字段同一口径。
+    """
+    raw = str((body or {}).get('token') or '').strip()
+    if len(raw) > 512:
+        raise HTTPException(status_code=400, detail='GitHub Token 过长（最多 512 字符）')
+    db.set_setting('github_token', raw)
+    security.audit(user, 'update_github_token', '', '已配置' if raw else '已清除')
+    return {'configured': bool(raw), 'masked': updater.mask_token(raw)}
 
 
 # ── 管理端用户 ───────────────────────────────────────────
@@ -180,6 +230,10 @@ def update_user(username: str, body: UserPatch, request: Request,
             target['sv'] = 1
 
     security.save_users(cfg)
+    if changed_pwd and username == 'admin':
+        # 改掉初始密码后，把 issue #179 留的那份明文副本抹掉 ——
+        # 这里只存了初始 admin 密码，改其他用户的密码不应让它失效。
+        security.clear_initial_password_file()
     if changed_pwd or changed_role:
         parts = []
         if changed_pwd:
@@ -212,6 +266,9 @@ def delete_user(username: str, request: Request,
         raise HTTPException(status_code=400, detail='不能删除当前登录用户')
     cfg['users'] = [u for u in users if u.get('username') != username]
     security.save_users(cfg)
+    if target.get('username') == 'admin':
+        # 被删掉的就是初始账号，那份明文初始密码也随之失效。
+        security.clear_initial_password_file()
     security.audit(user, 'delete_user', username, f'来源 {client_ip(request)}')
     return {'ok': True}
 

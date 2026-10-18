@@ -15,11 +15,19 @@ import asyncio
 
 def err_text(exc: BaseException) -> str:
     """异常 → 一句原因。保证非空。"""
+    name = type(exc).__name__
+    # httpx 的 PoolTimeout 原文只有 "timed out"，用户看到「请求异常: PoolTimeout:
+    # timed out」只会以为「网慢」，而真正的原因是**本机自己**把连接池占满了
+    # （issue #161：并发刷积分把它挤爆，单号测活排在队尾）。这里直接说清原因
+    # 与下一步，而不是让人去查网络。按类名判，避免为一个提示导入 httpx。
+    if name == 'PoolTimeout':
+        return ('本机并发请求过多，连接池排队超时（PoolTimeout）—— '
+                '等正在跑的批量任务结束再试；一直这样就调小 WB_CREDITS_CONCURRENCY')
     detail = str(exc).strip()
     if detail:
-        return f'{type(exc).__name__}: {detail}'
+        return f'{name}: {detail}'
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
         return '超时（等不到响应）'
     if isinstance(exc, asyncio.CancelledError):
         return '请求已取消'
-    return type(exc).__name__
+    return name

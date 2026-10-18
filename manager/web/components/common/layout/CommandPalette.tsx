@@ -165,7 +165,7 @@ export function CommandPalette() {
         <Search className="h-3 w-3 shrink-0 opacity-70" />
         <span className="hidden sm:inline">{t('palette.trigger')}</span>
         {mounted && (
-          <kbd className="hidden rounded border border-border/60 bg-background/70 px-1 font-sans text-[10px] leading-4 text-muted-foreground sm:inline">
+          <kbd className="hidden rounded border border-border/60 bg-background/70 px-1 font-sans text-[11px] leading-4 text-muted-foreground sm:inline">
             {isMacPlatform() ? '⌘K' : 'Ctrl K'}
           </kbd>
         )}

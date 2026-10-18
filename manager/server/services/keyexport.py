@@ -75,8 +75,8 @@ def anthropic_base_url(openai_base_url: str) -> str:
     实际请求会变成 `http://host/v1/v1/messages`，面板上根本没有这个路由
     （实测 405，不是 404——更容易被误判成"方法不对"而查错方向）。
 
-    已有的真实 cc-switch 配置也是这个口径（`https://www.chedankj.com/`），
-    即**根地址 + 尾斜杠**；尾斜杠保留是因为 SDK 直接做字符串拼接，
+    真实的 cc-switch 配置也是这个口径：填的是**根地址 + 尾斜杠**
+    （不是 `/v1`）。尾斜杠保留是因为 SDK 直接做字符串拼接，
     不补斜杠会得到 `http://hostv1/messages`。
     """
     base = str(openai_base_url or '').strip().rstrip('/')

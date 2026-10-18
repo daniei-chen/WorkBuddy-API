@@ -38,7 +38,7 @@ IN_POOL = {
     'cooling': False, 'success_count': 236, 'err_total': 3, 'credits': 3002,
 }
 OUT_OF_POOL = {
-    'uid': '99a07e71-e0c8-41af-a955-63ad678abcd2', 'nickname': '17748593599',
+    'uid': '99a07e71-e0c8-41af-a955-63ad678abcd2', 'nickname': '13800000000',
     'realm': 'cn',
 }
 

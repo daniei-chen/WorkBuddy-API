@@ -127,6 +127,28 @@ class GitAttributesTest(unittest.TestCase):
             '在 Linux 上检出/打包时 .cmd 会变成 LF，用户下到的发布包里脚本是坏的',
         )
 
+    def test_ps1_files_have_utf8_bom(self) -> None:
+        """`.ps1` 必须带 UTF-8 BOM。
+
+        为什么（dev/test-delete-rules.ps1 实测踩到）：没有 BOM 时 Windows PowerShell 5.1
+        按**系统 ANSI 代码页**读脚本，中文变成乱码 —— 而且某个汉字的第二字节可能正好是
+        `'` 或 `*`，于是引号被吃掉、代码直接解析失败（报「必须在 * 运算符后面提供一个
+        值表达式」这种与真实原因毫不相干的错）。`.cmd` 不能带 BOM（cmd.exe 会把 BOM 当
+        命令），`.ps1` 相反：PowerShell 认 BOM，本仓的 .ps1 一律带。
+        """
+        offenders = []
+        for path in _ROOT.rglob('*.ps1'):
+            parts = set(path.parts)
+            if parts & {'.git', 'node_modules', '.next', '.tools', '.runtime', 'dist'}:
+                continue
+            if not path.read_bytes().startswith(bytes([0xEF, 0xBB, 0xBF])):
+                offenders.append(str(path.relative_to(_ROOT)))
+        self.assertEqual(
+            offenders, [],
+            '这些 .ps1 缺 UTF-8 BOM —— PowerShell 5.1 会按 ANSI 读，中文会乱码甚至解析失败：'
+            + '、'.join(offenders),
+        )
+
     def test_rule_is_not_vacuous(self) -> None:
         """反证：确认这条规则真的会作用于我们的脚本路径（而不是没匹配上）。"""
         import subprocess
@@ -140,90 +162,134 @@ class GitAttributesTest(unittest.TestCase):
         self.assertIn('eol: crlf', r.stdout, f'git 没把该文件判成 crlf：{r.stdout!r}')
 
 
-if __name__ == '__main__':
-    unittest.main()
 
+class WindowsUpdaterIntegrityTest(unittest.TestCase):
+    """Windows 一键更新脚本（`update.ps1`）的完整性守卫。
 
-class WindowsUpdaterTrustChainTest(unittest.TestCase):
-    """Windows 一键更新脚本（`update.ps1`）的信任链守卫。
-
-    这个是真实踩出来的三条，每条都**不会让脚本报错**，只会让它悄悄失守：
-
-      · `Test-PackageSignature` 里 `$proc.WaitForExit()` 的返回值会进输出流，
-        函数于是返回 `@($true, $false)`；调用点是 `if (-not $isSigValid)`，
-        PowerShell 对**非空数组**取反恒为 `$false` —— **篡改包照样被安装**
-        （实测：篡改包 → `[True,False]` → 门禁放行）；
-      · `allowed_signers` 用 `[System.Text.Encoding]::UTF8` 写会带 **BOM**，
-        而 ssh-keygen 读到 BOM 整份文件解析失败 —— **真包也判「验签不过」**
-        （实测 exit=255 vs 无 BOM 的 exit=0）；
-      · 内嵌公钥一旦与 `deploy/update.py` 里的签发公钥不一致，所有更新都会被拒，
-        而错误看起来像「包坏了」。
+    2026-10-13 起这里不再有「离线私钥验签」（原因见 docs/release-signing.md），
+    改为核对发布包 sha256。这条门禁的特点是**失效时不报错**：一句 `-not` 写反、
+    或校验结果没被用来中止流程，就变成「装什么都放行」，而界面看起来一切正常。
+    所以按文本机械地钉住四件事。
     """
 
-    UPDATER = _ROOT / 'update.ps1'
+    UPDATER = _ROOT / 'windows' / 'update.ps1'
+
+    def _src(self) -> str:
+        return self.UPDATER.read_text(encoding='utf-8-sig')
 
     def test_script_exists(self) -> None:
         self.assertTrue(self.UPDATER.is_file(), f'找不到 {self.UPDATER}')
 
-    def test_process_output_is_suppressed(self) -> None:
-        """`WaitForExit` 的返回值必须被吞掉（否则签名门禁恒真）。"""
-        src = self.UPDATER.read_text(encoding='utf-8-sig')
-        self.assertIn('WaitForExit', src)
-        bad = [l.strip() for l in src.splitlines()
-               if 'WaitForExit' in l and not l.strip().startswith(('#', '[void]', '$null ='))]
-        self.assertEqual(
-            bad, [],
-            'WaitForExit 的返回值没有被吞掉：它会进函数输出流，把返回值变成非空数组，'
-            '`-not $isSigValid` 因此恒为假 —— 验签失败也不会中止。'
-            '写成 `$null = $proc.WaitForExit(...)` 或 `[void]$proc.WaitForExit(...)`。',
-        )
+    def test_hashes_with_sha256(self) -> None:
+        src = self._src()
+        self.assertIn('Test-PackageDigest', src, '没有摘要校验函数')
+        self.assertIn('Get-FileHash', src, '没有真的算哈希')
+        self.assertIn('-Algorithm SHA256', src, '算的不是 sha256 —— 发布页给的是 sha256')
 
-    def test_allowed_signers_has_no_bom(self) -> None:
-        """`allowed_signers` 必须以**无 BOM** 的 UTF-8 写。
+    def test_digest_mismatch_is_fatal(self) -> None:
+        """摘要不符必须中止：函数返回 $false，且调用点据此 exit。"""
+        src = self._src()
+        body = src.split('function Test-PackageDigest', 1)[1].split('\n# ──', 1)[0]
+        self.assertIn('return $false', body, '摘要不符的分支没有报失败')
+        self.assertIn('已拒绝安装', body, '摘要不符时没有给出明确拒绝语')
+        call = [l.strip() for l in src.splitlines() if 'Test-PackageDigest -archivePath' in l]
+        self.assertTrue(call, '没有任何地方调用摘要校验')
+        self.assertTrue(any(l.startswith('if (-not (Test-PackageDigest') for l in call),
+                            f'调用点没有按「失败即中止」写：{call}')
+        after = src.split('Test-PackageDigest -archivePath', 1)[1]
+        self.assertIn('exit 1', after.split('# ──', 1)[0],
+                      '校验失败后没有中止更新流程')
 
-        PowerShell 5.1 的 `[System.Text.Encoding]::UTF8` 会写 BOM，ssh-keygen 直接
-        解析失败 —— 表现为「官方包也被判验签不过」，用户无法更新。
-        """
-        src = self.UPDATER.read_text(encoding='utf-8-sig')
-        writers = [l.strip() for l in src.splitlines()
-                   if 'WriteAllText' in l and 'tempSigners' in l]
-        self.assertTrue(writers, '没有找到写 allowed_signers 的那一行')
-        for line in writers:
-            self.assertNotIn('[System.Text.Encoding]::UTF8', line,
-                             f'allowed_signers 用了会写 BOM 的编码：{line}')
-            self.assertIn('UTF8Encoding($false)', line,
-                          f'allowed_signers 必须显式无 BOM：{line}')
-
-    def test_embedded_pubkey_matches_the_release_key(self) -> None:
-        """脚本内嵌的公钥必须与 `deploy/update.py` 的签发公钥一致（换密钥时同步）。"""
-        import importlib.util
-        spec = importlib.util.spec_from_file_location('wb_upd_pub', _ROOT / 'deploy' / 'update.py')
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        want = ' '.join(str(mod.RELEASE_PUBKEY).split())
-        src = self.UPDATER.read_text(encoding='utf-8-sig')
-        m = re.search(r"\$pubkey\s*=\s*'([^']+)'", src)
-        self.assertIsNotNone(m, '脚本里找不到内嵌公钥')
-        self.assertEqual(' '.join(m.group(1).split()), want,
-                         '内嵌公钥与 deploy/update.py 不一致 —— 所有真实更新都会被拒绝')
-        self.assertEqual(str(mod.RELEASE_SIGNER_ID), 'release')
+    def test_signature_machinery_is_gone(self) -> None:
+        """旧的公钥验签要不留残渣：留着会让人以为还有这道门禁。"""
+        src = self._src()
+        for token in ('Test-PackageSignature', 'ssh-ed25519', 'allowed_signers',
+                      'tar.gz.sig'):
+            self.assertNotIn(token, src, f'{token} 仍在脚本里 —— 旧的签名门禁没清干净')
 
     def test_no_unverified_source_update(self) -> None:
-        """不许在更新流程里 `git reset/fetch`：那是**不经签名**的第二条代码来源。
+        """不许在更新流程里 `git reset/fetch`：那是**第二条代码来源**。
 
         会把 origin 指向的任意代码（fork、镜像）铺进用户目录，并丢弃本地改动。
         """
-        src = self.UPDATER.read_text(encoding='utf-8-sig')
+        src = self._src()
         offending = [l.strip() for l in src.splitlines()
                      if re.search(r'\bgit\s+(reset|fetch|pull|checkout)\b', l)
                      and not l.strip().startswith('#')]
-        self.assertEqual(offending, [],
-                         f'更新脚本里出现了不经验签的 git 操作：{offending}')
+        self.assertEqual(offending, [], f'更新流程里出现了 git 代码来源：{offending}')
 
     def test_confirm_before_destructive_phase(self) -> None:
         """停服务 / 清 web/out / 覆盖文件之前必须有一次确认。"""
-        src = self.UPDATER.read_text(encoding='utf-8-sig')
+        src = self._src()
         self.assertRegex(src, r'Read-Host\s+"[^"]*确认', '更新前没有确认提示')
         # 且确认必须在「停服务」之前
         self.assertLess(src.index('Read-Host'), src.index('stop.ps1'),
                         '确认排在了停服务之后 —— 用户点「不要」时服务已经被停了')
+
+
+
+class WindowsScriptLayoutTest(unittest.TestCase):
+    """脚本住在 `windows/`：项目根 = 脚本目录的**上一级**。
+
+    这条布局不是审美问题，而是脚本能跑的前提：
+
+      · `start.ps1` / `service-tools.ps1` / `update.ps1` 按「项目根」找 `server/`、
+        `web/out`、`.env`、`upstream/`、`.venv/`；
+      · `stop.ps1` 调同目录的 `service-tools.ps1`，`start.ps1` 调同目录的 `update.ps1`；
+      · `update.ps1` 更新前把这一套脚本备份到 `.tools/scripts_backup`，更新后按名字
+        **还原回脚本目录** —— 基准用错的话，更新完脚本会散落到仓库根，下次就找不到了。
+
+    写错的形态都是「脚本语法没错、也能跑，只是在错的地方找文件」：启动时报
+    「未找到 .venv」、更新后根目录多出一套脚本。所以这里按文本机械地钉住三条。
+    """
+
+    PS1 = ('start.ps1', 'stop.ps1', 'service-tools.ps1', 'update.ps1')
+    ENTRY_CMD = (('start.cmd', 'start.ps1'), ('stop.cmd', 'stop.ps1'), ('update.cmd', 'update.ps1'))
+
+    def _scripts(self) -> dict:
+        out = {}
+        names = list(self.PS1) + [c for c, _ in self.ENTRY_CMD]
+        for name in names:
+            p = _ROOT / 'windows' / name
+            self.assertTrue(p.is_file(), f'windows/{name} 不见了（被挪回根目录了？）')
+            out[name] = p.read_text(encoding='utf-8-sig')
+        return out
+
+    def test_root_is_the_parent_directory(self) -> None:
+        """项目根必须由**脚本目录的上一级**算出，而不是脚本自己所在目录。"""
+        for name, src in self._scripts().items():
+            if not name.endswith('.ps1'):
+                continue
+            with self.subTest(script=name):
+                self.assertIn('$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path', src)
+                self.assertIn('$root = Split-Path -Parent $scriptDir', src,
+                              f'{name} 没把项目根当成上一级 —— 它会在脚本目录里找 server/')
+
+    def test_sibling_scripts_use_script_dir(self) -> None:
+        """找兄弟脚本（同一目录里的那几个）必须走 `$scriptDir`，不许走 `$root`。"""
+        siblings = list(self.PS1) + [c for c, _ in self.ENTRY_CMD]
+        for name, src in self._scripts().items():
+            if not name.endswith('.ps1'):
+                continue
+            for line in src.splitlines():
+                if line.strip().startswith('#'):
+                    continue
+                with self.subTest(script=name, line=line.strip()[:60]):
+                    self.assertNotIn('Join-Path $root $s', line,
+                                     f'{name} 的批量备份/还原又用回 $root 了：{line.strip()[:80]}')
+                    for sib in siblings:
+                        for quoted in (f"Join-Path $root '{sib}'", f'Join-Path $root "{sib}"'):
+                            self.assertNotIn(quoted, line,
+                                             f'{name} 用 $root 找兄弟脚本了：{line.strip()[:80]}')
+
+    def test_entry_cmd_stays_sibling(self) -> None:
+        """三个双击入口要按 `%~dp0`（自己所在目录）调同目录的 .ps1 —— 它们总是一起挪动。"""
+        scripts = self._scripts()
+        for cmd, ps1 in self.ENTRY_CMD:
+            with self.subTest(script=cmd):
+                self.assertIn(f'%~dp0{ps1}', scripts[cmd],
+                              f'{cmd} 没有按 %~dp0 调同目录的 {ps1}')
+
+
+if __name__ == '__main__':
+    unittest.main()

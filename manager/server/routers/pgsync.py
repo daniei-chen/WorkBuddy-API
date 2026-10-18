@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from .. import security
 from ..services import pgsync
@@ -25,7 +25,12 @@ def get_config(user: dict = Depends(security.current_user)) -> dict:
 
 @router.post('')
 def save_config(body: dict, user: dict = Depends(security.require_session_admin)) -> dict:
-    cfg = pgsync.save_config(body or {})
+    try:
+        cfg = pgsync.save_config(body or {})
+    except ValueError as exc:
+        # 配置项本身不合法（如 SSL 模式）属于用户可改的输入错误，
+        # 回 400 + 具体可选值，而不是 500 或等到任务失败才暴露。
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     security.audit(user, 'pgsync.config', 'pg-sync',
                    f'自动备份={"开" if cfg.get("enabled") else "关"}'
                    f'；间隔={cfg.get("interval_minutes")} 分钟')

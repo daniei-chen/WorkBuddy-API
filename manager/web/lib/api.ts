@@ -5,12 +5,22 @@ import type {Realm} from './realm-context';
 import type {
   Account,
   AccountsResponse,
+  RefreshPlan,
+  DailyPlan,
+  DailyTask,
+  CreditsFlow,
   ApiKey,
   ApiToken,
   AuditLogPage,
   Changelog,
   CheckinLogPage,
   ClaimInfo,
+  ProxyProbe,
+  ProxyPool,
+  RouteBindingsResponse,
+  ProxyRoute,
+  ProxyRouteList,
+  ProxySettings,
   CreatedApiToken,
   CreatedRedPacket,
   CreditExpiry,
@@ -42,6 +52,7 @@ import type {
   TaskLogResponse,
   TaskRunStatus,
   UpdateCheck,
+  UpdatePackageMeta,
   UpdateStatus,
   UpstreamConfig,
   UpstreamEndpoint,
@@ -93,7 +104,10 @@ http.interceptors.response.use(
   (r) => r,
   (error: AxiosError) => {
     if (error.response?.status === 401 && typeof window !== 'undefined') {
-      // 会话失效：清掉缓存的登录态，避免仍显示管理员入口
+      // 会话失效：清掉缓存的登录态，避免仍显示管理员入口。
+      // `hadSession` 决定要不要说「会话已过期」：首次访问本来就没有会话，
+      // 那是「请登录」而不是「过期了」（用户会以为面板坏了）。
+      const hadSession = !!window.sessionStorage.getItem('wb-me');
       window.sessionStorage.removeItem('wb-me');
       const path = window.location.pathname;
       // **公开页不跳登录页**：红包抽奖页就是给没账号的人看的（同事朋友收到链接
@@ -106,8 +120,14 @@ http.interceptors.response.use(
       // window.location.href 会跳到域名根（通常 404）—— 登录页与公开页都一样。
       const loginPath = `${BASE_PATH}/login`;
       const publicPaths = [loginPath, `${BASE_PATH}/claim`];
-      if (!publicPaths.some((p) => path.startsWith(p))) {
-        window.location.href = loginPath;
+      // 根路径只是「跳到 /dashboard」的中转页，不在这里拦（否则首次访问者
+      // 会先被重定向到登录页并显示「会话已过期」）。
+      const isRoot = path === BASE_PATH || path === `${BASE_PATH}/`;
+      if (!isRoot && !publicPaths.some((p) => path.startsWith(p))) {
+        // 带上 `?expired=1`：登录页据此显示「会话已过期，请重新登录」，而不是毫无
+        // 解释地把人丢回登录页 —— 实测用户会以为自己点了退出、或面板坏了（明明刚才
+        // 还在用）。服务端鉴权不受影响，这只是给跳转补一个原因。
+        window.location.href = `${loginPath}${hadSession ? '?expired=1' : ''}`;
       }
     }
     return Promise.reject(error);
@@ -148,6 +168,15 @@ export const accountApi = {
     put<{ok: boolean; proxy: string; reload_triggered: boolean}>(
       `/api/accounts/${encodeURIComponent(filename)}/proxy` + groupQs(upstreamId), {proxy}),
   /**
+   * 设置 / 清除账号手写权重（issue #187）。`weight = 0` 表示恢复默认（1.0）。
+   *
+   * 写的是上游 auth 文件顶层 `weight`（不是本端库）：选号发生在上游，它必须能读到。
+   * 后端会顺带请求重载上游 —— 权重和线路一样是**加载时**解析进内存的。
+   */
+  setWeight: (filename: string, weight: number, upstreamId?: number | null) =>
+    put<{ok: boolean; weight: number; reload_triggered: boolean}>(
+      `/api/accounts/${encodeURIComponent(filename)}/weight` + groupQs(upstreamId), {weight}),
+  /**
    * 某分组的账号列表。upstreamId 省略 / null = 默认分组。
    *
    * 「分组」= 一套上游实例（账号池）：账号文件读该分组的目录、运行状态问该
@@ -156,6 +185,27 @@ export const accountApi = {
   list: (upstreamId?: number | null) =>
     get<AccountsResponse>('/api/accounts',
                           upstreamId == null ? undefined : {upstream_id: upstreamId}),
+  exportZip: async (upstreamId?: number | null) => {
+    const response = await http.get<Blob>('/api/accounts/export' + groupQs(upstreamId), {
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+  upload: (files: File[], upstreamId?: number | null, overwrite = false) => {
+    const body = new FormData();
+    files.forEach((file) => body.append('files', file, file.name));
+    const group = groupQs(upstreamId);
+    const separator = group ? '&' : '?';
+    return http.post<{
+      ok: boolean;
+      uploaded: Array<{file: string; uid: string; updated: boolean}>;
+      added: Array<{file: string; uid: string; updated: boolean}>;
+      overwritten: Array<{file: string; uid: string; updated: boolean}>;
+      rejected: Array<{file: string; uid?: string; message: string}>;
+      failed: Array<{file: string; message: string}>;
+    }>('/api/accounts/upload' + group + separator + `overwrite=${overwrite ? 'true' : 'false'}`, body)
+      .then((r) => r.data);
+  },
   /**
    * 发起扫码登录；realm 决定国内版 / 国际版端点。
    *
@@ -263,10 +313,47 @@ export const accountApi = {
   refresh: (file: string, upstreamId?: number | null) =>
     post<{ok: boolean; message: string}>(
       `/api/accounts/${encodeURIComponent(file)}/refresh${groupQs(upstreamId)}`),
+  /** 一键刷新所有账号的 accessToken（真实续期，末尾只重载一次上游） */
+  refreshAllTokens: (upstreamId?: number | null) =>
+    post<{
+      total: number;
+      succeeded: number;
+      failed: string[];
+      results: {file: string; nickname: string; uid: string; ok: boolean; message: string}[];
+      reload_triggered: boolean;
+    }>(`/api/accounts/refresh-tokens${groupQs(upstreamId)}`),
+  /** 令牌刷新计划（计划任务：每 N 天自动全量刷新一次） */
+  refreshPlan: () => get<RefreshPlan>('/api/accounts/refresh-plan'),
+  saveRefreshPlan: (enabled: boolean, intervalDays: number, hour: number) =>
+    put<RefreshPlan>('/api/accounts/refresh-plan',
+                     {enabled, interval_days: intervalDays, hour}),
+  /** 立即执行一次计划（全量刷新；串行，不重载上游） */
+  runRefreshPlan: () => post<{
+    checked: number; renewed: number; failed: number; skipped: number;
+    last_run: number; next_run: number | null;
+  }>('/api/accounts/refresh-plan/run'),
+  /** 每日任务计划（签到 / 领奖 / 做任务，到点自动跑） */
+  dailyPlan: () => get<DailyPlan>('/api/accounts/daily-plan'),
+  saveDailyPlan: (plan: DailyPlan) =>
+    put<DailyPlan>('/api/accounts/daily-plan', plan),
+  /** 立即执行一次某个每日任务（不等定时） */
+  runDailyTask: (task: DailyTask) =>
+    post<{ok: boolean; message: string; task: string; plan: DailyPlan}>(
+      '/api/accounts/daily-plan/run', {task}),
   /** 强制清除账号级冷却、熔断/降权与模型级限流（会重启一次上游）。 */
   clearCooling: (file: string, upstreamId?: number | null) =>
     post<{ok: boolean; message: string; uid?: string; backup?: string}>(
       `/api/accounts/${encodeURIComponent(file)}/clear-cooling${groupQs(upstreamId)}`,
+    ),
+  /** 强制设定账号级冷却（会重启一次上游）。 */
+  forceCooling: (
+    file: string,
+    body: {duration_seconds?: number; until?: string; permanent?: boolean; reason?: string},
+    upstreamId?: number | null,
+  ) =>
+    post<{ok: boolean; message: string; uid?: string; until?: string; backup?: string}>(
+      `/api/accounts/${encodeURIComponent(file)}/force-cooling${groupQs(upstreamId)}`,
+      body,
     ),
   /**
    * 给账号写备注（issue #67）。传空串 = 清除备注。
@@ -510,6 +597,10 @@ export const statsApi = {
    */
   hourly: (day?: string, realm?: Realm) =>
     get<UsageHourPoint[]>('/api/stats/hourly', {day, realm}),
+
+  /** 积分收支（收入 / 支出）按天聚合 + 今日 / 近 7 天合计 */
+  creditsFlow: (days = 30, realm?: Realm) =>
+    get<CreditsFlow>('/api/stats/credits', {days, realm}),
   byModel: (days = 30, realm?: Realm) =>
     get<UsageBreakdown[]>('/api/stats/by-model', {days, realm}),
   byKey: (days = 30, realm?: Realm) =>
@@ -541,6 +632,45 @@ export const securityApi = {
 };
 
 /* ── 上游配置 / 用户 ───────────────────────────────── */
+/** 代理线路与全局出口代理（设置 → 代理）。凭据一律走服务端的脱敏口径。 */
+export const proxyApi = {
+  routes: (upstreamId?: number | null) =>
+    get<ProxyRouteList>('/api/proxy-routes' + groupQs(upstreamId)),
+  create: (name: string, url: string, weight?: number, enabled?: boolean) =>
+    post<ProxyRoute>('/api/proxy-routes', {name, url, weight, enabled}),
+  update: (name: string, body: {url?: string; new_name?: string; weight?: number},
+           upstreamId?: number | null) =>
+    put<ProxyRoute>(`/api/proxy-routes/${encodeURIComponent(name)}` + groupQs(upstreamId), body),
+  remove: (name: string, force: boolean, upstreamId?: number | null) => {
+    // 查询串自己拼：groupQs 只负责分组参数，force 是这条接口特有的
+    const qs = new URLSearchParams();
+    if (upstreamId) qs.set('upstream_id', String(upstreamId));
+    if (force) qs.set('force', '1');
+    const query = qs.toString();
+    return del<{name: string; bound_cleared: number}>(
+      `/api/proxy-routes/${encodeURIComponent(name)}${query ? `?${query}` : ''}`);
+  },
+  import: (text: string) =>
+    post<{imported: number; problems: string[]}>('/api/proxy-routes/import', {text}),
+  probe: (name: string) => post<ProxyProbe>('/api/proxy-routes/probe', {name}),
+  /** 绑定管理：全部账号 + 各自绑定的线路（空 = 跟随池策略） */
+  bindings: (upstreamId?: number | null) =>
+    get<RouteBindingsResponse>('/api/proxy-routes/bindings' + groupQs(upstreamId)),
+  /** 自动分配 N 台账号到这条线路（未绑定的优先，挑完仍可手动增删） */
+  autoAssign: (name: string, count: number, upstreamId?: number | null) =>
+    post<{updated: number; requested: number; candidates: number; unbound_left: number}>(
+      `/api/proxy-routes/${encodeURIComponent(name)}/auto-assign` + groupQs(upstreamId),
+      {count}),
+  /** 池配置：开关 / 策略 / 间隔 */
+  savePool: (body: {enabled?: boolean; strategy?: string; interval_seconds?: number}) =>
+    put<ProxyPool>('/api/settings/proxy-pool', body),
+  settings: () => get<ProxySettings>('/api/settings/proxy'),
+  saveSettings: (body: {http_proxy?: string; update_proxy?: string;
+                           global_proxy_enabled?: boolean}) =>
+    put<ProxySettings>('/api/settings/proxy', body),
+  probeGlobal: () => post<ProxyProbe>('/api/settings/proxy/probe', {}),
+};
+
 export const settingsApi = {
   upstream: () => get<UpstreamConfig>('/api/settings/upstream'),
   saveUpstream: (body: Record<string, unknown>) =>
@@ -576,9 +706,30 @@ export const systemApi = {
   /** 检测新版本；force=true 绕过 6 小时缓存 */
   checkUpdate: (force = false) => get<UpdateCheck>('/api/system/check-update', {force}),
   versions: () => get<Versions>('/api/system/versions'),
-  /** 启动一键更新；target: manager | upstream | both */
-  startUpdate: (target: 'manager' | 'upstream' | 'both') =>
-    post<{ok: boolean; message: string}>('/api/system/update', {target}),
+  /** GitHub Token（版本检测 / 一键更新的认证）：读回掩码，写只传明文 */
+  githubToken: () => get<{configured: boolean; masked: string; source: 'env' | 'panel' | ''}>(
+    '/api/settings/github-token'),
+  saveGithubToken: (token: string) =>
+    put<{configured: boolean; masked: string}>('/api/settings/github-token', {token}),
+  /**
+   * 启动一键更新；target: manager | upstream | both。
+   * source='uploaded' 用面板里已上传的离线升级包（issue #153）。
+   */
+  startUpdate: (target: 'manager' | 'upstream' | 'both', source: 'release' | 'uploaded' = 'release') =>
+    post<{ok: boolean; message: string}>('/api/system/update', {target, source}),
+  /** 已上传的离线升级包元信息 */
+  packageMeta: () => get<UpdatePackageMeta>('/api/system/update-package'),
+  /**
+   * 上传离线升级包（发布页下载的 .tar.gz）。
+   * `expectedSha256` 填发布页那串摘要时会当场核对，不一致直接拒收。
+   */
+  uploadPackage: (file: File, expectedSha256 = '') => {
+    const body = new FormData();
+    body.append('file', file, file.name);
+    body.append('expected_sha256', expectedSha256);
+    return post<UpdatePackageMeta>('/api/system/update-package', body);
+  },
+  deletePackage: () => del<{ok: boolean}>('/api/system/update-package'),
   /** 固定上游版本（空串 = 取消固定，恢复跟随分支） */
   setUpstreamRef: (ref: string) =>
     post<{ok: boolean; upstream_ref: string}>('/api/system/upstream-ref', {ref}),

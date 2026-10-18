@@ -317,6 +317,7 @@ class UserAdminHttpTest(unittest.TestCase):
             {'username': 'guest', 'role': 'viewer',
              'pwd_hash': security.make_hash('guest-pw-123')},
         ], api_keys=['wbk_leaked_from_production'])
+        security.initial_password_path().unlink(missing_ok=True)
         try:
             db.execute('DELETE FROM audit_logs')
         except Exception:  # noqa: BLE001
@@ -342,15 +343,30 @@ class UserAdminHttpTest(unittest.TestCase):
 
     def test_admin_can_change_password_and_old_session_dies(self) -> None:
         """改密码必须成功（不是 500），且旧会话立即失效。"""
+        password_path = security.initial_password_path()
+        password_path.write_text('initial-admin-pw\n', encoding='utf-8')
         self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
         self.assertEqual(self.c.get('/api/me').status_code, 200)
         r = self.c.patch('/api/users/admin', json={'password': 'brand-new-pw-1'})
         self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(password_path.exists(), '修改 admin 密码后应清理初始密码文件')
         self.assertTrue(r.json().get('relogin_required'))
         # 同一个 client（持有旧 cookie）应被踢下线
         self.assertEqual(self.c.get('/api/me').status_code, 401)
         # 新密码可用
         self.assertEqual(self._login('admin', 'brand-new-pw-1'), 200)
+
+    def test_changing_non_admin_password_preserves_initial_admin_password_file(self) -> None:
+        """改其他用户密码时，初始 admin 密码仍有效，恢复文件应保留。"""
+        password_path = security.initial_password_path()
+        password_path.write_text('initial-admin-pw\n', encoding='utf-8')
+
+        self.assertEqual(self._login('admin', 'http-admin-pw'), 200)
+        r = self.c.patch('/api/users/guest', json={'password': 'guest-new-pw-1'})
+
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(password_path.exists())
+        self.assertEqual(password_path.read_text(encoding='utf-8'), 'initial-admin-pw\n')
 
     def test_short_password_rejected(self) -> None:
         self._login('admin', 'http-admin-pw')
@@ -485,7 +501,7 @@ if __name__ == '__main__':
 class MalformedLoginBodyTest(unittest.TestCase):
     """登录接口对「合法 JSON 但非对象」的 body 必须返回 400，而不是 500。
 
-    实测（真实部署 https://wk.sbai.shop/）：`null` 与 `[]` 会让 `body.get()`
+    实测（真实部署环境）：`null` 与 `[]` 会让 `body.get()`
     抛 AttributeError → 500。虽然 500 的响应体只有 "Internal Server Error"、
     不泄露堆栈，但这属于未处理异常：
 

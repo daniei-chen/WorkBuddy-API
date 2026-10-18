@@ -16,6 +16,7 @@
 import {useCallback, useEffect, useState} from 'react';
 
 import {errText, upstreamsApi} from '@/lib/api';
+import {useAuth} from '@/lib/auth-context';
 import {useT} from '@/lib/i18n/provider';
 import {notify} from '@/lib/toast';
 import type {UpstreamEndpoint} from '@/lib/types';
@@ -26,6 +27,8 @@ import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDial
 
 export function UpstreamEndpoints() {
   const t = useT();
+  // 这些操作后端要求会话管理员：对 viewer 显示出来只会得到 403。
+  const {isAdmin} = useAuth();
   const [items, setItems] = useState<UpstreamEndpoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [formOpen, setFormOpen] = useState(false);
@@ -97,9 +100,11 @@ export function UpstreamEndpoints() {
           <h2 className="text-sm font-semibold">{t('upstreams.title')}</h2>
           <p className="text-[11px] leading-4 text-muted-foreground">{t('upstreams.desc')}</p>
         </div>
-        <Button className="rounded-full" onClick={openCreate}>
-          {t('upstreams.add')}
-        </Button>
+        {isAdmin && (
+          <Button className="rounded-full" onClick={openCreate}>
+            {t('upstreams.add')}
+          </Button>
+        )}
       </div>
 
       {loading ? (
@@ -124,7 +129,7 @@ export function UpstreamEndpoints() {
                       {t('upstreams.disabledTag')}
                     </Badge>
                   )}
-                  <span className="text-[10px] text-muted-foreground">
+                  <span className="text-[11px] text-muted-foreground">
                     {t('upstreams.boundKeys', {n: item.bound_keys ?? 0})}
                   </span>
                 </div>
@@ -133,13 +138,13 @@ export function UpstreamEndpoints() {
                 </div>
                 {item.auth_dir ? (
                   <div
-                    className="truncate font-mono text-[11px] text-muted-foreground/80"
+                    className="truncate font-mono text-[11px] text-muted-foreground"
                     title={t('upstreams.dirLine', {dir: item.auth_dir})}
                   >
                     {t('upstreams.dirLine', {dir: item.auth_dir})}
                   </div>
                 ) : (
-                  <div className="truncate text-[11px] text-muted-foreground/70">
+                  <div className="truncate text-[11px] text-muted-foreground">
                     {t('upstreams.noDirLine')}
                   </div>
                 )}
@@ -147,7 +152,7 @@ export function UpstreamEndpoints() {
                   <div className="truncate text-[11px] text-muted-foreground">{item.note}</div>
                 ) : null}
               </div>
-              {!item.is_default && (
+              {isAdmin && !item.is_default && (
                 <div className="flex items-center gap-2">
                   <Button
                     variant="outline"

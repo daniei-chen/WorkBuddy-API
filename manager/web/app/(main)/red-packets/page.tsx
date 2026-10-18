@@ -18,9 +18,9 @@ import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
 import {Button} from '@/components/ui/button';
+import {ModelWhitelistInput} from '@/components/common/keys/ModelWhitelistInput';
 import {Input} from '@/components/ui/input';
 import {Label} from '@/components/ui/label';
-import {Textarea} from '@/components/ui/textarea';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
@@ -98,9 +98,8 @@ export default function RedPacketsPage() {
     }
     // token 红包必须限定模型（后端也拦，这里先给个更快的反馈）。
     // 拆法与密钥页同款：逗号或换行都认，去空白去空项。
-    const modelList = kind === 'token'
-      ? models.split(/[\n,]/).map((s) => s.trim()).filter(Boolean)
-      : [];
+    // 两类都接受模型范围（#131）：token 必填、积分可选（不填 = 不限制）。
+    const modelList = models.split(/[\n,]/).map((s) => s.trim()).filter(Boolean);
     if (kind === 'token' && modelList.length === 0) {
       notify.warn(t('redPacket.errModels'));
       return;
@@ -251,7 +250,7 @@ export default function RedPacketsPage() {
             <div className="flex items-center justify-between gap-3 rounded-2xl bg-background/60 px-3 py-2">
               <Label className="text-xs">{t('redPacket.fieldKind')}</Label>
               <Select value={kind} onValueChange={(v) => setKind(v as RedPacketKind)}>
-                <SelectTrigger className="h-8 w-44"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="h-8 w-44" aria-label={t('redPacket.fieldKind')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="credit">{t('redPacket.kindCredit')}</SelectItem>
                   <SelectItem value="token">{t('redPacket.kindToken')}</SelectItem>
@@ -261,7 +260,7 @@ export default function RedPacketsPage() {
             <div className="flex items-center justify-between gap-3 rounded-2xl bg-background/60 px-3 py-2">
               <Label className="text-xs">{t('redPacket.fieldMode')}</Label>
               <Select value={mode} onValueChange={(v) => setMode(v as RedPacketMode)}>
-                <SelectTrigger className="h-8 w-44"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="h-8 w-44" aria-label={t('redPacket.fieldMode')}><SelectValue /></SelectTrigger>
                 <SelectContent>
                   <SelectItem value="lucky">{t('redPacket.modeLucky')}</SelectItem>
                   <SelectItem value="even">{t('redPacket.modeEven')}</SelectItem>
@@ -290,23 +289,22 @@ export default function RedPacketsPage() {
                      onChange={(e) => setTitle(e.target.value)} />
             </div>
 
-            {/* 模型范围只在 token 红包下出现 —— 积分红包**不限制模型**
-                （按真实扣费计，任何模型都能用），显示出来反而会让人以为
-                可以限制。两类的规则相反是刻意的，见 redpacket.validate。 */}
-            {kind === 'token' && (
-              <div className="rounded-2xl bg-background/60 px-3 py-2 xl:col-span-2">
-                <Label className="text-xs">{t('redPacket.fieldModels')}</Label>
-                <Textarea
-                  className="mt-1 min-h-16 bg-background text-xs"
+            {/* 模型范围：token 红包必填（量随模型变），积分红包可选（#131）——
+                不填 = 不限制（按真实扣费计，任何模型都能用），填了就把这份额度
+                限定到指定模型上。做成可勾选的清单，省得记模型 ID。 */}
+            <div className="rounded-2xl bg-background/60 px-3 py-2 xl:col-span-2">
+              <Label className="text-xs">{t('redPacket.fieldModels')}</Label>
+              <div className="mt-1">
+                <ModelWhitelistInput
                   value={models}
+                  onChange={setModels}
                   placeholder={t('redPacket.fieldModelsPlaceholder')}
-                  onChange={(e) => setModels(e.target.value)}
                 />
-                <div className="mt-1 text-[10px] leading-3 text-muted-foreground">
-                  {t('redPacket.fieldModelsHint')}
-                </div>
               </div>
-            )}
+              <div className="mt-1 text-[11px] leading-3 text-muted-foreground">
+                {kind === 'token' ? t('redPacket.fieldModelsHint') : t('redPacket.fieldModelsHintOptional')}
+              </div>
+            </div>
           </div>
           <div className="mt-2.5 flex justify-end gap-2">
             <Button variant="ghost" className="rounded-full" disabled={busy}
@@ -350,7 +348,7 @@ export default function RedPacketsPage() {
                   <Copy className="mr-1 h-3 w-3" />{t('redPacket.copyLink')}
                 </Button>
               </div>
-              <div className="mt-1 text-[10px] leading-4 text-muted-foreground">
+              <div className="mt-1 text-[11px] leading-4 text-muted-foreground">
                 {t('redPacket.claimLinkHint')}
               </div>
             </div>
@@ -427,14 +425,14 @@ export default function RedPacketsPage() {
                       {/* 已领取 / 总量。抽奖式红包一眼要看的是这个进度 ——
                           「还剩几份」比「谁发的」重要得多。 */}
                       <span
-                        className="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground"
+                        className="shrink-0 rounded-full bg-background px-1.5 py-0.5 text-[11px] tabular-nums text-muted-foreground"
                         title={t('redPacket.claimedTip', {n: p.claimed, total: p.shares})}
                       >
                         {p.claimed}/{p.shares}
                       </span>
 
                       {p.revoked ? (
-                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                        <span className="rounded-full bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
                           {t('redPacket.revokedTag')}
                         </span>
                       ) : (

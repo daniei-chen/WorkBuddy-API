@@ -15,6 +15,7 @@ import {
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
 import {EmptyState} from '@/components/common/layout/EmptyState';
+import {StatCard} from '@/components/common/layout/StatCard';
 import {LoadError} from '@/components/common/states/LoadError';
 import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {Button} from '@/components/ui/button';
@@ -111,29 +112,7 @@ function sourceLabel(source: string, fallback: string, t: (key: string) => strin
   return key ? t(key) : fallback;
 }
 
-/** 一张统计卡 */
-function StatCard({
-  icon: Icon,
-  label,
-  value,
-  hint,
-}: {
-  icon: typeof Boxes;
-  label: string;
-  value: string;
-  hint?: string;
-}) {
-  return (
-    <div className="rounded-[20px] bg-muted px-3.5 py-3">
-      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-        <Icon className="h-3.5 w-3.5" />
-        {label}
-      </div>
-      <div className="mt-1.5 text-xl font-semibold tabular-nums">{value}</div>
-      {hint && <div className="mt-0.5 text-[10px] text-muted-foreground/80">{hint}</div>}
-    </div>
-  );
-}
+/** 一张统计卡（统一的 StatCard）：模型页只关心数值与副文案。 */
 
 export default function ModelsPage() {
   const t = useT();
@@ -189,11 +168,18 @@ export default function ModelsPage() {
     setQ('');
   }, [realm]);
 
-  /** 强制刷新：绕过服务端缓存重新拉一次（与首屏那次区分开，只有它才绕缓存） */
-  const refetch = useCallback(async () => {
+  /**
+   * 强制刷新：绕过服务端缓存重新拉一次（与首屏那次区分开，只有它才绕缓存）。
+   *
+   * **返回本次是否取到**，调用方据此提示成功还是失败。只能看返回值，不能写
+   * `.catch()`：`reload()` 内部已经把异常收进 `errors` 并返回布尔值，返回的
+   * Promise 永不 reject，靠 catch 判断失败的分支根本进不去——用户会永远看到
+   * 「正在拉取」，无论取到没取到。（同「密钥」页建完密钥后刷新的写法。）
+   */
+  const refetch = useCallback(async (): Promise<boolean> => {
     forceNext.current = true;
     try {
-      await reload();
+      return await reload();
     } finally {
       forceNext.current = false;
     }
@@ -249,9 +235,18 @@ export default function ModelsPage() {
             className="rounded-full"
             disabled={isRefreshing}
             title={t('models.refetchTitle')}
-            onClick={() => {
-              void refetch();
-              notify.info(t('models.refetching'));
+            onClick={async () => {
+              // 「进行中」那条提示在拿到结果后**换掉**，而不是留在屏幕上：原先只弹
+              // 这条、不看结果，无论成功失败都停在「正在重新拉取模型列表…」，用户
+              // 分不清是还在拉、拉到了、还是根本没拉到。
+              const pending = notify.info(t('models.refetching'));
+              const done = await refetch();
+              notify.dismiss(pending);
+              if (done) {
+                notify.ok(t('models.refetchDone'), t('models.refetchDoneHint'));
+              } else {
+                notify.err(t('models.refetchFailed'), t('models.refetchFailedHint'));
+              }
             }}
           >
             {isRefreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
@@ -448,7 +443,7 @@ export default function ModelsPage() {
                           {m.name ? (
                             <>
                               <span className="text-xs font-medium">{m.name}</span>
-                              <span className="font-mono text-[10px] text-muted-foreground">{m.id}</span>
+                              <span className="font-mono text-[11px] text-muted-foreground">{m.id}</span>
                             </>
                           ) : (
                             <span className="font-mono text-xs font-medium">{m.id}</span>
@@ -473,7 +468,7 @@ export default function ModelsPage() {
                                 用户据此知道不指定档位时会走哪一档 */}
                             {m.default_effort && (
                               <span
-                                className="text-[10px] text-muted-foreground"
+                                className="text-[11px] text-muted-foreground"
                                 title={t('models.defaultEffortTitle', {effort: m.default_effort})}
                               >
                                 {t('models.defaultEffort', {effort: m.default_effort})}
@@ -481,7 +476,7 @@ export default function ModelsPage() {
                             )}
                           </div>
                         ) : (
-                          <span className="text-[11px] text-muted-foreground/60">—</span>
+                          <span className="text-[11px] text-muted-foreground">—</span>
                         )}
                       </TableCell>
                       <TableCell className="pr-4">
@@ -548,7 +543,7 @@ export default function ModelsPage() {
         </details>
       )}
 
-      <p className="text-[10px] leading-4 text-muted-foreground/70">
+      <p className="text-[11px] leading-4 text-muted-foreground">
         {t('models.footnote')}
       </p>
     </div>

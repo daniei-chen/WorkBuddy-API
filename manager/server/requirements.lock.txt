@@ -23,3 +23,5 @@ uvicorn==0.53.0
 uvloop==0.22.1
 watchfiles==1.2.0
 websockets==17.1
+python-multipart==0.0.32
+socksio==1.0.0

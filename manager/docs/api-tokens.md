@@ -3,6 +3,8 @@
 > 状态：**已实现（P0 + P1）**。落地位置：`server/tokensvc.py`（生成 / 解析 / 校验）、
 > `server/routers/tokens.py`（CRUD）、`security.current_user` 的 Bearer 分支与
 > `require_session_admin`（高危接口仅会话）、前端「设置 → 访问令牌」面板。
+> 代理线路与全局出口代理（`/api/proxy-routes*`、`/api/settings/proxy*`）同样仅会话：
+> 它们既决定流量从哪个出口出去，也是凭据载体。
 > 本文档同时是该能力的**设计说明**与**安全约束清单**——改动前请先读「安全考量」
 > 与「接口」两节。
 >

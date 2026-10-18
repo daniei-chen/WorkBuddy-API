@@ -227,13 +227,15 @@ docker compose up -d
 WB_BASE_PATH=/workbuddy-manager
 ```
 
-> **别写进 `.env`。** 服务端只读进程环境变量：仓库里没有任何地方调用 `load_dotenv`，
-> `deploy/workbuddy-web.service` 没有 `EnvironmentFile=`，`docker-compose.yml` 用的是
-> 内联 `environment:` 而不是 `env_file:`——写进 `.env` 不会生效。
-> 这个坑的麻烦之处在于**症状很隐蔽**：配置看起来加了，但前缀没被剥掉，
-> 表现为「页面能打开、接口全 404」，容易误判成反代写错了。
+> **这一项（`WB_BASE_PATH`）别写在 `.env` 里**：它在构建期与前缀绑定，必须落在
+> systemd 的 `Environment=` / compose 的 `environment:` 这类**显式变量**里，
+> 症状很隐蔽 —— 配置看起来加了，但前缀没被剥掉，表现为「页面能打开、接口全 404」，
+> 容易误判成反代写错了。
 >
-> （唯一的例外是 Windows 原生部署：`start.ps1` 用 `uvicorn --env-file .env` 显式读取 `.env`。）
+> 其余可选项（出口代理 `WB_HTTP_PROXY`、更新代理 `WB_UPDATE_PROXY`、新账号默认线路
+> `WB_DEFAULT_ACCOUNT_PROXY` 等）**写进安装目录的 `.env` 即可**：容器部署由 compose 的
+> `${}` 取过去，systemd 部署由单元里的 `EnvironmentFile=` 读进来，Windows 原生由
+> 启动脚本交给面板（`uvicorn --env-file .env`）。
 
 **③ 反向代理：两种 `proxy_pass` 写法都可以**
 
@@ -283,7 +285,8 @@ location /workbuddy-manager/ {
 
 ## 四·五、后续更新
 
-部署后有两种更新方式，**都不需要重新执行安装脚本**。
+部署后有两种更新方式，**都不需要重新执行安装脚本**。（下面两条都是按**宿主安装**
+写的；容器部署请看本节末尾的「容器（Docker Compose）部署的更新」。）
 
 ### 方式一：网页一键更新（推荐）
 
@@ -310,18 +313,74 @@ sudo /opt/workbuddy-manager/venv/bin/python deploy/update.py --target both
 
 `--target` 取值为 `manager` / `upstream` / `both`。
 
+### 容器（Docker Compose）部署的更新
+
+上面两种方式都是按宿主安装写的（方式二用的是宿主上的 venv）。容器部署用面板里的
+「一键更新」即可；想在容器里跑命令行也行：
+
+```bash
+docker compose exec workbuddy-manager python /app/deploy/update.py --target both
+```
+
+> 这条命令结束时**会按设计终止容器**（更新进程发信号给 PID 1，再由 compose 的
+> `restart: unless-stopped` 用新代码拉起），所以 `exec` 会跟着断开 —— 这是正常的。
+
+**更新的代码落在哪**（决定了什么操作会让它「退回旧版」）：
+
+| 内容 | 位置 | `docker restart` | 重建容器（`up -d --build`） |
+|---|---|---|---|
+| 管理端代码 | 容器可写层 `/app/server`、`/app/web/out` | 保留 | **退回镜像里的版本** |
+| 更新时新装的依赖 | `/app/.local`（`PYTHONUSERBASE`） | 保留 | **丢失** |
+| 数据库 / 日志 / 配置 | 宿主 `./data`（bind mount） | 保留 | 保留 |
+
+所以**更新之后不要对管理端执行 `docker compose up -d`** —— 那会用镜像里的旧代码
+重建容器。要重启用 `docker restart workbuddy-manager`；要升级镜像本身，走下面这步。
+
+#### 一次性：离线更新（也是「更新后打不开面板」的救法）
+
+**更新器本身也在被更新的代码里** —— 这一版跑的仍是上一版的更新逻辑。所以这两种
+情况必须用发布包重建镜像，面板里的按钮帮不上忙：
+
+- 更新后管理端起不来（例如新版本引入了新依赖，而容器里装不上）；
+- 你要升级的是**镜像本身**（Dockerfile / compose / 基础依赖有变化）。
+
+```bash
+# 在部署目录（有 docker-compose.yml 的地方）
+tar xzf workbuddy-manager-vX.Y.Z.tar.gz
+cd workbuddy-manager-vX.Y.Z
+docker compose up -d --build workbuddy-manager
+```
+
+发布包里带 `Dockerfile`、`docker-compose.yml`、`server/`、`web/out/` 与 `upstream/`，
+所以这一步既能救砖、也能把镜像升到最新。`./data` 与 `../workbuddy2api` 都是挂载卷，
+不会被覆盖。
+
+#### 容器内操作 docker（更新上游 / 重载配置）
+
+容器以 uid 10001 运行，而宿主的 `/var/run/docker.sock` 通常归 `root:docker`
+（GID 998/999）—— 不在那个组里就是 `permission denied`。compose 已用 `group_add`
+引用 `DOCKER_GID`，把本机的真实值填进 `.env` 即可：
+
+```bash
+echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> .env
+docker compose up -d workbuddy-manager
+```
+
+不配也不会静默失败：更新上游时会提示你去取真实 GID。完全不想要容器操作 docker
+的话，把 compose 里挂 `docker.sock` 那一行注释掉即可，相关功能会如实降级。
+
 ---
 
 ## 五、目录与端口
 
 ```
-管理端   /opt/workbuddy-manager         :7864   仅本机（经反代对外）
+管理端   /opt/workbuddy-manager         :7864   监听 0.0.0.0（经反代对外；建议防火墙收紧）
   ├─ server/        后端代码
   ├─ web/out/       前端静态产物
   ├─ data/          SQLite、users.json（含会话密钥）
   └─ venv/          Python 虚拟环境
 
-上游     /opt/workbuddy2api             :7863   仅本机
+上游     /opt/workbuddy2api             :7863   仅本机（安装脚本把端口映射绑到 127.0.0.1）
   ├─ auths/         账号授权文件（每个账号一个 JSON）
   ├─ data/state.json 账号池状态
   └─ config.json    上游配置（含 api_key）
@@ -509,3 +568,59 @@ grep api_key /opt/workbuddy2api/config.json
 
 **Q：公网访问点「添加账号」二维码加载不出来**
 管理端需要访问腾讯接口生成授权链接，请确认服务器可访问外网。
+
+---
+
+## 附：Windows 原生部署（无需 Docker）
+
+前提：`workbuddy2api` 已在本机运行，并有可用的启停脚本与文件日志。
+
+```powershell
+git clone https://github.com/ithtelab/workbuddy-manager.git
+cd workbuddy-manager
+Copy-Item .env.example .env
+```
+
+在 `.env` 中至少设置以下项目（Windows 路径建议使用 `/`）：
+
+```dotenv
+WB_MANAGER_HOST=127.0.0.1
+WB_SECURE_COOKIE=false
+WB2API_MODE=native
+WB_UPSTREAM_DIR=C:/path/to/workbuddy2api
+WB_AUTH_DIR=C:/path/to/workbuddy2api/auths
+WB_UPSTREAM_CONFIG=C:/path/to/workbuddy2api/config.json
+WB2API_START_SCRIPT=C:/path/to/workbuddy2api/start-workbuddy2api.cmd
+WB2API_STOP_SCRIPT=C:/path/to/workbuddy2api/stop-workbuddy2api.cmd
+WB2API_LOG_FILE=C:/path/to/workbuddy2api/data/server.err.log
+```
+
+安装依赖、构建前端并后台启动：
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r server\requirements.txt
+Set-Location web
+npm ci
+npm run build:export
+Set-Location ..
+powershell -ExecutionPolicy Bypass -File .\windows\service-tools.ps1 start
+```
+
+用 `windows\service-tools.ps1 status|restart|stop` 管理后台进程。
+
+> Windows 的启动脚本都在 `windows\` 目录里，**不要把它们挪出去**：脚本按自己所在
+> 目录的上一级当项目根（找 `server/`、`web/out`、`.env`、`upstream/`）。双击
+> `windows\start.cmd` 前台启动（关窗口即停）、`stop.cmd` 停止、`update.cmd` 一键更新；
+> 后台常驻用 `windows\service-tools.ps1 start`。Windows 原生模式支持
+保存配置后重启上游及读取上游日志；网页一键更新依赖 Linux/Docker，当前会明确拒绝，
+请手动更新代码后重启服务。
+
+> **启停脚本优先用上游自带的**：上游 `workbuddy2api` 2026-09-18 起自带
+> `start/stop/status-workbuddy2api.cmd`（PID 文件 + 进程路径校验，不会误杀同名进程），
+> 直接把 `WB2API_START_SCRIPT` / `WB2API_STOP_SCRIPT` 指过去即可。若你的上游目录里
+> 没有这三个文件（旧版上游），`windows-native/` 下有一对可直接改用的模板。
+
+> **两个约定必须满足**（上游脚本已满足）：启动脚本要**立即返回**（前台运行会让
+> 「重启」等到超时才报失败），日志要写到 `WB2API_LOG_FILE`（否则「任务记录」读不到
+> 自动任务日志）。细节见 `windows-native/README.md`。

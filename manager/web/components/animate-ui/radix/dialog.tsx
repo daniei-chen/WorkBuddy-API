@@ -161,7 +161,7 @@ function DialogContent({
                   // 会**盖过**调用方传进来的 `max-w-[900px]`（两者不在同一个变体组，
                   // tailwind-merge 认为它们不冲突、都会保留），结果是任何 ≥640px 的屏幕
                   // 上所有弹窗都被压回 512px。历史上 7 个弹窗的宽度覆盖全部因此失效过。
-                  'fixed left-[50%] top-[50%] z-50 grid w-[calc(100%-2rem)] max-w-lg translate-x-[-50%] translate-y-[-50%] gap-0 overflow-hidden rounded-[24px] border border-border/60 bg-background shadow-[0_24px_60px_rgba(15,23,42,0.10)] duration-200 dark:border-border/70 dark:bg-background dark:shadow-[0_24px_60px_rgba(0,0,0,0.42)]',
+                  'fixed left-[50%] top-[50%] z-50 grid max-h-[calc(100dvh-2rem)] w-[calc(100%-2rem)] max-w-lg translate-x-[-50%] translate-y-[-50%] gap-0 overflow-hidden rounded-[24px] border border-border/60 bg-background shadow-[0_24px_60px_rgba(15,23,42,0.10)] duration-200 dark:border-border/70 dark:bg-background dark:shadow-[0_24px_60px_rgba(0,0,0,0.42)]',
                   className,
               )}
               {...props}

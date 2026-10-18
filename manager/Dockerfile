@@ -10,6 +10,9 @@
 #    没有 systemd、也不能重启自己所在的容器。所以容器形态下的「更新」是：
 #    替换代码 → 结束容器 → 由 compose 的 restart 策略用新代码拉起。
 #    这需要 compose 里配 `restart: unless-stopped`（本仓库的 compose 已配好）。
+#    新版本的依赖也由它按需补装：镜像里的依赖是 root 装的、site-packages 归 root，
+#    而进程是 uid 10001 —— 所以更新时装到**用户站点**（/app/.local，见下面的
+#    PYTHONUSERBASE 与 useradd 那一步），而不是往 root 的目录里写。
 #
 # 3. **挂载 docker.sock 是可选的，默认提供**。挂上它，容器内的管理端就能像
 #    宿主机部署那样操作上游容器（重载配置 / 读日志 / 一键更新上游）。
@@ -102,6 +105,11 @@ RUN set -eu; \
 FROM python:3.12-slim
 
 # 环境变量：Python 不要写 pyc（容器是一次性的，写了也没用）、日志不缓冲
+#
+# PYTHONUSERBASE 指到 /app/.local：容器里以 uid 10001 运行，而依赖是 root 装的、
+# site-packages 归 root，**更新时装新依赖只能走用户站点**。钉死这个路径有两个理由：
+# ① 不依赖 Docker 把 HOME 设对；② /app 已经 chown 给 10001（见下方 useradd 那步），
+# 目录必须**先存在**——CPython 的 site.py 只在用户站点目录存在时才把它加进 sys.path。
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     WB_RUN_MODE=docker \
@@ -113,7 +121,8 @@ ENV PYTHONUNBUFFERED=1 \
     WB_AUTH_DIR=/opt/workbuddy2api/auths \
     WB_UPSTREAM_CONFIG=/opt/workbuddy2api/config.json \
     WB2API_BASE=http://127.0.0.1:7863 \
-    WB_BASE_PATH=""
+    WB_BASE_PATH="" \
+    PYTHONUSERBASE=/app/.local
 
 # 可选：Debian 软件源镜像（留空 = 官方源 deb.debian.org）。
 #
@@ -285,8 +294,11 @@ COPY CHANGELOG.md README.md /app/
 # 非 root 运行。目录归属交给 app 用户，使容器内更新能写回代码目录。
 # 注意与上游 auths/data 卷的 uid 对齐：上游容器以 uid 10001 运行，
 # 这里用同一 uid 可避免跨容器写同一个卷时的权限问题。
+#
+# /app/.local 是 PYTHONUSERBASE 的落点（见上面的 ENV）：容器内更新装新依赖时
+# 只能写用户站点，且该目录必须**先存在**，否则重启后的新进程不在 sys.path 上找它。
 RUN useradd -u 10001 -m -s /bin/bash app \
-    && mkdir -p /app/data /opt/workbuddy2api \
+    && mkdir -p /app/data /app/.local /opt/workbuddy2api \
     && chown -R 10001:10001 /app /opt/workbuddy2api
 
 USER app

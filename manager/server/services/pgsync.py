@@ -25,11 +25,12 @@ CREATE TABLE + 批量 INSERT，读 PG 只需要 SELECT *** —— 业务代码�
    `request_logs` 已经写进了某次调用、`usage_daily` 还没累加）。`VACUUM INTO`
    一条语句拿到事务一致的完整副本，之后从副本慢慢搬，源库只被锁住一瞬间。
 
-3. **恢复走「就地事务」而不是换文件**。把 PG 的行写回本地时，在一个
-   `BEGIN IMMEDIATE` 事务里先清空再灌入：失败自动回滚、成功即刻生效，
-   **不需要重启服务，也不用跟 WAL / -shm 伴生文件打交道**（那是换文件方案里
-   最容易出错、也最难在本地复现的一步）。代价是恢复期间其它数据库调用被
-   `db._lock` 挡住（大库几秒），换来「要么全成、要么全不动」。
+3. **恢复先写临时库，最后一步才换文件**。把 PG 的行写进当前库所在目录的
+   一份临时副本（由 `VACUUM INTO` 生成），全程**不持有** `db._lock` ——
+   恢复再慢，网关与管理面照常读写。数据写完后，只在「关闭旧连接 → 改名
+   替换 → 重新打开」这一小段持有全局锁（毫秒级）。失败时临时文件直接丢弃，
+   本地库一个字节都不会动；替换阶段失败则由 `db.replace_database` 回滚旧文件。
+   （早期版本在 `BEGIN IMMEDIATE` 里就地覆盖，大库恢复期间所有请求都被挡住。）
 
 ## 与「备份」有关的一条安全约定
 
@@ -96,6 +97,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _SECRET_FIELDS = ('password',)
 
+# libpq 支持的 sslmode。只接受这些值：它是**写进连接串的配置**，填错时
+# libpq 只会回一句难以定位的 "invalid sslmode value"，界面看不出该改成什么。
+# 空值按 prefer（libpq 默认）处理。
+SSLMODES = ('disable', 'allow', 'prefer', 'require', 'verify-ca', 'verify-full')
+
 # 导出/恢复互斥：同时只能有一个在跑（手动与定时共用同一把锁）。
 _job_lock = threading.Lock()
 _scheduler_thread: threading.Thread | None = None
@@ -108,6 +114,14 @@ def _as_int(value: object, default: int) -> int:
         return int(str(value).strip() or default)
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_sslmode(value: object) -> str:
+    mode = str(value or '').strip().lower() or 'prefer'
+    if mode not in SSLMODES:
+        raise ValueError(
+            'SSL 模式必须是以下之一：' + ' / '.join(SSLMODES))
+    return mode
 
 
 def get_config() -> dict:
@@ -151,6 +165,9 @@ def save_config(patch: dict) -> dict:
     cfg['interval_minutes'] = max(0, _as_int(cfg['interval_minutes'], 0))
     cfg['enabled'] = bool(cfg['enabled'])
     cfg['keep_local_backup'] = bool(cfg['keep_local_backup'])
+    # 非法值在这里就拒掉（路由层转 400），而不是等到导出时才在任务日志里
+    # 看到一句 libpq 的原文。读路径不做校验：历史脏值不该把配置接口弄挂。
+    cfg['sslmode'] = _normalize_sslmode(cfg.get('sslmode'))
     db.set_setting(CONFIG_KEY, cfg)
     return cfg
 
@@ -181,9 +198,9 @@ def build_dsn(cfg: dict) -> str:
     dbname = quote(str(cfg.get('dbname') or '').strip(), safe='')
     auth = f'{user}:{pwd}@' if user else ''
     dsn = f'postgresql://{auth}{host}:{_as_int(cfg.get("port"), 5432)}/{dbname}'
-    sslmode = str(cfg.get('sslmode') or '').strip()
+    sslmode = _normalize_sslmode(cfg.get('sslmode'))
     # prefer 是 libpq 默认，写不写一样；不写能让连接串更短、日志更好看。
-    if sslmode and sslmode != 'prefer':
+    if sslmode != 'prefer':
         dsn += f'?sslmode={quote(sslmode, safe="")}'
     return dsn
 
@@ -527,17 +544,25 @@ def _snapshot_path() -> Path:
     return config.DATA_DIR / f'.pgsync-snapshot-{os.getpid()}.db'
 
 
+def _restore_staging_path() -> Path:
+    # 必须与正式库同目录：换库用的是 `os.replace`，跨文件系统会直接失败
+    # （EXDEV）。WB_DB 指到别处时 DATA_DIR 不一定在同一个挂载点。
+    config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    return config.DB_PATH.parent / f'.pgsync-restore-{os.getpid()}.db'
+
+
 def export_to_pg(cfg: dict, reporter: _Reporter) -> dict:
     psycopg = _require_psycopg()
     dsn = build_dsn(cfg)
     snapshot = _snapshot_path()
     if snapshot.exists():
         snapshot.unlink()
-    conn = db.connect()
     with db._lock:
         # VACUUM INTO 必须在没有活动事务时执行；db.execute 每次都 commit，
         # 正常路径下连接是空闲的。这里加锁是为了挡住并发的写入。
-        conn.execute('VACUUM INTO ?', (str(snapshot),))
+        # 取连接也放在锁内：恢复换库时会在锁内关掉并重开连接，锁外拿到的
+        # 可能是即将被关闭的旧句柄。
+        db.connect().execute('VACUUM INTO ?', (str(snapshot),))
     reporter.log(f'已生成一致性快照（{snapshot.stat().st_size // 1024} KB）')
     src = _SqliteSource(snapshot)
     try:
@@ -646,58 +671,75 @@ def import_from_pg(cfg: dict, reporter: _Reporter) -> dict:
         if backup:
             reporter.log(f'恢复前已备份当前数据到 {backup.name}')
 
-    conn = db.connect()
     # 同导出：连接阶段也要有超时（见上面的说明）。这里刻意**在取 db._lock 之前**连接，
     # 所以连不上时面板不会跟着卡住。
     with psycopg.connect(dsn, connect_timeout=CONNECT_TIMEOUT) as pg:
         src = _PgSource(pg)
         available = set(src.tables())
-        local = _local_tables(conn)
-        missing = sorted(local - available)
-        if missing:
-            # 措辞必须与行为一致：这些表**不会被清空**。恢复的语义虽然有「让本地等于
-            # 镜像」的一面，但镜像可能来自更早的版本（那时这张表还不存在），清空等于
-            # 把镜像里根本没有的数据删掉 —— 那是不可恢复的损失。所以保持现状，只提示。
-            reporter.log(
-                '镜像里没有这些表，恢复不会改动它们（保持现状）：' + '、'.join(missing),
-                'warn')
-        total = len(available & local)
-        reporter.data['tables_total'] = total
 
-        sink = _SqliteSink(conn)
-        with db._lock:
+        staging = _restore_staging_path()
+        try:
+            if staging.exists():
+                staging.unlink()
+            # 快照本身是一条 VACUUM INTO，很快；真正耗时的是从 PG 搬数据，
+            # 那一段只写这份临时副本，不持有 db._lock。
+            with db._lock:
+                db.connect().execute('VACUUM INTO ?', (str(staging),))
+            reporter.log('已生成本地快照，正在写入临时库（在线请求不受影响；'
+                         '恢复期间的新写入会在完成时被镜像覆盖）')
+
+            conn = sqlite3.connect(str(staging))
             try:
-                conn.execute('BEGIN IMMEDIATE')
-                for index, table in enumerate(sorted(available & local), start=1):
-                    src_cols = src.columns(table)
-                    names = [c['name'] for c in src_cols]
-                    wanted = sink.accepts(table, names)
-                    if not wanted:
-                        # 两边同名却没有任何公共列 —— 结构已经对不上了。
-                        # 这时**不清空**：清掉等于把一张表的数据凭空删掉，
-                        # 而镜像里那份又灌不进来。
-                        # （遍历的是 available & local 的交集，所以这里的「没有公共列」
-                        #   就是字面意思；镜像有、本地没有的表根本不会进这个循环。）
-                        reporter.log(f'跳过 {table}（与镜像没有公共列）', 'warn')
+                local = _local_tables(conn)
+                missing = sorted(local - available)
+                if missing:
+                    # 措辞必须与行为一致：这些表**不会被清空**。恢复的语义虽然有
+                    # 「让本地等于镜像」的一面，但镜像可能来自更早的版本（那时这张
+                    # 表还不存在），清空等于把镜像里根本没有的数据删掉 —— 那是
+                    # 不可恢复的损失。所以保持现状，只提示。
+                    reporter.log(
+                        '镜像里没有这些表，恢复不会改动它们（保持现状）：'
+                        + '、'.join(missing), 'warn')
+                total = len(available & local)
+                reporter.data['tables_total'] = total
+
+                sink = _SqliteSink(conn)
+                # 临时库是私有的：事务失败就整体回滚，然后把文件丢掉即可，
+                # 本地正在服务的库一个字节都不会动。
+                with conn:
+                    for index, table in enumerate(sorted(available & local), start=1):
+                        src_cols = src.columns(table)
+                        names = [c['name'] for c in src_cols]
+                        wanted = sink.accepts(table, names)
+                        if not wanted:
+                            # 两边同名却没有任何公共列 —— 结构已经对不上了。
+                            # 这时**不清空**：清掉等于把一张表的数据凭空删掉，
+                            # 而镜像里那份又灌不进来。
+                            reporter.log(f'跳过 {table}（与镜像没有公共列）', 'warn')
+                            reporter.data['tables_done'] = index
+                            continue
+                        # 先清空再灌入：恢复的语义是「让本地等于镜像」，而不是合并
+                        # —— 合并会把镜像里已经删掉的记录留在本地。
+                        conn.execute(f'DELETE FROM "{table}"')
+                        for chunk in src.rows(table, wanted, BATCH):
+                            sink.write(table, wanted, chunk)
                         reporter.data['tables_done'] = index
-                        continue
-                    # 先清空再灌入：恢复的语义是「让本地等于镜像」，而不是合并
-                    # —— 合并会把镜像里已经删掉的记录留在本地。
-                    conn.execute(f'DELETE FROM "{table}"')
-                    for chunk in src.rows(table, wanted, BATCH):
-                        sink.write(table, wanted, chunk)
-                    reporter.data['tables_done'] = index
-                    reporter.step(f'恢复 {table}（{index}/{total}）',
-                                  percent=int(index * 100 / max(1, total)))
-                    reporter.log(f'{table}：已恢复')
-                conn.commit()
-            except Exception:
-                # 整体回滚：恢复失败时本地库保持原样（这正是选「就地事务」
-                # 而不是换文件的原因 —— 换文件方案下失败会留下半个库）。
-                conn.rollback()
-                raise
-        db.set_setting(LAST_IMPORT_KEY, int(time.time()))
-        return {'tables': total}
+                        reporter.step(f'恢复 {table}（{index}/{total}）',
+                                      percent=int(index * 95 / max(1, total)))
+                        reporter.log(f'{table}：已恢复')
+            finally:
+                # 必须先关掉 staging 的句柄：Windows 上文件被打开时无法改名替换。
+                conn.close()
+
+            reporter.step('替换本地数据库…', percent=99)
+            db.replace_database(staging)
+            db.set_setting(LAST_IMPORT_KEY, int(time.time()))
+            return {'tables': total}
+        finally:
+            try:
+                staging.unlink()
+            except OSError:
+                pass
 
 
 def _local_tables(conn: sqlite3.Connection) -> set[str]:
@@ -712,9 +754,8 @@ def _local_backup() -> Path | None:
     try:
         config.ensure_dirs()
         path = config.DATA_DIR / f'pre-restore-{time.strftime("%Y%m%d-%H%M%S")}.db'
-        conn = db.connect()
         with db._lock:
-            conn.execute('VACUUM INTO ?', (str(path),))
+            db.connect().execute('VACUUM INTO ?', (str(path),))
         return path
     except Exception:  # noqa: BLE001 —— 备份失败不该阻止恢复，但要留下痕迹
         logger.exception('恢复前备份本地库失败')
