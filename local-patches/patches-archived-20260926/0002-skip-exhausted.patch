@@ -1,0 +1,520 @@
+diff --git a/cmd/server/config.go b/cmd/server/config.go
+index 4bff1d3..e9d15e6 100644
+--- a/cmd/server/config.go
++++ b/cmd/server/config.go
+@@ -13,6 +13,9 @@ import (
+ 	"workbuddy2api/internal/prompt"
+ )
+ 
++// boolPtr 返回 v 的指针（给带"未设置 vs 显式 false"区分的配置项用）。
++func boolPtr(v bool) *bool { return &v }
++
+ // Config 顶层配置。
+ type Config struct {
+ 	Listen    string `json:"listen"`     // ":7863"
+@@ -124,6 +127,10 @@ type Config struct {
+ 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
+ 		// 的积分被标记为"快过期"，选号优先消耗（issue:积分过期）。空/0 = 禁用分桶。
+ 		ExpiringSoon string `json:"expiring_soon"`
++		// SkipExhausted 额度耗尽跳过（本地定制，默认 true）：权威观测 credits<=0 的
++		// 账号从选号/粘性分配/探活中剔除，等签到查到余额自动恢复。只信权威值
++		// （签到/余额接口），不信扣减估算——实测估算会误压正常账号到 0。
++		SkipExhausted *bool `json:"skip_exhausted"`
+ 	} `json:"pool"`
+ 
+ 	SessionSticky struct {
+@@ -140,6 +147,8 @@ type Config struct {
+ 	SessionTTL          time.Duration `json:"-"`
+ 	SessionGCInterval   time.Duration `json:"-"`
+ 	ExpiringSoonDur     time.Duration `json:"-"`
++	// SkipExhaustedOn 解析后的"额度耗尽跳过"开关（normalize 落值；本地定制）。
++	SkipExhaustedOn bool `json:"-"`
+ }
+ 
+ // Default 默认配置。
+@@ -181,6 +190,9 @@ func Default() *Config {
+ 	c.Pool.IdleWeightPerHour = 0.5
+ 	c.Pool.IdleWeightMax = 5.0
+ 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
++	// 额度耗尽跳过默认开启（本地定制）：权威余额<=0 的账号不再被选中；
++	// 显式 skip_exhausted=false 或 WB2A_SKIP_EXHAUSTED=0 可关闭。
++	c.Pool.SkipExhausted = boolPtr(true)
+ 	c.SessionSticky.Enabled = true
+ 	c.SessionSticky.TTL = "30m"
+ 	c.SessionSticky.GCInterval = "5m"
+@@ -282,6 +294,12 @@ func applyEnv(c *Config) {
+ 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
+ 		c.Pool.ExpiringSoon = v
+ 	}
++	// 额度耗尽跳过开关（本地定制）：WB2A_SKIP_EXHAUSTED=0/false 关闭，=1/true 开启。
++	if v := os.Getenv("WB2A_SKIP_EXHAUSTED"); v != "" {
++		if b, err := strconv.ParseBool(v); err == nil {
++			c.Pool.SkipExhausted = boolPtr(b)
++		}
++	}
+ }
+ 
+ func (c *Config) normalize() error {
+@@ -350,6 +368,8 @@ func (c *Config) normalize() error {
+ 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
+ 		c.Listen = ":" + c.Listen
+ 	}
++	// 额度耗尽跳过（本地定制）：未显式设置（nil）默认开启；显式 false 关闭。
++	c.SkipExhaustedOn = c.Pool.SkipExhausted == nil || *c.Pool.SkipExhausted
+ 	// 排程段归一（空数组回落默认、ActivityReportCount 归一、小时范围校验）
+ 	// 由 internal/config 统一实现，cmd/server 与 cmd/activity 共用同一份语义。
+ 	if err := c.Schedule.Normalize(); err != nil {
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index 2f97a94..26fb820 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -61,6 +61,12 @@ func main() {
+ 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域在途分档（WAF 403 修复 P1-1，默认 2）
+ 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
++	// 额度耗尽跳过（本地定制）：权威余额<=0 的账号从选号/粘性分配/探活中剔除，
++	// 等签到刷新余额自动恢复。默认开启（config pool.skip_exhausted / WB2A_SKIP_EXHAUSTED 可控）。
++	p.SetSkipExhausted(cfg.SkipExhaustedOn)
++	if cfg.SkipExhaustedOn {
++		log.Printf("额度耗尽跳过已启用（pool.skip_exhausted，权威余额<=0 的账号不再被选中）")
++	}
+ 
+ 	// 会话粘性路由（可配关闭）。
+ 	var sessRouter *session.Router
+diff --git a/internal/pool/cooldown.go b/internal/pool/cooldown.go
+index e02f37a..0389c0c 100644
+--- a/internal/pool/cooldown.go
++++ b/internal/pool/cooldown.go
+@@ -13,6 +13,7 @@ func (p *Pool) SetCredits(uid string, credits int64) {
+ 	defer p.mu.Unlock()
+ 	if e, ok := p.byUID[uid]; ok {
+ 		e.credits = credits
++		e.creditsKnown = true // 显式写入即权威观测（本地定制：耗尽跳过只看权威值）
+ 		p.dirty.Store(true)
+ 	}
+ }
+@@ -31,6 +32,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
+ 		}
+ 		e.credits = credits
+ 		e.creditsExpiring = expiring
++		e.creditsKnown = true // 签到/余额接口返回值为权威观测（本地定制）
+ 		p.dirty.Store(true)
+ 	}
+ }
+diff --git a/internal/pool/entry.go b/internal/pool/entry.go
+index e020601..5795a1e 100644
+--- a/internal/pool/entry.go
++++ b/internal/pool/entry.go
+@@ -27,10 +27,13 @@ func (k CoolKind) String() string {
+ 
+ // Status 单个账号对外暴露的状态（脱敏）。
+ type Status struct {
+-	UID           string    `json:"uid"`
+-	Realm         string    `json:"realm,omitempty"`
+-	Nickname      string    `json:"nickname,omitempty"`
+-	Credits       int64     `json:"credits"`
++	UID      string `json:"uid"`
++	Realm    string `json:"realm,omitempty"`
++	Nickname string `json:"nickname,omitempty"`
++	Credits  int64  `json:"credits"`
++	// CreditsKnown 余额是否为权威观测值（签到/余额接口）。本地定制：界面据此区分
++	// 「真实余额」与「估算值」；选号跳过（skip_exhausted）也只看权威 0。
++	CreditsKnown  bool      `json:"credits_known"`
+ 	Cooling       bool      `json:"cooling"`
+ 	CoolKind      string    `json:"cool_kind,omitempty"`
+ 	CoolRemaining int64     `json:"cool_remaining_sec,omitempty"`
+@@ -69,6 +72,12 @@ type RateLimitedModel struct {
+ type entry struct {
+ 	a       *auth.Auth
+ 	credits int64
++	// creditsKnown 余额是否经过**权威观测**（签到/余额接口返回值，或显式 SetCredits）。
++	// 选号跳过规则只信权威值（见 exhausted）：扣减内插的估算值（NoteModelCost 每请求
++	// 扣减）会因"消费早于记账"等误差漂移，实测出现过余额 2800+ 的账号被估算压到 0
++	// 的情况——按估算硬跳过会误杀正常账号。未知余额（新加入账号尚未查过余额）不跳。
++	// 持久化（stateAccount.CreditsKnown）；旧 state.json 缺失时按 credits>0 迁移。
++	creditsKnown bool
+ 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
+ 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
+ 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
+@@ -168,6 +177,21 @@ func (e *entry) healthy(now time.Time) bool {
+ 	return true
+ }
+ 
++// exhausted 报告账号是否**已确认额度耗尽**（本地定制，配合 skip_exhausted 选号跳过）。
++//
++// 判定口径刻意保守——只信权威观测：
++//   - creditsKnown=true（该账号余额来自签到/余额接口的权威返回值）且 credits<=0 → 耗尽；
++//   - creditsKnown=false（新加入/尚未查过余额）→ 不判耗尽（未知 ≠ 没额度）；
++//   - 估算扣减（NoteModelCost）把值压到 0 但不改变 creditsKnown → 不判耗尽。
++//
++// 为什么不用估算值判：实测 state.json 有 9 个账号被扣减内插压到 0，真实余额
++// 2400+，其中一个 30 分钟内正常服务 17 个请求——按估算硬跳过会误杀 37% 的池子。
++// 为什么仍需本机制：签到查到 0 的账号（如未开卡/被清零）会持续 402，提前跳过
++// 省一轮无效往返；等下次签到查到余额 >0 自动恢复（ReenableIfCredits 路径）。
++func (e *entry) exhausted() bool {
++	return e.creditsKnown && e.credits <= 0
++}
++
+ // modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
+ // 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
+ // 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
+@@ -260,7 +284,12 @@ func (e *entry) fallbackKind(now time.Time) string {
+ 
+ // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
+ type stateAccount struct {
+-	Credits      int64     `json:"credits"`
++	Credits int64 `json:"credits"`
++	// CreditsKnown 余额是否已经过权威观测（签到/余额接口）。本地定制：选号跳过
++	// （pool.skip_exhausted）只信权威 0，不信扣减内插估算——实测估算会把有余额
++	// 的账号压到 0，按估算硬跳会误杀。旧 state.json 无此字段 → 加载时按
++	// credits>0 迁移（有值说明历史上查过），零值保持未知。
++	CreditsKnown bool      `json:"credits_known"`
+ 	Disabled     bool      `json:"disabled"`
+ 	Reason       string    `json:"reason,omitempty"`
+ 	Until        time.Time `json:"until,omitempty"`
+diff --git a/internal/pool/exhausted_test.go b/internal/pool/exhausted_test.go
+new file mode 100644
+index 0000000..4bd80d9
+--- /dev/null
++++ b/internal/pool/exhausted_test.go
+@@ -0,0 +1,193 @@
++package pool
++
++import (
++	"os"
++	"testing"
++
++	"workbuddy2api/internal/auth"
++)
++
++// 本地定制（2026-09-16）：额度耗尽跳过（pool.skip_exhausted）。
++// 契约：权威余额<=0 的账号不参与选号/兜底/粘性分配/探活；估算归零不跳过；
++// 未知余额不跳过；签到恢复后自动回到池子。
++
++// setExhausted 把账号标记为"权威观测余额=0"：走 SetCreditsDetailed（签到的权威路径）。
++func setExhausted(p *Pool, uid string) {
++	p.SetCreditsDetailed(uid, 0, 0)
++}
++
++func TestExhaustedSkippedInPick(t *testing.T) {
++	withNoPickGap(t)
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++	p.SetSkipExhausted(true)
++	setExhausted(p, "u1") // u1 权威余额 0
++	p.SetCredits("u2", 100)
++	for i := 0; i < 20; i++ {
++		got := p.Pick("")
++		if got == nil || got.UID != "u2" {
++			t.Fatalf("pick=%+v want u2（u1 已耗尽应被跳过）", got)
++		}
++	}
++}
++
++func TestExhaustedSkippedAllReturnsNil(t *testing.T) {
++	// 全池耗尽 → 直接不可服务（按用户选择"直接停用"，不做无效调用）。
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++	p.SetSkipExhausted(true)
++	setExhausted(p, "u1")
++	setExhausted(p, "u2")
++	if got := p.Pick(""); got != nil {
++		t.Fatalf("全池耗尽应返回 nil，got %+v", got)
++	}
++	if p.ServableNow() {
++		t.Fatal("全池耗尽时 ServableNow 应为 false（探活与选号同口径）")
++	}
++}
++
++func TestExhaustedEstimateDoesNotSkip(t *testing.T) {
++	// 关键回归：扣减内插把估算值压到 0，但 creditsKnown=false → 不得跳过。
++	// 实测背景：9 个真实余额 2400+ 的账号被估算压到 0，按估算跳过会误杀。
++	withNoPickGap(t)
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.SetSkipExhausted(true)
++	// 未经签到观测（creditsKnown=false），直接写估算值 0（模拟扣减到 0）。
++	p.mu.Lock()
++	if e := p.byUID["u1"]; e != nil {
++		e.credits = 0
++		e.creditsKnown = false
++	}
++	p.mu.Unlock()
++	if got := p.Pick(""); got == nil || got.UID != "u1" {
++		t.Fatalf("估算归零不得跳过（未知≠耗尽），got %+v", got)
++	}
++}
++
++func TestExhaustedUnknownNotSkipped(t *testing.T) {
++	// 新加入账号（从未查过余额）→ creditsKnown=false → 不跳过。
++	withNoPickGap(t)
++	p := New("")
++	p.Add(&auth.Auth{UID: "new"})
++	p.SetSkipExhausted(true)
++	if got := p.Pick(""); got == nil || got.UID != "new" {
++		t.Fatalf("新账号（余额未知）应可选中，got %+v", got)
++	}
++}
++
++func TestExhaustedReviveAfterCheckin(t *testing.T) {
++	// 签到查到余额>0：ReenableIfCredits 恢复后重新可选中。
++	withNoPickGap(t)
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.SetSkipExhausted(true)
++	setExhausted(p, "u1")
++	if got := p.Pick(""); got != nil {
++		t.Fatalf("耗尽后应不可选，got %+v", got)
++	}
++	p.ReenableIfCredits("u1", 500) // 签到查到 500
++	if got := p.Pick(""); got == nil || got.UID != "u1" {
++		t.Fatalf("签到恢复后应可选中，got %+v", got)
++	}
++}
++
++func TestExhaustedSkipDisabledByDefault(t *testing.T) {
++	// 默认（未调用 SetSkipExhausted）不跳过：保持上游行为，零回归。
++	withNoPickGap(t)
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.SetCredits("u1", 0) // 权威 0，但开关未开
++	if got := p.Pick(""); got == nil || got.UID != "u1" {
++		t.Fatalf("未开启跳过时应照常可选，got %+v", got)
++	}
++}
++
++func TestExhaustedSkippedInAvailableUIDs(t *testing.T) {
++	// 粘性分配可用列表同样剔除耗尽账号（新会话不再落到空号上）。
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++	p.SetSkipExhausted(true)
++	setExhausted(p, "u1")
++	p.SetCredits("u2", 100)
++	uids := p.AvailableUIDs()
++	if len(uids) != 1 || uids[0] != "u2" {
++		t.Fatalf("AvailableUIDs=%v want [u2]", uids)
++	}
++}
++
++func TestExhaustedSkippedByModelList(t *testing.T) {
++	// 按模型可用列表（粘性按模型校验用）同样生效。
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++	p.SetSkipExhausted(true)
++	setExhausted(p, "u2")
++	p.SetCredits("u1", 100)
++	uids := p.AvailableUIDsForModel("deepseek-v4")
++	if len(uids) != 1 || uids[0] != "u1" {
++		t.Fatalf("AvailableUIDsForModel=%v want [u1]", uids)
++	}
++}
++
++func TestExhaustedStickyPickByUIDReturnsNil(t *testing.T) {
++	// 粘性直取（PickByUIDForModel）对耗尽号返回 nil → handler 解绑重分配。
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	p.SetSkipExhausted(true)
++	setExhausted(p, "u1")
++	if got := p.PickByUIDForModel("u1", "deepseek-v4"); got != nil {
++		t.Fatalf("耗尽号粘性直取应为 nil，got %+v", got)
++	}
++}
++
++func TestExhaustedPersistenceRoundTrip(t *testing.T) {
++	// credits_known 落盘/恢复往返：耗尽状态跨重启不丢（否则重启会把空号放回池子）。
++	dir := t.TempDir()
++	fp := dir + "/state.json"
++	p := New(fp)
++	p.Add(&auth.Auth{UID: "u1"})
++	p.Add(&auth.Auth{UID: "u2"})
++	setExhausted(p, "u1") // u1: credits=0, known=true
++	p.SetCredits("u2", 300)
++	p.Flush()
++
++	p2 := New(fp)
++	p2.SetSkipExhausted(true)
++	if got := p2.Pick(""); got == nil || got.UID != "u2" {
++		t.Fatalf("重启后耗尽号仍应被跳过，got %+v", got)
++	}
++}
++
++func TestExhaustedLegacyStateMigration(t *testing.T) {
++	// 旧 state.json 无 credits_known 字段：credits>0 → 视为已知；credits=0 → 未知（不跳）。
++	dir := t.TempDir()
++	fp := dir + "/state.json"
++	legacy := `{"accounts":{"u1":{"credits":0},"u2":{"credits":500}}}`
++	if err := os.WriteFile(fp, []byte(legacy), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	p := New(fp)
++	p.SetSkipExhausted(true)
++	// u1: credits=0 且旧文件无法确认是权威 0 → creditsKnown=false → 不跳（保守）；
++	// u2: credits>0 → known=true → 不跳。两者都应可选。
++	if got := p.Pick(""); got == nil {
++		t.Fatal("旧文件迁移后两号都应可选（保守口径）")
++	}
++}
++
++func TestExhaustedStatusExposesKnownFlag(t *testing.T) {
++	p := New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	setExhausted(p, "u1")
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("status missing u1")
++	}
++	if !st.CreditsKnown || st.Credits != 0 {
++		t.Fatalf("Status 应透出 credits_known=true、credits=0，got known=%v credits=%d", st.CreditsKnown, st.Credits)
++	}
++}
+diff --git a/internal/pool/persist.go b/internal/pool/persist.go
+index 5dab87e..38586a9 100644
+--- a/internal/pool/persist.go
++++ b/internal/pool/persist.go
+@@ -162,6 +162,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+ 		e := &entry{
+ 			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+ 			credits:          s.Credits,
++			creditsKnown:     s.CreditsKnown || s.Credits > 0, // 旧 state.json 无此字段：按 credits>0 迁移（本地定制）
+ 			disabled:         s.Disabled,
+ 			reason:           s.Reason,
+ 			until:            s.Until,
+@@ -341,6 +342,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
+ 		coolKind, reason := cooledReasonLocked(e, now)
+ 		sf.Accounts[uid] = stateAccount{
+ 			Credits:          e.credits,
++			CreditsKnown:     e.creditsKnown,
+ 			Disabled:         e.disabled,
+ 			Reason:           reason,
+ 			Until:            e.until,
+diff --git a/internal/pool/pick.go b/internal/pool/pick.go
+index 0279d67..285d846 100644
+--- a/internal/pool/pick.go
++++ b/internal/pool/pick.go
+@@ -56,6 +56,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+ 		if !healthyOf(e) {
+ 			continue
+ 		}
++		if p.skipExhausted && e.exhausted() {
++			continue // 额度耗尽（权威 0）：跳过，等签到恢复（本地定制）
++		}
+ 		if p.inFlightFull(e) {
+ 			continue // 在途占满：跳过（max=0 不限时不触发）
+ 		}
+@@ -207,6 +210,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
+ 		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
+ 			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+ 		}
++		if p.skipExhausted && e.exhausted() {
++			continue // 权威余额 0 的账号不参与兜底：等签到恢复（本地定制）
++		}
+ 		if p.inFlightFull(e) {
+ 			continue
+ 		}
+diff --git a/internal/pool/pool.go b/internal/pool/pool.go
+index c48a407..6477d97 100644
+--- a/internal/pool/pool.go
++++ b/internal/pool/pool.go
+@@ -32,6 +32,10 @@ type Pool struct {
+ 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
+ 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
+ 	maxInFlightGlobal int
++	// skipExhausted 额度耗尽跳过开关（SetSkipExhausted 注入；默认 false=不跳过，
++	// 与引入前行为一致）。开启后：权威观测到 credits<=0 的账号在选号/粘性分配/
++	// 探活中被跳过（见 entry.exhausted 的保守口径——只信签到等权威值，不信估算）。
++	skipExhausted bool
+ 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
+ 	// 生产代码不应设置此字段。
+ 	randInt64N func(n int64) int64
+@@ -137,6 +141,15 @@ func (p *Pool) inFlightLimit(e *entry) int {
+ 	return p.maxInFlight
+ }
+ 
++// SetSkipExhausted 注入「额度耗尽跳过」开关（本地定制，config pool.skip_exhausted）。
++// 开启后：权威观测 credits<=0 的账号从选号候选、全冷却兜底、粘性可用列表与
++// 探活中剔除；签到查到余额后自动恢复。默认 false（保持上游行为）。
++func (p *Pool) SetSkipExhausted(enabled bool) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.skipExhausted = enabled
++}
++
+ // SetStore 注入池状态快照镜像（redisstore.Store）。nil 表示不镜像（纯本地恢复）。
+ // 必须在 SyncToDir 之前调用，使"择新恢复"发生在账号对齐之前。
+ func (p *Pool) SetStore(s StoreSnapshotter) {
+diff --git a/internal/pool/state.go b/internal/pool/state.go
+index 35449dd..48c70d6 100644
+--- a/internal/pool/state.go
++++ b/internal/pool/state.go
+@@ -86,6 +86,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain int64) {
+ 		} else {
+ 			e.credits = remain
+ 		}
++		e.creditsKnown = true // 签名/余额查询为权威观测（本地定制）
+ 		p.dirty.Store(true)
+ 	}
+ }
+@@ -248,7 +249,9 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
+ 
+ // availableUIDsLocked 是 AvailableUIDs 四变体（AvailableUIDs/ForModel/ForRealm/
+ // ForModelRealm）共用的遍历实现：realm 过滤（""=全池）+ 可替换健康口径（healthy /
+-// healthyForModel）+ 在途占满过滤，输出按 UID 排序（稳定）。调用方必须不持锁。
++// healthyForModel）+ 在途占满过滤 + 额度耗尽过滤（本地定制：skipExhausted 开启时
++// 剔除权威余额<=0 的账号，让粘性分配不再落到空号上），输出按 UID 排序（稳定）。
++// 调用方必须不持锁。
+ func (p *Pool) availableUIDsLocked(realm string, health func(e *entry, now time.Time) bool) []string {
+ 	p.mu.RLock()
+ 	defer p.mu.RUnlock()
+@@ -261,6 +264,9 @@ func (p *Pool) availableUIDsLocked(realm string, health func(e *entry, now time.
+ 		if !health(e, now) {
+ 			continue
+ 		}
++		if p.skipExhausted && e.exhausted() {
++			continue // 额度耗尽（权威 0）：不参与粘性分配（本地定制）
++		}
+ 		if p.inFlightFull(e) {
+ 			continue
+ 		}
+@@ -286,6 +292,9 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+ 	if !e.healthyForModel(now, model) {
+ 		return nil
+ 	}
++	if p.skipExhausted && e.exhausted() {
++		return nil // 额度耗尽（权威 0）：粘性直取失败 → handler 解绑并回落轮换（本地定制）
++	}
+ 	if p.inFlightFull(e) {
+ 		return nil
+ 	}
+@@ -366,7 +375,9 @@ func (p *Pool) ServableForRealm(realm string) bool {
+ }
+ 
+ // servableLocked 是 ServableNow / ServableForRealm 共用的遍历实现：
+-// 存在至少一个（realm 匹配、未占满在途名额、healthy 或模型豁免形态）的账号即 true。
++// 存在至少一个（realm 匹配、未占满在途名额、healthy 或模型豁免形态、且额度未耗尽）
++// 的账号即 true。额度耗尽过滤（本地定制）：skipExhausted 开启时，权威余额<=0 的账号
++// 不可服务——探活与选号同口径，避免"全号耗尽但 /healthz 报 200"的口径裂缝。
+ // realm=="" 不加 realm 谓词（全池）。调用方必须不持锁。
+ func (p *Pool) servableLocked(realm string) bool {
+ 	p.mu.RLock()
+@@ -379,6 +390,9 @@ func (p *Pool) servableLocked(realm string) bool {
+ 		if p.inFlightFull(e) {
+ 			continue
+ 		}
++		if p.skipExhausted && e.exhausted() {
++			continue // 额度耗尽：探活不计入（本地定制）
++		}
+ 		if e.healthy(now) || e.modelExempt() {
+ 			return true
+ 		}
+@@ -416,6 +430,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
+ 		Realm:             e.a.Realm(),
+ 		Nickname:          e.a.Nickname,
+ 		Credits:           e.credits,
++		CreditsKnown:      e.creditsKnown, // 本地定制：区分权威余额与估算值
+ 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
+ 		Reason:            reason,
+ 		Disabled:          e.disabled,

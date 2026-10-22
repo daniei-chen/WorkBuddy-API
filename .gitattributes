@@ -1,0 +1,12 @@
+# 换行锁定
+#   Linux 部署脚本必须 LF —— CRLF 会让 shebang 失效：
+#   `bash: ./x.sh: /bin/bash^M: bad interpreter`
+#   Windows 批处理声明 -text（不做转换），保持仓库内既有 CRLF 不变。
+*.sh   text eol=lf
+*.py   text eol=lf
+*.go   text eol=lf
+Dockerfile text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.cmd  -text
+*.bat  -text

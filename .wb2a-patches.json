@@ -1,0 +1,21 @@
+{
+  "0001-tool-result-pairing.patch": "bbfdb3361182f44335313e76a283a3cbb874b4d87326b59d4be0a1c254c290a3",
+  "0002-listing-compat.patch": "58dc03f3858678060b654b37d374e78199127a4f819e3cb0bc9b9d6f627f670f",
+  "0003-random-daily-schedule.patch": "dcac2f6b81155d7e8aa142f9b6072b3b06131edc7da19dfd93324f4fa9f4fbac",
+  "0004-credit-exhausted-cooldown.patch": "e5a62f9ce145815d69553f066bdd551b5c92cb99b9c16cbf81a1d4959926532b",
+  "0005-conversation-id-header-family.patch": "11f5901c9fa2a9d39d53f3c091b3488ec869013f9d61f3810715a7449707d76a",
+  "0006-channel-check-console-fallback.patch": "a85b16e5b03a547667a1eb38054210a728f9df30fa747c3e743be4e5bc53eb67",
+  "0007-account-egress-and-request-level-errors.patch": "9ba12c4fc861edab35f9185cdf53977080d74c006deb46cfe69b53ea17a9ca6f",
+  "0008-account-manual-weight.patch": "a43e32e0461a4d585eff1f21a37de2135d6447401ab78146f7cb16645e61348b",
+  "0009-reasoning-as-content.patch": "f037cd64a5325830b7663ca90f34b9a29ec55770371145e12789d4debb9f7f51",
+  "0010-reasoning-frame-order.patch": "7e599ea9d07edbe1d4843a9f55d284d1669097f20d5b317d51fc5668d2e61051",
+  "0011-fix-cooldown-test-clock.patch": "4d2bf7f68b449ed445fe4f98082e0b98cb76bbbbe39a9b00d9295bfd94e4f81b",
+  "0012-expert-lighthouse-real-chat.patch": "b7c2241b34760b4c08ac9a3e9bcf9b01719dbfa67139a90c58e010d5b388eed2",
+  "0013-account-direct-route.patch": "5e2eea2795bf3a6d226ef4f82fa967e74c4aab44ac236c69ba49f173104cacd5",
+  "0014-truncated-stream-signal.patch": "f984101e94592bbb8e7c72ee18fcfc16014c24e264b66c99dd7a08fa66f24aff",
+  "0015-global-credits-refresh.patch": "e28cfabf96c21e71bda8cd805087095a73f51a1197fbc097b27956d9f12f99b7",
+  "0016-global-deepseek-max-effort.patch": "6a3e395423a1cc136b1f1d8385b497ded9776b1bc41e5a1ffca36c84d5b88fd1",
+  "0017-dsh-system-prompt-fingerprint.patch": "4d44cbefaf382dc02609730a7998a6c87c7553588df89ccc135e871edfbdba2e",
+  "0018-console-fallback-model-missing.patch": "ef36e101c60fa7d103be4f4c555aecff55e5ae1caba61e06f8871d379a45c384",
+  "0019-dsh-web-gui-fingerprint.patch": "ab82ba353b7719e7aeba71daf50f2bcd19c51ee163c975befd49712c01554010"
+}
